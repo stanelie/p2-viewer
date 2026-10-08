@@ -178,6 +178,9 @@ static volatile int64_t  s_stream_open_us = 0;  /* when the current stream opene
  * camera applies its flat-field - so a collapse here IS the FFC-completed signal. */
 static volatile uint32_t s_dbg_neigh_mad = 0;
 static volatile bool s_clean_logged = false;  /* one-shot: time-to-calibrated per stream */
+static volatile uint32_t s_startup_roughness = 0; /* only meaningful until s_clean_logged */
+static volatile bool s_shutter_cfg_done = false; /* set when the schedule write verified */
+static volatile int64_t s_connect_us = 0;  /* device-connect time: what the user actually waits */
 #define P2_RAW_UNCAL 32768u   /* 0x8000 - flat sentinel until the camera calibrates */
 
 /* Characterises what is actually in the radiometric half, to explain the ~6s of garbled image that
@@ -206,10 +209,15 @@ static void p2_log_first_clean(const uint16_t *raw16, size_t npix, int64_t t_ope
         n++;
     }
     const uint32_t mad = n ? (uint32_t)(adiff / n) : 0;
+    s_startup_roughness = mad;
     if (mad > 0 && mad < 100) {
         s_clean_logged = true;
-        ESP_LOGW(TAG, "camera calibrated: clean image %d ms after stream open (roughness %u)",
-                 (int)((esp_timer_get_time() - t_open_us) / 1000), (unsigned)mad);
+        /* Report from device connect, not from stream open: anything done before stream_start
+         * would otherwise be invisible in this number and make a change look better than it is. */
+        const int64_t now = esp_timer_get_time();
+        ESP_LOGW(TAG, "camera calibrated: %d ms after connect (%d ms after stream open, roughness %u)",
+                 s_connect_us ? (int)((now - s_connect_us) / 1000) : -1,
+                 (int)((now - t_open_us) / 1000), (unsigned)mad);
     }
 }
 
@@ -476,6 +484,16 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
 #define P2_SET_SHUTTER_DELAYS 1
 #define P2_SHUTTER_1ST_DELAY  1
 #define P2_SHUTTER_2ND_DELAY  1
+/* MIN_INTERVAL (default 5s) may gate how soon a second shutter is allowed after whatever the
+ * camera does during its flat phase. Lower it too, same risk class, default recorded. */
+#define P2_SHUTTER_MIN_INTERVAL 1
+/* Try configuring BEFORE preview starts. The delays are counted from preview start, so writing
+ * after stream_start (~3s, once the channel answers) may already be too late to move the first
+ * shutter. The device handle exists after stream_open, so the channel can be tried there. */
+/* Disproved: the command channel does not answer until preview is running, so the schedule
+ * cannot be written before stream_start. The probe loop also cost ~1s of time-to-first-image.
+ * Kept behind the flag only as a record that it was tried. */
+#define P2_EARLY_CONFIG 0
 
 /* Poll the shutter/vtemp registers after start and log them, so the calibration event shows up in
  * the log instead of depending on hearing the click. Costs two control transfers per tick. */
@@ -514,6 +532,34 @@ static void p2_vtemp_watch_task(void *arg)
     vTaskDelete(NULL);
 }
 #endif
+
+/* Writes the shutter schedule. Returns ESP_OK only if every write read back as requested, so the
+ * caller can tell a real success from a camera that is not listening yet. */
+static esp_err_t p2_write_shutter_schedule(const char *when)
+{
+    static const struct { const char *name; uint16_t id; uint16_t val; } cfg[] = {
+        /* MIN_INTERVAL is rejected by the camera - the write returns a status error and it
+         * reads back 5 unchanged. Left out rather than retried every connect. */
+        { "PREVIEW_START_1ST_DELAY", P2_ASP_PREVIEW_START_1ST_DELAY, P2_SHUTTER_1ST_DELAY },
+        { "PREVIEW_START_2ND_DELAY", P2_ASP_PREVIEW_START_2ND_DELAY, P2_SHUTTER_2ND_DELAY },
+    };
+    esp_err_t worst = ESP_OK;
+    for (size_t i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
+        esp_err_t we = p2_long_cmd_write(P2_CMD_SET_AUTO_SHUTTER, cfg[i].id, cfg[i].val);
+        uint8_t rb[2] = {0};
+        esp_err_t re = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, cfg[i].id, rb, sizeof(rb));
+        const unsigned got = (re == ESP_OK) ? (unsigned)((rb[0] << 8) | rb[1]) : 0xFFFFu;
+        if (we != ESP_OK || re != ESP_OK || got != cfg[i].val) {
+            worst = (we != ESP_OK) ? we : (re != ESP_OK ? re : ESP_FAIL);
+        }
+        ESP_LOGW(TAG, "p2: [%s] %-24s := %u -> %s, reads %u", when, cfg[i].name, cfg[i].val,
+                 (we == ESP_OK) ? "OK" : p2_err(we), got);
+    }
+    if (worst == ESP_OK) {
+        s_shutter_cfg_done = true;
+    }
+    return worst;
+}
 
 static void p2_camera_init(void)
 {
@@ -588,24 +634,11 @@ static void p2_camera_init(void)
 #endif
 
 #if P2_SET_SHUTTER_DELAYS
-    /* Shorten the camera's own auto-shutter schedule. Factory defaults are 1ST=5s, 2ND=4s, which
-     * is the measured 8.75s to a usable image. Originals are recorded here so they can be put
-     * back; MIN_INTERVAL is 5, so the camera may clamp these - the read-back tells us.
-     * PROP_SWITCH is deliberately untouched (clearing it would disable auto-shutter entirely). */
-    ESP_LOGW(TAG, "p2: ---- setting preview-start shutter delays (was 1ST=5 2ND=4) ----");
-    static const struct { const char *name; uint16_t id; uint16_t val; } delays[] = {
-        { "PREVIEW_START_1ST_DELAY", P2_ASP_PREVIEW_START_1ST_DELAY, P2_SHUTTER_1ST_DELAY },
-        { "PREVIEW_START_2ND_DELAY", P2_ASP_PREVIEW_START_2ND_DELAY, P2_SHUTTER_2ND_DELAY },
-    };
-    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        esp_err_t we = p2_long_cmd_write(P2_CMD_SET_AUTO_SHUTTER, delays[i].id, delays[i].val);
-        uint8_t rb[2] = {0};
-        esp_err_t re = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, delays[i].id, rb, sizeof(rb));
-        ESP_LOGW(TAG, "p2:   %s := %u -> write %s, reads back %u%s",
-                 delays[i].name, delays[i].val,
-                 (we == ESP_OK) ? "OK" : p2_err(we),
-                 (re == ESP_OK) ? (unsigned)((rb[0] << 8) | rb[1]) : 9999u,
-                 (re == ESP_OK && ((rb[0] << 8) | rb[1]) != delays[i].val) ? "  <== CLAMPED" : "");
+    /* Late path: runs once the channel answers after stream_start. If the early attempt already
+     * succeeded this is a no-op re-write, which is harmless and keeps the camera correct after a
+     * renegotiation. */
+    if (!s_shutter_cfg_done) {
+        p2_write_shutter_schedule("late");
     }
 #endif
 
@@ -1643,20 +1676,34 @@ static void render_task(void *arg)
                    (size_t)(s_fb_h - s_img_h) * s_img_w * sizeof(uint16_t));
         }
 
-        /* A cold camera emits a constant 0x8000 in every radiometric pixel until it runs its
-         * first calibration (~3s after the stream opens, measured). Mapping that through the
-         * palette yields a meaningless flat field, so say what is happening instead. The camera's
-         * command channel is not reachable during this window either, so there is nothing to do
-         * but wait it out. */
-        const bool uncalibrated = (min_v == P2_RAW_UNCAL && max_v == P2_RAW_UNCAL);
+        /* A cold camera goes through two distinct unusable phases, and they need different
+         * labels - the earlier version called both "CALIBRATING", which was wrong for the first
+         * and absent for the second.
+         *
+         *   STARTING    every radiometric pixel is the constant 0x8000 sentinel. The camera is
+         *               booting: its command channel does not even answer yet, and the shutter
+         *               has not fired. Nothing is being calibrated.
+         *   CALIBRATING real but uncorrected data (~53x spatially rougher than a finished image).
+         *               The camera is waiting on its scheduled shutter, and the flat-field lands
+         *               at the END of this window. This is the phase that is genuinely calibration,
+         *               and it is the one that used to show through as a garbled picture.
+         *
+         * The roughness test is bounded to the startup window and stops once a clean frame has
+         * been seen, so a high-contrast scene can never cause a spurious overlay later on. */
+        const bool flat = (min_v == P2_RAW_UNCAL && max_v == P2_RAW_UNCAL);
+        const bool in_startup_window =
+            !s_clean_logged && (esp_timer_get_time() - s_stream_open_us) < 10000000;
+        const bool uncorrected = in_startup_window && !flat && s_startup_roughness >= 100;
+        const char *notice = flat ? "STARTING" : (uncorrected ? "CALIBRATING" : NULL);
+
+        const bool uncalibrated = (notice != NULL);
         if (uncalibrated) {
             memset(s_rgb_buf, 0, (size_t)s_img_w * s_fb_h * sizeof(uint16_t));
-            const char *msg = "CALIBRATING";
             const int cal_scale = 3;
-            int tw = (int)strlen(msg) * (FONT_W + 1) * cal_scale;
+            int tw = (int)strlen(notice) * (FONT_W + 1) * cal_scale;
             draw_text_to(s_rgb_buf, s_img_w, s_fb_h,
                          (s_img_w - tw) / 2, (s_fb_h - FONT_H * cal_scale) / 2,
-                         cal_scale, 0xFFFF, msg);
+                         cal_scale, 0xFFFF, notice);
         }
 
         if (s_osd_enabled && !uncalibrated) { /* OSD toggle covers the overlays too, not just the bar */
@@ -1799,6 +1846,29 @@ static void streaming_task(void *arg)
             continue;
         }
         BOOT_MARK("uvc: stream_open returned");
+#if P2_EARLY_CONFIG
+        /* The shutter delays are counted from preview start, so configuring after stream_start
+         * may be too late to move the FIRST shutter - by then the camera has already scheduled
+         * it. The device handle exists from stream_open, so try the channel here. On a cold
+         * camera it may well not answer yet; that is why the late path still exists. */
+        s_shutter_cfg_done = false;
+        s_p2_wait_ms = 60;
+        for (int i = 0; i < 12 && !s_shutter_cfg_done; i++) {
+            uint8_t probe[2];
+            if (p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, P2_ASP_MIN_INTERVAL,
+                                 probe, sizeof(probe)) == ESP_OK) {
+                s_p2_wait_ms = 1000;
+                ESP_LOGW(TAG, "p2: channel answered BEFORE preview start (attempt %d)", i + 1);
+                p2_write_shutter_schedule("early");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        s_p2_wait_ms = 1000;
+        if (!s_shutter_cfg_done) {
+            ESP_LOGW(TAG, "p2: channel not up before preview start - will configure after");
+        }
+#endif
         err = uvc_host_stream_start(s_stream);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "uvc_host_stream_start failed: %s - retrying", esp_err_to_name(err));
@@ -1810,6 +1880,10 @@ static void streaming_task(void *arg)
         BOOT_MARK("uvc: stream_start returned (first image)");
         s_stream_open_us = esp_timer_get_time();
         s_clean_logged = false;   /* re-arm for this stream */
+        /* The camera forgets the shutter schedule whenever it loses power, so this must be
+         * re-armed per stream, NOT left latched from the first successful write after boot.
+         * Getting that wrong silently restored the stock 5s+4s on every replug. */
+        s_shutter_cfg_done = false;
         ESP_LOGI(TAG, "Stream opened, starting continuous render");
         p2_camera_init();
         s_stream_restart_req = false;
@@ -1838,6 +1912,7 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
     if (event->type != UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED) {
         return;
     }
+    s_connect_us = esp_timer_get_time();
     ESP_LOGI(TAG, "Device connected, addr=%d, starting streaming task", event->device_connected.dev_addr);
 
     /* Dump what the camera actually advertises - this is how we tell "image-only mode" apart

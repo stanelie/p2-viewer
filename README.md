@@ -10,6 +10,7 @@ Priorities, in order: **boot time, framerate, latency.**
 
 Streams 256x384 YUY2 at a stable **25 fps** (the sensor's ceiling), **~36.9 ms** arrival-to-on-screen,
 **~1.71 s** from power-on to first image and **~6.4 s** to a fully calibrated one (down from ~11.8 s).
+Time-to-calibrated is reported on the console every stream open.
 
 ## Build
 
@@ -46,7 +47,14 @@ Plugging in a cold camera goes through three phases, timed from stream open:
 
 Phase 2 is uncorrected bolometer output (per-pixel fixed-pattern noise, no flat-field yet). It is
 full-length and inside a plausible temperature band, so neither a frame-length check nor the
-`0x8000` check catches it — it just looks garbled. The firmware shows **CALIBRATING** during phase 1.
+`0x8000` check catches it — it just looks garbled.
+
+The firmware labels these honestly, which took a correction: it originally showed **CALIBRATING**
+through phase 1, when the camera is merely booting and the shutter has not fired, and then let the
+genuinely-uncalibrated phase 2 show through as a garbled picture. Now phase 1 shows **STARTING**
+and phase 2 shows **CALIBRATING**, which is the phase the flat-field actually lands at the end of.
+The phase-2 test is bounded to the startup window and stops once a clean frame is seen, so a
+high-contrast scene can never trigger a spurious overlay later.
 
 A useful metric for telling these apart is the mean absolute difference between horizontally
 adjacent raw pixels: ~0 flat, **~320 uncorrected, ~6 clean**.
@@ -67,11 +75,26 @@ schedule. Factory defaults as read from the camera:
 | 11 | `CHANGE_GAIN_1ST_DELAY` | 5 |
 | 12 | `CHANGE_GAIN_2ND_DELAY` | 4 |
 
-Units are seconds, and 5 + 4 = 9 matches the measured 8.75 s exactly. The firmware writes both to 1
-as soon as the command channel opens (~2.7 s), which brings a usable image forward from
-**8753 ms to 4535 ms**. The two early shutter clicks the official phone app produces are these same
-two events with shorter delays configured - there is no manual-FFC opcode, which is why other
-projects looking for one did not find it.
+Units are seconds, and 5 + 4 = 9 matches the measurement exactly. The firmware writes both to 1 as
+soon as the command channel opens, which brings a usable image forward from **~9.35 s to ~5.4 s
+after device connect** (9349/9366 ms vs 5350/5425 ms over repeated cold plugs). The two early
+shutter clicks the official phone app produces are these same two events with shorter delays
+configured - there is no manual-FFC opcode, which is why other projects looking for one did not
+find it.
+
+Measure this from **device connect**, not from stream open: the channel-up time varies by ~900 ms
+run to run, so the "after stream open" figure moves around while the total stays within ~75 ms.
+
+The schedule must be rewritten **on every stream open**. The camera forgets it whenever it loses
+power, so latching "already configured" after the first success silently restores the stock 5s+4s
+on every subsequent replug.
+
+Two things that do **not** work, both measured:
+- **Configuring before preview starts.** The delays count from preview start, so writing earlier
+  should move the first shutter - but the command channel does not answer until preview is
+  running, so there is no window in which to do it.
+- **Lowering `MIN_INTERVAL`.** The camera rejects the write with a status error and it reads back
+  5 unchanged.
 
 **These values do not survive the camera losing power** - a cold camera reads back 5/4 - so the
 firmware reapplies them on every connect. Nothing is permanently written to the camera.

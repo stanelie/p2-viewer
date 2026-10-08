@@ -237,6 +237,30 @@ static void p2_frame_diag(const uint16_t *raw16, size_t npix, size_t data_len, i
 
 #define P2_CMD_SET       0x4000
 
+/* Auto-shutter configuration. Extracted from libircmd.so in the official Android app: the camera
+ * schedules its own shutter events, and SHUTTER_PREVIEW_START_1ST/2ND_DELAY are the delays before
+ * the first and second auto-shutter after preview starts. That is what the phone's two early
+ * clicks are - the app is not triggering FFC manually, it configures when the camera does it. */
+#define P2_CMD_GET_AUTO_SHUTTER  0x8214
+#define P2_CMD_SET_AUTO_SHUTTER  0xc214   /* 0x8214 | SET */
+
+#define P2_ASP_PROP_SWITCH            0
+#define P2_ASP_MIN_INTERVAL           1
+#define P2_ASP_MAX_INTERVAL           2
+#define P2_ASP_TEMP_THRESHOLD_OOC     3
+#define P2_ASP_TEMP_THRESHOLD_B       4
+#define P2_ASP_PROTECT_SWITCH         5
+#define P2_ASP_ANY_INTERVAL           6
+#define P2_ASP_PROTECT_THR_HIGH_GAIN  7
+#define P2_ASP_PROTECT_THR_LOW_GAIN   8
+#define P2_ASP_PREVIEW_START_1ST_DELAY 9
+#define P2_ASP_PREVIEW_START_2ND_DELAY 10
+#define P2_ASP_CHANGE_GAIN_1ST_DELAY  11
+#define P2_ASP_CHANGE_GAIN_2ND_DELAY  12
+
+#define P2_IDX_CMD_LONG  0x9d00
+#define P2_IDX_DATA_LONG 0x1d10
+
 #define P2_CMD_GET_DEVICE_INFO   0x8405
 #define P2_CMD_SHUTTER_VTEMP     0x840c
 #define P2_CMD_CUR_VTEMP         0x8b0d
@@ -295,6 +319,68 @@ static esp_err_t p2_cmd(uint16_t cmd, uint32_t param)
     return p2_wait_ready(s_p2_wait_ms);
 }
 
+/* "Long command" form, as libircmd.so builds it: an 8-byte header to 0x9d00 carrying cmd + a
+ * big-endian 16-bit p1, a second 8-byte block to 0x1d08 whose last 4 bytes are the read length,
+ * then the payload read back from 0x1d10. Note p1 is big-endian here while the short-form
+ * parameter is little-endian - the firmware is not self-consistent, so follow it exactly. */
+static esp_err_t p2_long_cmd_read(uint16_t cmd, uint16_t p1, uint8_t *out, uint16_t len)
+{
+    uint8_t b1[8] = {0}, b2[8] = {0};
+    b1[0] = (uint8_t)(cmd & 0xFF);
+    b1[1] = (uint8_t)(cmd >> 8);
+    b1[2] = (uint8_t)(p1 >> 8);      /* p1, BIG-endian */
+    b1[3] = (uint8_t)(p1 & 0xFF);
+    /* b1[4..7] = p2 = 0 */
+    b2[4] = (uint8_t)(len >> 24);    /* length, BIG-endian 32 */
+    b2[5] = (uint8_t)(len >> 16);
+    b2[6] = (uint8_t)(len >> 8);
+    b2[7] = (uint8_t)(len & 0xFF);
+
+    esp_err_t err = uvc_host_usb_ctrl(s_stream, P2_VC_OUT, P2_VC_REQ_WRITE,
+                                      P2_VC_VALUE, P2_IDX_CMD_LONG, sizeof(b1), b1);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = uvc_host_usb_ctrl(s_stream, P2_VC_OUT, P2_VC_REQ_WRITE,
+                            P2_VC_VALUE, P2_IDX_DATA, sizeof(b2), b2);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = p2_wait_ready(s_p2_wait_ms);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return uvc_host_usb_ctrl(s_stream, P2_VC_IN, P2_VC_REQ_READ,
+                             P2_VC_VALUE, P2_IDX_DATA_LONG, len, out);
+}
+
+/* Long-form write, as libircmd.so builds it: header to 0x9d00, then eight ZERO bytes to 0x1d08
+ * (p3/p4 both unused here), then poll ready. */
+static esp_err_t p2_long_cmd_write(uint16_t cmd, uint16_t p1, uint32_t p2)
+{
+    uint8_t b1[8], b2[8] = {0};
+    b1[0] = (uint8_t)(cmd & 0xFF);
+    b1[1] = (uint8_t)(cmd >> 8);
+    b1[2] = (uint8_t)(p1 >> 8);       /* p1, BIG-endian */
+    b1[3] = (uint8_t)(p1 & 0xFF);
+    b1[4] = (uint8_t)(p2 >> 24);      /* p2, BIG-endian 32 */
+    b1[5] = (uint8_t)(p2 >> 16);
+    b1[6] = (uint8_t)(p2 >> 8);
+    b1[7] = (uint8_t)(p2 & 0xFF);
+
+    esp_err_t err = uvc_host_usb_ctrl(s_stream, P2_VC_OUT, P2_VC_REQ_WRITE,
+                                      P2_VC_VALUE, P2_IDX_CMD_LONG, sizeof(b1), b1);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = uvc_host_usb_ctrl(s_stream, P2_VC_OUT, P2_VC_REQ_WRITE,
+                            P2_VC_VALUE, P2_IDX_DATA, sizeof(b2), b2);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return p2_wait_ready(s_p2_wait_ms);
+}
+
 static const char *p2_err(esp_err_t e)
 {
     /* ESP_ERR_NOT_SUPPORTED specifically means the device STALLed, i.e. no such command. */
@@ -338,6 +424,13 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * ESP_FAIL (camera status error), and what actually recovered the camera was physically
  * unplugging and replugging it. Left off - there is no known software undo for the mode change. */
 #define P2_RECOVER_Y16_MODE 0
+
+/* Shorten the camera's own auto-shutter schedule at startup. Factory defaults are 1ST=5s, 2ND=4s,
+ * which is the measured ~8.75s before a usable image. To put the camera back to stock, set these
+ * to 5 and 4 and reflash. */
+#define P2_SET_SHUTTER_DELAYS 1
+#define P2_SHUTTER_1ST_DELAY  1
+#define P2_SHUTTER_2ND_DELAY  1
 
 /* Poll the shutter/vtemp registers after start and log them, so the calibration event shows up in
  * the log instead of depending on hearing the click. Costs two control transfers per tick. */
@@ -424,6 +517,50 @@ static void p2_camera_init(void)
         }
     }
     ESP_LOGI(TAG, "p2: transport OK, part number '%s'", (char *)pn);
+
+    /* Read-only dump of the camera's auto-shutter schedule. Params 9 and 10 are the delays before
+     * the 1st and 2nd auto-shutter after preview start - the ~8.75s we are trying to shorten. */
+    static const char *asp_names[13] = {
+        "PROP_SWITCH", "MIN_INTERVAL", "MAX_INTERVAL", "TEMP_THRESHOLD_OOC",
+        "TEMP_THRESHOLD_B", "PROTECT_SWITCH", "ANY_INTERVAL", "PROTECT_THR_HIGH_GAIN",
+        "PROTECT_THR_LOW_GAIN", "PREVIEW_START_1ST_DELAY", "PREVIEW_START_2ND_DELAY",
+        "CHANGE_GAIN_1ST_DELAY", "CHANGE_GAIN_2ND_DELAY",
+    };
+    ESP_LOGW(TAG, "p2: ---- auto-shutter params (read-only) ----");
+    for (int i = 0; i < 13; i++) {
+        uint8_t r[2] = {0};
+        esp_err_t ae = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, (uint16_t)i, r, sizeof(r));
+        if (ae == ESP_OK) {
+            ESP_LOGW(TAG, "p2:   [%2d] %-24s = %5u (0x%02x%02x)%s",
+                     i, asp_names[i], (unsigned)((r[0] << 8) | r[1]), r[0], r[1],
+                     (i == P2_ASP_PREVIEW_START_1ST_DELAY ||
+                      i == P2_ASP_PREVIEW_START_2ND_DELAY) ? "  <== target" : "");
+        } else {
+            ESP_LOGW(TAG, "p2:   [%2d] %-24s -> %s", i, asp_names[i], p2_err(ae));
+        }
+    }
+
+#if P2_SET_SHUTTER_DELAYS
+    /* Shorten the camera's own auto-shutter schedule. Factory defaults are 1ST=5s, 2ND=4s, which
+     * is the measured 8.75s to a usable image. Originals are recorded here so they can be put
+     * back; MIN_INTERVAL is 5, so the camera may clamp these - the read-back tells us.
+     * PROP_SWITCH is deliberately untouched (clearing it would disable auto-shutter entirely). */
+    ESP_LOGW(TAG, "p2: ---- setting preview-start shutter delays (was 1ST=5 2ND=4) ----");
+    static const struct { const char *name; uint16_t id; uint16_t val; } delays[] = {
+        { "PREVIEW_START_1ST_DELAY", P2_ASP_PREVIEW_START_1ST_DELAY, P2_SHUTTER_1ST_DELAY },
+        { "PREVIEW_START_2ND_DELAY", P2_ASP_PREVIEW_START_2ND_DELAY, P2_SHUTTER_2ND_DELAY },
+    };
+    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
+        esp_err_t we = p2_long_cmd_write(P2_CMD_SET_AUTO_SHUTTER, delays[i].id, delays[i].val);
+        uint8_t rb[2] = {0};
+        esp_err_t re = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, delays[i].id, rb, sizeof(rb));
+        ESP_LOGW(TAG, "p2:   %s := %u -> write %s, reads back %u%s",
+                 delays[i].name, delays[i].val,
+                 (we == ESP_OK) ? "OK" : p2_err(we),
+                 (re == ESP_OK) ? (unsigned)((rb[0] << 8) | rb[1]) : 9999u,
+                 (re == ESP_OK && ((rb[0] << 8) | rb[1]) != delays[i].val) ? "  <== CLAMPED" : "");
+    }
+#endif
 
     uint8_t v[2] = {0};
     if (p2_cmd_read(P2_CMD_CUR_VTEMP, 0, v, sizeof(v)) == ESP_OK) {

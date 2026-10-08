@@ -9,7 +9,7 @@ Priorities, in order: **boot time, framerate, latency.**
 ## Status
 
 Streams 256x384 YUY2 at a stable **25 fps** (the sensor's ceiling), **~36.9 ms** arrival-to-on-screen,
-**~2.16 s** from power-on to first image.
+**~2.16 s** from power-on to first image and **~6.7 s** to a fully calibrated one (down from ~11.8 s).
 
 ## Build
 
@@ -51,6 +51,40 @@ full-length and inside a plausible temperature band, so neither a frame-length c
 A useful metric for telling these apart is the mean absolute difference between horizontally
 adjacent raw pixels: ~0 flat, **~320 uncorrected, ~6 clean**.
 
+### Cutting the cold start (the auto-shutter delays)
+
+The uncorrected phase is **not** a missing FFC command - it is configuration. The camera schedules
+its own shutter events, and `get/set_prop_auto_shutter_params` (`0x8214` / `0xc214`) exposes the
+schedule. Factory defaults as read from the camera:
+
+| id | name | default |
+|---|---|---|
+| 0 | `PROP_SWITCH` | 1 (auto-shutter on) |
+| 1 | `MIN_INTERVAL` | 5 |
+| 2 | `MAX_INTERVAL` | 60 |
+| **9** | **`PREVIEW_START_1ST_DELAY`** | **5** |
+| **10** | **`PREVIEW_START_2ND_DELAY`** | **4** |
+| 11 | `CHANGE_GAIN_1ST_DELAY` | 5 |
+| 12 | `CHANGE_GAIN_2ND_DELAY` | 4 |
+
+Units are seconds, and 5 + 4 = 9 matches the measured 8.75 s exactly. The firmware writes both to 1
+as soon as the command channel opens (~2.7 s), which brings a usable image forward from
+**8753 ms to 4535 ms**. The two early shutter clicks the official phone app produces are these same
+two events with shorter delays configured - there is no manual-FFC opcode, which is why other
+projects looking for one did not find it.
+
+**These values do not survive the camera losing power** - a cold camera reads back 5/4 - so the
+firmware reapplies them on every connect. Nothing is permanently written to the camera.
+
+The remaining ~4.5 s is close to a floor: the command channel is not reachable until ~2.7 s (the
+same camera-readiness gate that ends the flat phase at ~2.6 s), plus ~1.8 s for the shutter to
+run and the NUC to be applied.
+
+Opcodes and parameter ids were extracted from `libircmd.so` in the official Android APK:
+`readelf --dyn-syms` lists ~155 JNI exports whose names are the SDK API, disassembly gives the
+opcode and packing, and `baksmali` on `classes.dex` gives the enum semantics
+(`CommonParams$PropAutoShutterParameter`).
+
 ### Vendor command channel
 
 Beyond UVC, the camera carries an InfiRay command interface behind two vendor control requests.
@@ -86,7 +120,6 @@ commands do **not** USB-stall; they return a camera status error in the ready by
   one net feeding the AXP2101's charger *input*; the PMIC is an NVDC charger with no boost at all.
   Powering the camera on battery needs an added 3.7→5 V boost module.
 - The image is ~8% vertically stretched at 416x312 (PPA scale factors quantize to 1/16 steps).
-- The FFC trigger opcode is still unknown, so cold-start calibration cannot be forced.
 
 ## Layout
 

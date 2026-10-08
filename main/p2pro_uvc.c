@@ -210,7 +210,12 @@ static void p2_log_first_clean(const uint16_t *raw16, size_t npix, int64_t t_ope
     }
     const uint32_t mad = n ? (uint32_t)(adiff / n) : 0;
     s_startup_roughness = mad;
-    if (mad > 0 && mad < 100) {
+    /* Low roughness alone is NOT enough: a CLOSED shutter is a uniform field and scores just as
+     * smooth as a calibrated image (measured: roughness ~7, spread 132). Without the spread test
+     * this fired mid-shutter and reported a calibration that had not happened yet. A real scene
+     * measured 532-730 counts of spread. */
+    const int spread = (int)s_dbg_max_v - (int)s_dbg_min_v;
+    if (mad > 0 && mad < 100 && spread > 300) {
         s_clean_logged = true;
         /* Report from device connect, not from stream open: anything done before stream_start
          * would otherwise be invisible in this number and make a change look better than it is. */
@@ -288,6 +293,13 @@ static void p2_frame_diag(const uint16_t *raw16, size_t npix, size_t data_len, i
  * schedules its own shutter events, and SHUTTER_PREVIEW_START_1ST/2ND_DELAY are the delays before
  * the first and second auto-shutter after preview starts. That is what the phone's two early
  * clicks are - the app is not triggering FFC manually, it configures when the camera does it. */
+/* shutter_manual_switch, from libircmd.so. Already carries the 0x4000 SET bit (0x4000|0x020c),
+ * so do NOT OR it again. Short form: the switch value is the parameter byte at header[2].
+ * CommonParams$ShutterManualSwitchType: SHUTTER_OPEN = 0, SHUTTER_CLOSE = 1. */
+#define P2_CMD_SHUTTER_MANUAL    0x420c
+#define P2_SHUTTER_OPEN          0
+#define P2_SHUTTER_CLOSE         1
+
 #define P2_CMD_GET_AUTO_SHUTTER  0x8214
 #define P2_CMD_SET_AUTO_SHUTTER  0xc214   /* 0x8214 | SET */
 
@@ -495,6 +507,18 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * Kept behind the flag only as a record that it was tried. */
 #define P2_EARLY_CONFIG 0
 
+/* Force a shutter cycle the moment the command channel answers, rather than waiting ~1.5s for the
+ * camera's auto logic to act on the rewritten schedule. This is a direct actuator, not a mode
+ * setting, so it is reversible by definition - but a shutter left closed would blind the camera,
+ * hence the unconditional reopen and the uniform-field check after it. */
+/* Disproved: forcing the shutter the moment the channel answers gave 5337/5281ms vs 5350/5425ms
+ * baseline - no gain. The ~1.5s after the trigger is the flat-field operation itself, not
+ * scheduling latency, so there is nothing to bring forward. It also blanks the image for ~800ms
+ * and risks leaving the shutter shut. Kept behind the flag as a record that it was measured. */
+#define P2_FORCE_SHUTTER 0
+/* One-off validation: fire the cycle even when the image is already clean. Set back to 0. */
+#define P2_SHUTTER_SELFTEST 0
+
 /* Poll the shutter/vtemp registers after start and log them, so the calibration event shows up in
  * the log instead of depending on hearing the click. Costs two control transfers per tick. */
 #define P2_WATCH_VTEMP   P2_DIAG
@@ -535,6 +559,43 @@ static void p2_vtemp_watch_task(void *arg)
 
 /* Writes the shutter schedule. Returns ESP_OK only if every write read back as requested, so the
  * caller can tell a real success from a camera that is not listening yet. */
+#if P2_FORCE_SHUTTER
+/* Close the shutter, give the camera time to sample and compute its flat-field, then reopen.
+ * The reopen is unconditional: if the camera already reopened by itself it is a harmless no-op,
+ * and if it treats the command as a dumb actuator it is what prevents a blind camera. */
+static void p2_force_shutter_cycle(void)
+{
+    ESP_LOGW(TAG, "p2: forcing shutter cycle (0x%04x)", P2_CMD_SHUTTER_MANUAL);
+    esp_err_t ce = p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_CLOSE);
+    ESP_LOGW(TAG, "p2:   close -> %s", (ce == ESP_OK) ? "OK" : p2_err(ce));
+    if (ce != ESP_OK) {
+        /* Never leave it ambiguous - try an open anyway in case the close partly took. */
+        p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(800));          /* long enough to sample and compute */
+    esp_err_t oe = p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+    ESP_LOGW(TAG, "p2:   open  -> %s", (oe == ESP_OK) ? "OK" : p2_err(oe));
+
+    /* A closed shutter presents a near-uniform field, which the clean-image detector would
+     * happily call "calibrated". Spread is the giveaway: a real scene was ~730 counts, the
+     * uncorrected phase ~3500. Measured with the shutter actually closed: 132 - so the original
+     * threshold of 50 would have let a stuck shutter through. 300 errs the safe way; a redundant
+     * reopen costs nothing, a missed one blinds the camera. */
+    for (int i = 0; i < 12; i++) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        const int spread = (int)s_dbg_max_v - (int)s_dbg_min_v;
+        if (spread > 300) {
+            ESP_LOGW(TAG, "p2:   field spread %d - shutter is open", spread);
+            return;
+        }
+    }
+    ESP_LOGE(TAG, "p2: field still uniform (spread %d) after reopen - retrying open",
+             (int)s_dbg_max_v - (int)s_dbg_min_v);
+    p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+}
+#endif
+
 static esp_err_t p2_write_shutter_schedule(const char *when)
 {
     static const struct { const char *name; uint16_t id; uint16_t val; } cfg[] = {
@@ -640,6 +701,14 @@ static void p2_camera_init(void)
     if (!s_shutter_cfg_done) {
         p2_write_shutter_schedule("late");
     }
+#if P2_FORCE_SHUTTER
+    /* Don't wait ~1.5s for the auto logic to act on the new schedule - trigger it now.
+     * P2_SHUTTER_SELFTEST forces one cycle even on an already-clean camera, to prove the
+     * actuator closes and reopens against a known-good baseline before relying on it cold. */
+    if (!s_clean_logged || P2_SHUTTER_SELFTEST) {
+        p2_force_shutter_cycle();
+    }
+#endif
 #endif
 
     uint8_t v[2] = {0};

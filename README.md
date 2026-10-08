@@ -89,12 +89,25 @@ The schedule must be rewritten **on every stream open**. The camera forgets it w
 power, so latching "already configured" after the first success silently restores the stock 5s+4s
 on every subsequent replug.
 
-Two things that do **not** work, both measured:
+Verified cold-plug timing with the schedule rewritten: **5216 / 5218 ms** from device connect to a
+calibrated image, against **9349 / 9366 ms** stock.
+
+Three things that do **not** work, all measured:
 - **Configuring before preview starts.** The delays count from preview start, so writing earlier
   should move the first shutter - but the command channel does not answer until preview is
   running, so there is no window in which to do it.
 - **Lowering `MIN_INTERVAL`.** The camera rejects the write with a status error and it reads back
   5 unchanged.
+- **Forcing the shutter** with `shutter_manual_switch` (`0x420c`, 0=OPEN / 1=CLOSE) the moment the
+  channel answers, instead of waiting for the auto logic. 5337/5281 ms vs 5350/5425 ms baseline:
+  no gain. The ~1.5 s after the trigger is the flat-field operation itself, not scheduling
+  latency, so there is nothing to bring forward — and it blanks the image for ~800 ms.
+
+  The actuator does work (close gives a uniform field, spread 132; open restores it), so it is
+  available if a manual FFC is ever wanted. **A closed shutter reads as a smooth, low-roughness
+  frame** — roughness ~7, indistinguishable from a calibrated image on roughness alone — so any
+  "is it calibrated yet" test must also require a realistic min/max spread. Without that, the
+  detector fires mid-shutter and reports a calibration that has not happened.
 
 **These values do not survive the camera losing power** - a cold camera reads back 5/4 - so the
 firmware reapplies them on every connect. Nothing is permanently written to the camera.

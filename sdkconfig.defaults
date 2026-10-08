@@ -11,3 +11,20 @@ CONFIG_LOG_COLORS=y
 # Boot time. The PSRAM power-on memory test costs ~890ms of the ~3s to first image and is a
 # manufacturing diagnostic, not something this build needs on every start.
 CONFIG_SPIRAM_MEMTEST=n
+
+# ---- boot time, round 2 ----
+# The boot log is ~1.5KB and ESP_LOG to UART blocks, which is ~130ms at 115200. Raising the
+# console baud keeps full diagnostics while cutting that ~8x. Serial tools must match.
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+# Bootloader prints ~20 lines we never read in normal use.
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+# Skip the SHA256 of the ~390KB app image on a power-on boot.
+CONFIG_BOOTLOADER_SKIP_VALIDATE_ON_POWER_ON=y
+# -O2. This is a per-frame-budget-bound app, so favour speed over size.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# Allows raising a component's log level to DEBUG at runtime (used by P2_DIAG). Costs flash only.
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+# Tried CONFIG_ESPTOOLPY_FLASHMODE_QIO: the esp32p4 target forces CONFIG_ESPTOOLPY_FLASHMODE="dio"
+# regardless, so it had no effect. Left out rather than left in looking effective.
+# Nothing reads the bootloader banner in normal use, and UART output blocks.
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

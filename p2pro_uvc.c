@@ -177,7 +177,6 @@ static volatile int64_t  s_stream_open_us = 0;  /* when the current stream opene
 /* Spatial roughness of the radiometric half. ~320 on uncorrected cold data, ~6 once the
  * camera applies its flat-field - so a collapse here IS the FFC-completed signal. */
 static volatile uint32_t s_dbg_neigh_mad = 0;
-static volatile bool s_clean_logged = false;  /* one-shot: time-to-calibrated per stream */
 #define P2_RAW_UNCAL 32768u   /* 0x8000 - flat sentinel until the camera calibrates */
 
 /* Characterises what is actually in the radiometric half, to explain the ~6s of garbled image that
@@ -186,33 +185,6 @@ static volatile bool s_clean_logged = false;  /* one-shot: time-to-calibrated pe
  * Real radiometric data is spatially smooth and sits in a narrow band around ambient; preview/YUY2
  * bytes reinterpreted as uint16 are high-variance and spread across the whole range. So log the
  * neighbour-difference magnitude and how many pixels fall outside a plausible thermal band. */
-/* Logs a single line when the camera's flat-field lands, so time-to-calibrated is always
- * visible without the full per-frame diagnostic. Subsamples every 7th adjacent pair and stops
- * computing anything at all once it has fired, so the steady-state cost is one bool test. */
-static void p2_log_first_clean(const uint16_t *raw16, size_t npix, int64_t t_open_us)
-{
-    /* s_dbg_min_v is published late in the render loop, so it is stale here on the first frames -
-     * test the data itself. During the flat phase every pixel is the sentinel, so one sample is
-     * enough. A real thermal image always has some spatial variation, so a roughness of exactly
-     * zero means "not real data", never "perfectly calibrated". */
-    if (s_clean_logged || raw16[0] == P2_RAW_UNCAL) {
-        return;
-    }
-    uint64_t adiff = 0;
-    size_t n = 0;
-    for (size_t i = 1; i < npix; i += 7) {
-        const int d = (int)raw16[i] - (int)raw16[i - 1];
-        adiff += (uint64_t)(d < 0 ? -d : d);
-        n++;
-    }
-    const uint32_t mad = n ? (uint32_t)(adiff / n) : 0;
-    if (mad > 0 && mad < 100) {
-        s_clean_logged = true;
-        ESP_LOGW(TAG, "camera calibrated: clean image %d ms after stream open (roughness %u)",
-                 (int)((esp_timer_get_time() - t_open_us) / 1000), (unsigned)mad);
-    }
-}
-
 static void p2_frame_diag(const uint16_t *raw16, size_t npix, size_t data_len, int64_t t_open_us)
 {
 #if !P2_DIAG
@@ -1480,7 +1452,6 @@ static void render_task(void *arg)
         const uint16_t *raw16 = (const uint16_t *)raw_half;
         size_t npix = RAW_H_RES * RAW_V_RES;
         p2_frame_diag(raw16, npix, qf.frame->data_len, s_stream_open_us);
-        p2_log_first_clean(raw16, npix, s_stream_open_us);
 
         /* --- flat-field correction --- */
         if (s_ffc_req) { /* start a capture; accumulate UNcorrected frames */
@@ -1809,7 +1780,6 @@ static void streaming_task(void *arg)
         }
         BOOT_MARK("uvc: stream_start returned (first image)");
         s_stream_open_us = esp_timer_get_time();
-        s_clean_logged = false;   /* re-arm for this stream */
         ESP_LOGI(TAG, "Stream opened, starting continuous render");
         p2_camera_init();
         s_stream_restart_req = false;

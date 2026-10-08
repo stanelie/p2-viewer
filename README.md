@@ -9,7 +9,7 @@ Priorities, in order: **boot time, framerate, latency.**
 ## Status
 
 Streams 256x384 YUY2 at a stable **25 fps** (the sensor's ceiling), **~36.9 ms** arrival-to-on-screen,
-**~2.16 s** from power-on to first image and **~6.7 s** to a fully calibrated one (down from ~11.8 s).
+**~1.71 s** from power-on to first image and **~6.4 s** to a fully calibrated one (down from ~11.8 s).
 
 ## Build
 
@@ -125,6 +125,31 @@ commands do **not** USB-stall; they return a camera status error in the ready by
 
 ```
 main/p2pro_uvc.c    all firmware
-sdkconfig.defaults  config that matters (CONFIG_SPIRAM_MEMTEST=n saves ~890ms of boot)
+sdkconfig.defaults  config that matters (see Boot time below)
 docs/               P2 Pro protocol reference
 ```
+
+## Boot time
+
+Measured breakdown to first image, 3049 ms originally, **1709 ms** now:
+
+| phase | cost | notes |
+|---|---|---|
+| ROM + bootloader + PSRAM + system init | ~410 ms | `CONFIG_SPIRAM_MEMTEST=n` removed ~890 ms of this |
+| USB host install | 40 ms | moved to the *front* of `app_main` |
+| display init | 310 ms | now runs **inside** the enumeration wait, so it is free |
+| camera USB enumeration | ~550 ms | the camera's own; overlapped with display init |
+| `uvc_host_stream_start` | ~650 ms | the camera processing SET_INTERFACE; not reducible from the host |
+
+The structural win was ordering: USB enumeration takes ~550 ms and proceeds on its own task, so
+installing the host first and doing display init and buffer allocation inside that window hides
+~310 ms. A semaphore gates the streaming task so it cannot touch buffers before they exist.
+
+Things tried that did **not** help: `CONFIG_ESPTOOLPY_FLASHMODE_QIO` (the esp32p4 target forces
+`dio` regardless), silencing the bootloader log (~3 ms once it was already at WARN), and
+`CONFIG_ESP_CONSOLE_UART_BAUDRATE` (only settable with `ESP_CONSOLE_UART_CUSTOM`, otherwise pinned
+at 115200).
+
+Set `P2_DIAG 1` in `main/p2pro_uvc.c` to re-enable the investigation instrumentation (auto-shutter
+dump, per-frame content diagnostic, UVC component DEBUG logs). The one-line
+`camera calibrated: clean image N ms after stream open` report is always on.

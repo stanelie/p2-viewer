@@ -112,9 +112,27 @@ Three things that do **not** work, all measured:
 **These values do not survive the camera losing power** - a cold camera reads back 5/4 - so the
 firmware reapplies them on every connect. Nothing is permanently written to the camera.
 
-The remaining ~4.5 s is close to a floor: the command channel is not reachable until ~2.7 s (the
-same camera-readiness gate that ends the flat phase at ~2.6 s), plus ~1.8 s for the shutter to
-run and the NUC to be applied.
+### Where the remaining time goes
+
+Measured on a true cold boot (board and camera both unpowered), timestamps are ms since power-on:
+
+| segment | cost | whose |
+|---|---|---|
+| power-on -> camera enumerated | 1009 ms | ours |
+| -> first image on screen | 700 ms | camera (SET_INTERFACE) |
+| -> command channel answers | 2832 ms | **camera** |
+| -> schedule written | 140 ms | ours |
+| -> flat-field complete | 1520 ms | **camera** |
+| **total** | **6209 ms** | |
+
+The command channel answers **~4.5 s after the camera receives power** - 4549 ms from power-on here,
+and ~4.2 s after plug-in across the replug tests, despite very different host timings in the two
+cases. So it is gated by the camera's own boot, not by when the host starts preview.
+
+**Further boot optimisation will not improve time-to-calibrated.** The first image is already on
+screen at ~1.7 s, 2.8 s before the camera will talk to us at all. Cutting host boot further makes
+the first frame appear sooner but leaves the usable image at ~6.2 s. About 4.35 s of that 6.2 s is
+the camera's own boot plus its flat-field.
 
 Opcodes and parameter ids were extracted from `libircmd.so` in the official Android APK:
 `readelf --dyn-syms` lists ~155 JNI exports whose names are the SDK API, disassembly gives the

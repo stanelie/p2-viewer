@@ -1,0 +1,18 @@
+# ESP-IDF build output
+/build/
+build/
+
+# Fetched by the IDF component manager from main/idf_component.yml + dependencies.lock.
+# Not source, and ~5MB.
+/managed_components/
+
+# Generated from sdkconfig.defaults on first build. sdkconfig.defaults is the real source;
+# committing this one causes confusing drift between machines.
+/sdkconfig
+/sdkconfig.old
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

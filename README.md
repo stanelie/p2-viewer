@@ -12,6 +12,18 @@ Streams 256x384 YUY2 at a stable **25 fps** (the sensor's ceiling), **~36.9 ms**
 **~1.71 s** from power-on to first image and **~6.4 s** to a fully calibrated one (down from ~11.8 s).
 Time-to-calibrated is reported on the console every stream open.
 
+## Flashing a prebuilt binary
+
+The [latest release](https://github.com/stanelie/p2-viewer/releases/latest) carries a single merged
+image. Flash it at `0x0` via the **UART** Type-C port, so the OTG port stays free for the camera:
+
+```bash
+esptool.py --chip esp32p4 -b 460800 write_flash 0x0 p2-viewer-v1.0.0-esp32p4.bin
+```
+
+That writes the bootloader, partition table and app, and leaves a stored flat-field table intact.
+For a clean device, `esptool.py --chip esp32p4 erase_flash` first.
+
 ## Build
 
 Needs **ESP-IDF v5.5+**. The board's ESP32-P4 is silicon revision **v3.2**, which IDF v5.3.x

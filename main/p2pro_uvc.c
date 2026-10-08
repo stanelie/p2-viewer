@@ -15,6 +15,8 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"   /* esp_ptr_internal() */
+#include "esp_partition.h"
+#include "esp_crc.h"
 #include "esp_check.h"
 
 #include "freertos/FreeRTOS.h"
@@ -138,6 +140,93 @@ static uint32_t *s_ffc_accum;
 static volatile bool s_ffc_active = false;
 static volatile bool s_ffc_req = false;
 static int s_ffc_remaining = 0;
+
+/* ---- persisted flat-field table -------------------------------------------------------------
+ * A wall-based FFC sees the WHOLE optical path, so it corrects things the camera's own shutter FFC
+ * structurally cannot: the shutter sits behind the lens, so anything in the optics (a speck on the
+ * window, vignetting) is invisible to it and survives every shutter cycle. That part of the table
+ * is a physical property of the camera, identical on every power-up, so it is worth keeping.
+ *
+ * Stored raw in its own 64KB partition: 48KB does not fit the 24KB NVS partition, and a raw write
+ * avoids NVS blob overhead. CLR erases it, so this stays reversible. */
+#define FFC_STORE_MAGIC   0x50324646u   /* 'P2FF' */
+#define FFC_STORE_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t npix;
+    uint32_t crc;      /* esp_crc32_le over the offset bytes */
+} ffc_store_hdr_t;
+
+static const esp_partition_t *ffc_part(void)
+{
+    static const esp_partition_t *p;
+    static bool looked;
+    if (!looked) {
+        looked = true;
+        p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "ffc");
+        if (!p) {
+            ESP_LOGW(TAG, "FFC: no 'ffc' partition - correction will not persist");
+        }
+    }
+    return p;
+}
+
+static void ffc_store_save(size_t npix)
+{
+    const esp_partition_t *part = ffc_part();
+    if (!part) {
+        return;
+    }
+    ffc_store_hdr_t h = {
+        .magic = FFC_STORE_MAGIC,
+        .version = FFC_STORE_VERSION,
+        .npix = (uint32_t)npix,
+        .crc = esp_crc32_le(0, (const uint8_t *)s_ffc_offset, npix),
+    };
+    esp_err_t e = esp_partition_erase_range(part, 0, (sizeof(h) + npix + 0xFFF) & ~0xFFFU);
+    if (e == ESP_OK) { e = esp_partition_write(part, 0, &h, sizeof(h)); }
+    if (e == ESP_OK) { e = esp_partition_write(part, sizeof(h), s_ffc_offset, npix); }
+    ESP_LOGI(TAG, "FFC: %s stored table (%u bytes)",
+             (e == ESP_OK) ? "saved" : esp_err_to_name(e), (unsigned)npix);
+}
+
+static void ffc_store_erase(void)
+{
+    const esp_partition_t *part = ffc_part();
+    if (!part) {
+        return;
+    }
+    esp_err_t e = esp_partition_erase_range(part, 0, 0x1000);  /* drop the header -> invalid */
+    ESP_LOGI(TAG, "FFC: stored table %s", (e == ESP_OK) ? "erased" : esp_err_to_name(e));
+}
+
+/* Returns true if a valid table was loaded into s_ffc_offset. */
+static bool ffc_store_load(size_t npix)
+{
+    const esp_partition_t *part = ffc_part();
+    if (!part) {
+        return false;
+    }
+    ffc_store_hdr_t h;
+    if (esp_partition_read(part, 0, &h, sizeof(h)) != ESP_OK) {
+        return false;
+    }
+    if (h.magic != FFC_STORE_MAGIC || h.version != FFC_STORE_VERSION || h.npix != npix) {
+        return false;                      /* nothing stored, or from a different build */
+    }
+    if (esp_partition_read(part, sizeof(h), s_ffc_offset, npix) != ESP_OK) {
+        return false;
+    }
+    const uint32_t crc = esp_crc32_le(0, (const uint8_t *)s_ffc_offset, npix);
+    if (crc != h.crc) {
+        ESP_LOGW(TAG, "FFC: stored table failed CRC - ignoring");
+        return false;
+    }
+    ESP_LOGI(TAG, "FFC: restored stored table (%u bytes)", (unsigned)npix);
+    return true;
+}
 
 /* One press = 2 C. Raw counts are Kelvin*64, so a 2 K step is 2*64. */
 #define ADJ_STEP_RAW (2 * 64)
@@ -501,6 +590,7 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * UART blocks, and at 115200 these cost ~200ms of boot on their own - so they are off unless
  * something is being investigated. BOOT_MARK stays on; it is ~12 lines and worth it. */
 #define P2_DIAG 0
+
 
 #define P2_SET_SHUTTER_DELAYS 1
 #define P2_SHUTTER_1ST_DELAY  1
@@ -1333,6 +1423,88 @@ static esp_err_t display_init(void)
 
 /* ---------------- Touch (OSD toggle) ---------------- */
 
+/* ---- power button: 2s hold to power off -------------------------------------------------------
+ * The AXP2101's own PWROFF long-press (REG 0x27 bits 3:2) only offers 4/6/8/10s, and shipped
+ * configured for 6s. 2s is therefore not reachable by configuration - but the chip can raise a
+ * long-press IRQ at 1/1.5/2/2.5s (bits 5:4), so we take that at 2s and command the shutdown.
+ *
+ * Observed on hardware, status register 0x49: bit 1 = press, bit 2 = long press at IRQLEVEL,
+ * bit 0 = release. Those latch even with the IRQ masked in 0x41, so polling is enough and the
+ * interrupt-enable registers are left alone.
+ *
+ * OFFLEVEL is also dropped to its 4s minimum. That is deliberately LONGER than our 2s software
+ * path, so it acts as a backstop: if this task ever wedges, holding the button still cuts power
+ * in hardware. */
+#define PMIC_ADDR            0x34
+#define PMIC_REG_COMMON_CFG  0x10   /* bit 0: soft power off */
+#define PMIC_REG_PWRON_CFG   0x27
+#define PMIC_REG_IRQ_STATUS2 0x49
+#define PMIC_IRQ_PRESS       0x02
+#define PMIC_IRQ_LONGPRESS   0x04
+#define PMIC_IRQ_RELEASE     0x01
+/* IRQLEVEL=10 (2s), OFFLEVEL=00 (4s), ONLEVEL=00 (128ms) */
+#define PMIC_PWRON_CFG_VALUE 0x20
+
+static i2c_master_dev_handle_t s_pmic;
+
+static esp_err_t pmic_rd(uint8_t reg, uint8_t *val)
+{
+    return i2c_master_transmit_receive(s_pmic, &reg, 1, val, 1, 100);
+}
+
+static esp_err_t pmic_wr(uint8_t reg, uint8_t val)
+{
+    const uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(s_pmic, buf, 2, 100);
+}
+
+static void pmic_power_task(void *arg)
+{
+    (void)arg;
+    uint8_t before = 0;
+    pmic_rd(PMIC_REG_PWRON_CFG, &before);
+    if (pmic_wr(PMIC_REG_PWRON_CFG, PMIC_PWRON_CFG_VALUE) != ESP_OK) {
+        ESP_LOGW(TAG, "power: could not configure PWRON timing - leaving hardware default");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "power: PWRON cfg 0x%02x -> 0x%02x (irq 2s, hw off 4s backstop)",
+             before, PMIC_PWRON_CFG_VALUE);
+
+    /* Clear anything latched from the power-on press itself, then require a FRESH press before
+     * honouring a long press. Without that, holding the button to switch the device ON leaves a
+     * long-press bit set and we would shut straight back down. */
+    for (uint8_t r = 0x48; r <= 0x4A; r++) {
+        uint8_t st = 0;
+        if (pmic_rd(r, &st) == ESP_OK && st) {
+            pmic_wr(r, st);
+        }
+    }
+
+    bool armed = false;
+    while (true) {
+        uint8_t st = 0;
+        if (pmic_rd(PMIC_REG_IRQ_STATUS2, &st) == ESP_OK && st) {
+            if (st & PMIC_IRQ_PRESS) {
+                armed = true;
+            }
+            if (st & PMIC_IRQ_RELEASE) {
+                armed = false;
+            }
+            if (armed && (st & PMIC_IRQ_LONGPRESS)) {
+                ESP_LOGW(TAG, "power: 2s hold - powering off");
+                uint8_t cc = 0;
+                if (pmic_rd(PMIC_REG_COMMON_CFG, &cc) == ESP_OK) {
+                    pmic_wr(PMIC_REG_COMMON_CFG, (uint8_t)(cc | 0x01));
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));   /* should not return */
+            }
+            pmic_wr(PMIC_REG_IRQ_STATUS2, st);    /* write-1-to-clear */
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+}
+
 static esp_err_t touch_init(void)
 {
     i2c_master_bus_handle_t i2c_bus = NULL;
@@ -1345,6 +1517,21 @@ static esp_err_t touch_init(void)
         .flags.enable_internal_pullup = true,
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_bus_conf, &i2c_bus), TAG, "i2c bus");
+
+    /* The AXP2101 PMIC shares this bus (scanned: 0x18, 0x34 PMIC, 0x36, 0x38 touch). */
+    const i2c_device_config_t pmic_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = PMIC_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    if (i2c_master_bus_add_device(i2c_bus, &pmic_cfg, &s_pmic) == ESP_OK) {
+        xTaskCreate(pmic_power_task, "pmicpwr", 3072, NULL, 4, NULL);
+    } else {
+        ESP_LOGW(TAG, "power: PMIC not reachable - power button keeps its hardware timing");
+    }
+
+
+
 
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
@@ -1434,6 +1621,7 @@ static void touch_task(void *arg)
                 if (s_ffc_active || s_ffc_remaining) {
                     s_ffc_active = false;
                     s_ffc_remaining = 0;
+                    ffc_store_erase();
                     ESP_LOGI(TAG, "FFC cleared");
                 } else {
                     s_ffc_req = true;
@@ -1641,6 +1829,7 @@ static void render_task(void *arg)
                 }
                 s_ffc_active = true;
                 ESP_LOGI(TAG, "FFC captured over %d frames (mean %d)", FFC_FRAMES, (int)mean);
+                ffc_store_save(npix);
             }
             s_osd_dirty = true;
         }
@@ -2103,6 +2292,9 @@ void app_main(void)
     s_ffc_offset    = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(int8_t),   MALLOC_CAP_SPIRAM);
     s_ffc_accum     = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
     assert(s_ffc_offset && s_ffc_accum);
+    if (ffc_store_load((size_t)RAW_H_RES * RAW_V_RES)) {
+        s_ffc_active = true;   /* the side-bar button shows CLR, so this is visible and undoable */
+    }
 
     const ppa_client_config_t ppa_client_config = {
         .oper_type = PPA_OPERATION_SRM,

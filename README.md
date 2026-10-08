@@ -166,8 +166,19 @@ commands do **not** USB-stall; they return a camera status error in the ready by
 ## Flat-field correction button
 
 Aim at something thermally uniform and press FFC. It averages 32 frames (~1.3 s) and applies each
-pixel's deviation from the frame mean. RAM-only, never persisted, so a power cycle always starts
-from the camera's own calibration.
+pixel's deviation from the frame mean.
+
+**The table is persisted** to a dedicated 64 KB `ffc` partition (48 KB of `int8` offsets plus magic,
+version, pixel count and CRC32) and restored at boot. It is rejected if the CRC fails or it came
+from a different geometry, so a corrupt table cannot silently degrade the image, and `CLR` erases
+it. The side-bar button reads `CLR` whenever a correction is active - including a restored one - so
+it is never applied invisibly.
+
+This is worth persisting because a wall-based correction fixes something the camera structurally
+cannot. The shutter sits *behind* the lens, so the camera's own FFC is blind to anything in the
+optical path - a speck on the window, vignetting - which therefore survives every shutter cycle. A
+wall-based capture sees the whole path. That component is a physical property of the camera and is
+identical on every power-up.
 
 **The camera's own shutter is NOT used as the reference, although it was tried.** Mechanically it
 is the obvious choice - `shutter_manual_switch` (`0x420c`) closes it and it presents a field with
@@ -182,6 +193,7 @@ frame budget that already has only ~3 ms spare:
 |---|---|---|
 | separate corrected-copy pass (PSRAM) | 13.9 ms | 90-110 ms, runaway backlog |
 | folded into the existing passes, `int16` | 12.0 ms | 39.4 ms, stable |
+| folded, `int8` offsets (current) | 11.3 ms | 38.3 ms, stable |
 
 Materialising a corrected copy costs read-raw + read-offset + write-copy + re-read-copy, all PSRAM.
 Folding the offset into the loops that already read each pixel removes three of those four streams.
@@ -195,6 +207,26 @@ continuous `Frame buffer underflow`. Measured, not theorised.
 **The 5x7 font only carries the characters the UI happens to need.** A missing glyph renders as a
 hollow box (deliberately - it used to render blank, which made `CALIBRATING` silently appear as
 `CALI RATING` and `FFC` as two squares). Adding a label means checking its characters exist.
+
+## Power button
+
+Holding the power button for **2 s** powers the device off. The AXP2101's own `PWROFF` long-press
+(REG `0x27` bits 3:2) only offers 4/6/8/10 s and shipped set to 6 s, so 2 s is not reachable by
+configuration. Instead the chip's long-press *interrupt* (bits 5:4, options 1/1.5/2/2.5 s) is set to
+2 s and the firmware commands the shutdown itself via `0x10` bit 0.
+
+`OFFLEVEL` is also dropped to its 4 s minimum. That is deliberately longer than the 2 s software
+path, so it acts as a backstop: if the firmware wedges, holding the button still cuts power in
+hardware.
+
+Observed on hardware, status register `0x49`: **bit 1 = press, bit 2 = long press at IRQLEVEL,
+bit 0 = release**. Those bits latch even with the interrupt masked in `0x41`, so polling is
+sufficient and the interrupt-enable registers are left untouched. The task requires a *fresh press*
+before honouring a long press - otherwise holding the button to switch the device **on** leaves a
+long-press bit set and it would shut straight back down.
+
+The PMIC shares the touch I2C bus (port 1, SDA 7, SCL 8). A scan of that bus finds `0x18`,
+`0x34` (AXP2101), `0x36` and `0x38` (FT5x06 touch).
 
 ## Known limitations
 

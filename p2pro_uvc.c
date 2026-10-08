@@ -14,6 +14,9 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"   /* esp_ptr_internal() */
+#include "esp_partition.h"
+#include "esp_crc.h"
 #include "esp_check.h"
 
 #include "freertos/FreeRTOS.h"
@@ -119,16 +122,111 @@ static int s_bar_w, s_bar_h, s_bar_x, s_bar_y;
 #define SLOT_MINPLUS 5
 #define SLOT_MINMINUS 6
 
-/* Software flat-field correction. The camera's own shutter FFC is strictly better (it has a
- * real uniform reference); this corrects residual drift between those, and needs the user to
- * aim at something thermally uniform before pressing. Never persisted - RAM only. */
+/* Software flat-field correction. Aim at something thermally uniform and press.
+ *
+ * This deliberately does NOT use the camera's own shutter as the reference, although the shutter
+ * is mechanically the obvious choice and was tried: the shutter has a thermal gradient of its own,
+ * so a table captured from it encodes that gradient and corrects less well than a plain uniform
+ * surface at a distance. Tested on hardware and reverted.
+ *
+ * Never persisted - RAM only, so a power cycle always starts from the camera's own correction. */
 #define FFC_FRAMES 32          /* ~1.3s at 25fps - averages the temporal noise down */
-static int16_t  *s_ffc_offset;    /* per-pixel deviation from the frame mean */
-static uint16_t *s_ffc_corrected; /* raw minus offset, so downstream code is unchanged */
+/* int8, not int16: halves the PSRAM read this table costs in the per-pixel loop. 1 count is
+ * 1/64 K, so +/-127 covers +/-2 C of offset - ample for FPN residual (a closed shutter measured
+ * 112 counts of total spread, i.e. deviations within about +/-56). Saturation is counted and
+ * reported, so if a camera ever needs more range we will know rather than silently clip. */
+static int8_t   *s_ffc_offset;    /* per-pixel deviation from the frame mean, counts */
 static uint32_t *s_ffc_accum;
 static volatile bool s_ffc_active = false;
 static volatile bool s_ffc_req = false;
 static int s_ffc_remaining = 0;
+
+/* ---- persisted flat-field table -------------------------------------------------------------
+ * A wall-based FFC sees the WHOLE optical path, so it corrects things the camera's own shutter FFC
+ * structurally cannot: the shutter sits behind the lens, so anything in the optics (a speck on the
+ * window, vignetting) is invisible to it and survives every shutter cycle. That part of the table
+ * is a physical property of the camera, identical on every power-up, so it is worth keeping.
+ *
+ * Stored raw in its own 64KB partition: 48KB does not fit the 24KB NVS partition, and a raw write
+ * avoids NVS blob overhead. CLR erases it, so this stays reversible. */
+#define FFC_STORE_MAGIC   0x50324646u   /* 'P2FF' */
+#define FFC_STORE_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t npix;
+    uint32_t crc;      /* esp_crc32_le over the offset bytes */
+} ffc_store_hdr_t;
+
+static const esp_partition_t *ffc_part(void)
+{
+    static const esp_partition_t *p;
+    static bool looked;
+    if (!looked) {
+        looked = true;
+        p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "ffc");
+        if (!p) {
+            ESP_LOGW(TAG, "FFC: no 'ffc' partition - correction will not persist");
+        }
+    }
+    return p;
+}
+
+static void ffc_store_save(size_t npix)
+{
+    const esp_partition_t *part = ffc_part();
+    if (!part) {
+        return;
+    }
+    ffc_store_hdr_t h = {
+        .magic = FFC_STORE_MAGIC,
+        .version = FFC_STORE_VERSION,
+        .npix = (uint32_t)npix,
+        .crc = esp_crc32_le(0, (const uint8_t *)s_ffc_offset, npix),
+    };
+    esp_err_t e = esp_partition_erase_range(part, 0, (sizeof(h) + npix + 0xFFF) & ~0xFFFU);
+    if (e == ESP_OK) { e = esp_partition_write(part, 0, &h, sizeof(h)); }
+    if (e == ESP_OK) { e = esp_partition_write(part, sizeof(h), s_ffc_offset, npix); }
+    ESP_LOGI(TAG, "FFC: %s stored table (%u bytes)",
+             (e == ESP_OK) ? "saved" : esp_err_to_name(e), (unsigned)npix);
+}
+
+static void ffc_store_erase(void)
+{
+    const esp_partition_t *part = ffc_part();
+    if (!part) {
+        return;
+    }
+    esp_err_t e = esp_partition_erase_range(part, 0, 0x1000);  /* drop the header -> invalid */
+    ESP_LOGI(TAG, "FFC: stored table %s", (e == ESP_OK) ? "erased" : esp_err_to_name(e));
+}
+
+/* Returns true if a valid table was loaded into s_ffc_offset. */
+static bool ffc_store_load(size_t npix)
+{
+    const esp_partition_t *part = ffc_part();
+    if (!part) {
+        return false;
+    }
+    ffc_store_hdr_t h;
+    if (esp_partition_read(part, 0, &h, sizeof(h)) != ESP_OK) {
+        return false;
+    }
+    if (h.magic != FFC_STORE_MAGIC || h.version != FFC_STORE_VERSION || h.npix != npix) {
+        return false;                      /* nothing stored, or from a different build */
+    }
+    if (esp_partition_read(part, sizeof(h), s_ffc_offset, npix) != ESP_OK) {
+        return false;
+    }
+    const uint32_t crc = esp_crc32_le(0, (const uint8_t *)s_ffc_offset, npix);
+    if (crc != h.crc) {
+        ESP_LOGW(TAG, "FFC: stored table failed CRC - ignoring");
+        return false;
+    }
+    ESP_LOGI(TAG, "FFC: restored stored table (%u bytes)", (unsigned)npix);
+    return true;
+}
 
 /* One press = 2 C. Raw counts are Kelvin*64, so a 2 K step is 2*64. */
 #define ADJ_STEP_RAW (2 * 64)
@@ -177,6 +275,10 @@ static volatile int64_t  s_stream_open_us = 0;  /* when the current stream opene
 /* Spatial roughness of the radiometric half. ~320 on uncorrected cold data, ~6 once the
  * camera applies its flat-field - so a collapse here IS the FFC-completed signal. */
 static volatile uint32_t s_dbg_neigh_mad = 0;
+static volatile bool s_clean_logged = false;  /* one-shot: time-to-calibrated per stream */
+static volatile uint32_t s_startup_roughness = 0; /* only meaningful until s_clean_logged */
+static volatile bool s_shutter_cfg_done = false; /* set when the schedule write verified */
+static volatile int64_t s_connect_us = 0;  /* device-connect time: what the user actually waits */
 #define P2_RAW_UNCAL 32768u   /* 0x8000 - flat sentinel until the camera calibrates */
 
 /* Characterises what is actually in the radiometric half, to explain the ~6s of garbled image that
@@ -185,6 +287,43 @@ static volatile uint32_t s_dbg_neigh_mad = 0;
  * Real radiometric data is spatially smooth and sits in a narrow band around ambient; preview/YUY2
  * bytes reinterpreted as uint16 are high-variance and spread across the whole range. So log the
  * neighbour-difference magnitude and how many pixels fall outside a plausible thermal band. */
+/* Logs a single line when the camera's flat-field lands, so time-to-calibrated is always
+ * visible without the full per-frame diagnostic. Subsamples every 7th adjacent pair and stops
+ * computing anything at all once it has fired, so the steady-state cost is one bool test. */
+static void p2_log_first_clean(const uint16_t *raw16, size_t npix, int64_t t_open_us)
+{
+    /* s_dbg_min_v is published late in the render loop, so it is stale here on the first frames -
+     * test the data itself. During the flat phase every pixel is the sentinel, so one sample is
+     * enough. A real thermal image always has some spatial variation, so a roughness of exactly
+     * zero means "not real data", never "perfectly calibrated". */
+    if (s_clean_logged || raw16[0] == P2_RAW_UNCAL) {
+        return;
+    }
+    uint64_t adiff = 0;
+    size_t n = 0;
+    for (size_t i = 1; i < npix; i += 7) {
+        const int d = (int)raw16[i] - (int)raw16[i - 1];
+        adiff += (uint64_t)(d < 0 ? -d : d);
+        n++;
+    }
+    const uint32_t mad = n ? (uint32_t)(adiff / n) : 0;
+    s_startup_roughness = mad;
+    /* Low roughness alone is NOT enough: a CLOSED shutter is a uniform field and scores just as
+     * smooth as a calibrated image (measured: roughness ~7, spread 132). Without the spread test
+     * this fired mid-shutter and reported a calibration that had not happened yet. A real scene
+     * measured 532-730 counts of spread. */
+    const int spread = (int)s_dbg_max_v - (int)s_dbg_min_v;
+    if (mad > 0 && mad < 100 && spread > 300) {
+        s_clean_logged = true;
+        /* Report from device connect, not from stream open: anything done before stream_start
+         * would otherwise be invisible in this number and make a change look better than it is. */
+        const int64_t now = esp_timer_get_time();
+        ESP_LOGW(TAG, "camera calibrated: %d ms after connect (%d ms after stream open, roughness %u)",
+                 s_connect_us ? (int)((now - s_connect_us) / 1000) : -1,
+                 (int)((now - t_open_us) / 1000), (unsigned)mad);
+    }
+}
+
 static void p2_frame_diag(const uint16_t *raw16, size_t npix, size_t data_len, int64_t t_open_us)
 {
 #if !P2_DIAG
@@ -252,6 +391,13 @@ static void p2_frame_diag(const uint16_t *raw16, size_t npix, size_t data_len, i
  * schedules its own shutter events, and SHUTTER_PREVIEW_START_1ST/2ND_DELAY are the delays before
  * the first and second auto-shutter after preview starts. That is what the phone's two early
  * clicks are - the app is not triggering FFC manually, it configures when the camera does it. */
+/* shutter_manual_switch, from libircmd.so. Already carries the 0x4000 SET bit (0x4000|0x020c),
+ * so do NOT OR it again. Short form: the switch value is the parameter byte at header[2].
+ * CommonParams$ShutterManualSwitchType: SHUTTER_OPEN = 0, SHUTTER_CLOSE = 1. */
+#define P2_CMD_SHUTTER_MANUAL    0x420c
+#define P2_SHUTTER_OPEN          0
+#define P2_SHUTTER_CLOSE         1
+
 #define P2_CMD_GET_AUTO_SHUTTER  0x8214
 #define P2_CMD_SET_AUTO_SHUTTER  0xc214   /* 0x8214 | SET */
 
@@ -445,9 +591,32 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * something is being investigated. BOOT_MARK stays on; it is ~12 lines and worth it. */
 #define P2_DIAG 0
 
+
 #define P2_SET_SHUTTER_DELAYS 1
 #define P2_SHUTTER_1ST_DELAY  1
 #define P2_SHUTTER_2ND_DELAY  1
+/* MIN_INTERVAL (default 5s) may gate how soon a second shutter is allowed after whatever the
+ * camera does during its flat phase. Lower it too, same risk class, default recorded. */
+#define P2_SHUTTER_MIN_INTERVAL 1
+/* Try configuring BEFORE preview starts. The delays are counted from preview start, so writing
+ * after stream_start (~3s, once the channel answers) may already be too late to move the first
+ * shutter. The device handle exists after stream_open, so the channel can be tried there. */
+/* Disproved: the command channel does not answer until preview is running, so the schedule
+ * cannot be written before stream_start. The probe loop also cost ~1s of time-to-first-image.
+ * Kept behind the flag only as a record that it was tried. */
+#define P2_EARLY_CONFIG 0
+
+/* Force a shutter cycle the moment the command channel answers, rather than waiting ~1.5s for the
+ * camera's auto logic to act on the rewritten schedule. This is a direct actuator, not a mode
+ * setting, so it is reversible by definition - but a shutter left closed would blind the camera,
+ * hence the unconditional reopen and the uniform-field check after it. */
+/* Disproved: forcing the shutter the moment the channel answers gave 5337/5281ms vs 5350/5425ms
+ * baseline - no gain. The ~1.5s after the trigger is the flat-field operation itself, not
+ * scheduling latency, so there is nothing to bring forward. It also blanks the image for ~800ms
+ * and risks leaving the shutter shut. Kept behind the flag as a record that it was measured. */
+#define P2_FORCE_SHUTTER 0
+/* One-off validation: fire the cycle even when the image is already clean. Set back to 0. */
+#define P2_SHUTTER_SELFTEST 0
 
 /* Poll the shutter/vtemp registers after start and log them, so the calibration event shows up in
  * the log instead of depending on hearing the click. Costs two control transfers per tick. */
@@ -486,6 +655,71 @@ static void p2_vtemp_watch_task(void *arg)
     vTaskDelete(NULL);
 }
 #endif
+
+/* Writes the shutter schedule. Returns ESP_OK only if every write read back as requested, so the
+ * caller can tell a real success from a camera that is not listening yet. */
+#if P2_FORCE_SHUTTER
+/* Close the shutter, give the camera time to sample and compute its flat-field, then reopen.
+ * The reopen is unconditional: if the camera already reopened by itself it is a harmless no-op,
+ * and if it treats the command as a dumb actuator it is what prevents a blind camera. */
+static void p2_force_shutter_cycle(void)
+{
+    ESP_LOGW(TAG, "p2: forcing shutter cycle (0x%04x)", P2_CMD_SHUTTER_MANUAL);
+    esp_err_t ce = p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_CLOSE);
+    ESP_LOGW(TAG, "p2:   close -> %s", (ce == ESP_OK) ? "OK" : p2_err(ce));
+    if (ce != ESP_OK) {
+        /* Never leave it ambiguous - try an open anyway in case the close partly took. */
+        p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(800));          /* long enough to sample and compute */
+    esp_err_t oe = p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+    ESP_LOGW(TAG, "p2:   open  -> %s", (oe == ESP_OK) ? "OK" : p2_err(oe));
+
+    /* A closed shutter presents a near-uniform field, which the clean-image detector would
+     * happily call "calibrated". Spread is the giveaway: a real scene was ~730 counts, the
+     * uncorrected phase ~3500. Measured with the shutter actually closed: 132 - so the original
+     * threshold of 50 would have let a stuck shutter through. 300 errs the safe way; a redundant
+     * reopen costs nothing, a missed one blinds the camera. */
+    for (int i = 0; i < 12; i++) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        const int spread = (int)s_dbg_max_v - (int)s_dbg_min_v;
+        if (spread > 300) {
+            ESP_LOGW(TAG, "p2:   field spread %d - shutter is open", spread);
+            return;
+        }
+    }
+    ESP_LOGE(TAG, "p2: field still uniform (spread %d) after reopen - retrying open",
+             (int)s_dbg_max_v - (int)s_dbg_min_v);
+    p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+}
+#endif
+
+static esp_err_t p2_write_shutter_schedule(const char *when)
+{
+    static const struct { const char *name; uint16_t id; uint16_t val; } cfg[] = {
+        /* MIN_INTERVAL is rejected by the camera - the write returns a status error and it
+         * reads back 5 unchanged. Left out rather than retried every connect. */
+        { "PREVIEW_START_1ST_DELAY", P2_ASP_PREVIEW_START_1ST_DELAY, P2_SHUTTER_1ST_DELAY },
+        { "PREVIEW_START_2ND_DELAY", P2_ASP_PREVIEW_START_2ND_DELAY, P2_SHUTTER_2ND_DELAY },
+    };
+    esp_err_t worst = ESP_OK;
+    for (size_t i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
+        esp_err_t we = p2_long_cmd_write(P2_CMD_SET_AUTO_SHUTTER, cfg[i].id, cfg[i].val);
+        uint8_t rb[2] = {0};
+        esp_err_t re = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, cfg[i].id, rb, sizeof(rb));
+        const unsigned got = (re == ESP_OK) ? (unsigned)((rb[0] << 8) | rb[1]) : 0xFFFFu;
+        if (we != ESP_OK || re != ESP_OK || got != cfg[i].val) {
+            worst = (we != ESP_OK) ? we : (re != ESP_OK ? re : ESP_FAIL);
+        }
+        ESP_LOGW(TAG, "p2: [%s] %-24s := %u -> %s, reads %u", when, cfg[i].name, cfg[i].val,
+                 (we == ESP_OK) ? "OK" : p2_err(we), got);
+    }
+    if (worst == ESP_OK) {
+        s_shutter_cfg_done = true;
+    }
+    return worst;
+}
 
 static void p2_camera_init(void)
 {
@@ -560,25 +794,20 @@ static void p2_camera_init(void)
 #endif
 
 #if P2_SET_SHUTTER_DELAYS
-    /* Shorten the camera's own auto-shutter schedule. Factory defaults are 1ST=5s, 2ND=4s, which
-     * is the measured 8.75s to a usable image. Originals are recorded here so they can be put
-     * back; MIN_INTERVAL is 5, so the camera may clamp these - the read-back tells us.
-     * PROP_SWITCH is deliberately untouched (clearing it would disable auto-shutter entirely). */
-    ESP_LOGW(TAG, "p2: ---- setting preview-start shutter delays (was 1ST=5 2ND=4) ----");
-    static const struct { const char *name; uint16_t id; uint16_t val; } delays[] = {
-        { "PREVIEW_START_1ST_DELAY", P2_ASP_PREVIEW_START_1ST_DELAY, P2_SHUTTER_1ST_DELAY },
-        { "PREVIEW_START_2ND_DELAY", P2_ASP_PREVIEW_START_2ND_DELAY, P2_SHUTTER_2ND_DELAY },
-    };
-    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        esp_err_t we = p2_long_cmd_write(P2_CMD_SET_AUTO_SHUTTER, delays[i].id, delays[i].val);
-        uint8_t rb[2] = {0};
-        esp_err_t re = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, delays[i].id, rb, sizeof(rb));
-        ESP_LOGW(TAG, "p2:   %s := %u -> write %s, reads back %u%s",
-                 delays[i].name, delays[i].val,
-                 (we == ESP_OK) ? "OK" : p2_err(we),
-                 (re == ESP_OK) ? (unsigned)((rb[0] << 8) | rb[1]) : 9999u,
-                 (re == ESP_OK && ((rb[0] << 8) | rb[1]) != delays[i].val) ? "  <== CLAMPED" : "");
+    /* Late path: runs once the channel answers after stream_start. If the early attempt already
+     * succeeded this is a no-op re-write, which is harmless and keeps the camera correct after a
+     * renegotiation. */
+    if (!s_shutter_cfg_done) {
+        p2_write_shutter_schedule("late");
     }
+#if P2_FORCE_SHUTTER
+    /* Don't wait ~1.5s for the auto logic to act on the new schedule - trigger it now.
+     * P2_SHUTTER_SELFTEST forces one cycle even on an already-clean camera, to prove the
+     * actuator closes and reopens against a known-good baseline before relying on it cold. */
+    if (!s_clean_logged || P2_SHUTTER_SELFTEST) {
+        p2_force_shutter_cycle();
+    }
+#endif
 #endif
 
     uint8_t v[2] = {0};
@@ -754,6 +983,7 @@ static const glyph_t FONT_5X7[] = {
     {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
     {'+', {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00}},
     {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
 };
 #define FONT_W 5
 #define FONT_H 7
@@ -939,13 +1169,28 @@ static void update_status_bar(uint16_t min_v, uint16_t max_v, uint16_t centre_v)
 
 /* 3x3 average at the native sensor centre: a single pixel is noisy enough to make the reading
  * jitter by a degree or more frame to frame. */
+/* Applies the flat-field offset to one pixel. Folded into the passes that already read the
+ * pixel rather than materialising a corrected copy: the separate pass cost ~4.8ms/frame (read
+ * raw + read offset + write copy, then re-read the copy, all PSRAM) which exceeded the ~3ms of
+ * headroom in the 40ms budget and tipped the pipeline into backlog. */
+static inline uint16_t ffc_px(const uint16_t *raw, size_t i)
+{
+    if (!s_ffc_active) {
+        return raw[i];
+    }
+    int32_t v = (int32_t)raw[i] - s_ffc_offset[i];
+    if (v < 0) { v = 0; }
+    if (v > 65535) { v = 65535; }
+    return (uint16_t)v;
+}
+
 static uint16_t centre_raw(const uint16_t *raw16)
 {
     uint32_t sum = 0;
     const int cx = RAW_H_RES / 2, cy = RAW_V_RES / 2;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
-            sum += raw16[(cy + dy) * RAW_H_RES + (cx + dx)];
+            sum += ffc_px(raw16, (size_t)(cy + dy) * RAW_H_RES + (cx + dx));
         }
     }
     return (uint16_t)(sum / 9);
@@ -1178,6 +1423,88 @@ static esp_err_t display_init(void)
 
 /* ---------------- Touch (OSD toggle) ---------------- */
 
+/* ---- power button: 2s hold to power off -------------------------------------------------------
+ * The AXP2101's own PWROFF long-press (REG 0x27 bits 3:2) only offers 4/6/8/10s, and shipped
+ * configured for 6s. 2s is therefore not reachable by configuration - but the chip can raise a
+ * long-press IRQ at 1/1.5/2/2.5s (bits 5:4), so we take that at 2s and command the shutdown.
+ *
+ * Observed on hardware, status register 0x49: bit 1 = press, bit 2 = long press at IRQLEVEL,
+ * bit 0 = release. Those latch even with the IRQ masked in 0x41, so polling is enough and the
+ * interrupt-enable registers are left alone.
+ *
+ * OFFLEVEL is also dropped to its 4s minimum. That is deliberately LONGER than our 2s software
+ * path, so it acts as a backstop: if this task ever wedges, holding the button still cuts power
+ * in hardware. */
+#define PMIC_ADDR            0x34
+#define PMIC_REG_COMMON_CFG  0x10   /* bit 0: soft power off */
+#define PMIC_REG_PWRON_CFG   0x27
+#define PMIC_REG_IRQ_STATUS2 0x49
+#define PMIC_IRQ_PRESS       0x02
+#define PMIC_IRQ_LONGPRESS   0x04
+#define PMIC_IRQ_RELEASE     0x01
+/* IRQLEVEL=10 (2s), OFFLEVEL=00 (4s), ONLEVEL=00 (128ms) */
+#define PMIC_PWRON_CFG_VALUE 0x20
+
+static i2c_master_dev_handle_t s_pmic;
+
+static esp_err_t pmic_rd(uint8_t reg, uint8_t *val)
+{
+    return i2c_master_transmit_receive(s_pmic, &reg, 1, val, 1, 100);
+}
+
+static esp_err_t pmic_wr(uint8_t reg, uint8_t val)
+{
+    const uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(s_pmic, buf, 2, 100);
+}
+
+static void pmic_power_task(void *arg)
+{
+    (void)arg;
+    uint8_t before = 0;
+    pmic_rd(PMIC_REG_PWRON_CFG, &before);
+    if (pmic_wr(PMIC_REG_PWRON_CFG, PMIC_PWRON_CFG_VALUE) != ESP_OK) {
+        ESP_LOGW(TAG, "power: could not configure PWRON timing - leaving hardware default");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "power: PWRON cfg 0x%02x -> 0x%02x (irq 2s, hw off 4s backstop)",
+             before, PMIC_PWRON_CFG_VALUE);
+
+    /* Clear anything latched from the power-on press itself, then require a FRESH press before
+     * honouring a long press. Without that, holding the button to switch the device ON leaves a
+     * long-press bit set and we would shut straight back down. */
+    for (uint8_t r = 0x48; r <= 0x4A; r++) {
+        uint8_t st = 0;
+        if (pmic_rd(r, &st) == ESP_OK && st) {
+            pmic_wr(r, st);
+        }
+    }
+
+    bool armed = false;
+    while (true) {
+        uint8_t st = 0;
+        if (pmic_rd(PMIC_REG_IRQ_STATUS2, &st) == ESP_OK && st) {
+            if (st & PMIC_IRQ_PRESS) {
+                armed = true;
+            }
+            if (st & PMIC_IRQ_RELEASE) {
+                armed = false;
+            }
+            if (armed && (st & PMIC_IRQ_LONGPRESS)) {
+                ESP_LOGW(TAG, "power: 2s hold - powering off");
+                uint8_t cc = 0;
+                if (pmic_rd(PMIC_REG_COMMON_CFG, &cc) == ESP_OK) {
+                    pmic_wr(PMIC_REG_COMMON_CFG, (uint8_t)(cc | 0x01));
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));   /* should not return */
+            }
+            pmic_wr(PMIC_REG_IRQ_STATUS2, st);    /* write-1-to-clear */
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+}
+
 static esp_err_t touch_init(void)
 {
     i2c_master_bus_handle_t i2c_bus = NULL;
@@ -1190,6 +1517,21 @@ static esp_err_t touch_init(void)
         .flags.enable_internal_pullup = true,
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_bus_conf, &i2c_bus), TAG, "i2c bus");
+
+    /* The AXP2101 PMIC shares this bus (scanned: 0x18, 0x34 PMIC, 0x36, 0x38 touch). */
+    const i2c_device_config_t pmic_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = PMIC_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    if (i2c_master_bus_add_device(i2c_bus, &pmic_cfg, &s_pmic) == ESP_OK) {
+        xTaskCreate(pmic_power_task, "pmicpwr", 3072, NULL, 4, NULL);
+    } else {
+        ESP_LOGW(TAG, "power: PMIC not reachable - power button keeps its hardware timing");
+    }
+
+
+
 
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
@@ -1279,6 +1621,7 @@ static void touch_task(void *arg)
                 if (s_ffc_active || s_ffc_remaining) {
                     s_ffc_active = false;
                     s_ffc_remaining = 0;
+                    ffc_store_erase();
                     ESP_LOGI(TAG, "FFC cleared");
                 } else {
                     s_ffc_req = true;
@@ -1452,6 +1795,7 @@ static void render_task(void *arg)
         const uint16_t *raw16 = (const uint16_t *)raw_half;
         size_t npix = RAW_H_RES * RAW_V_RES;
         p2_frame_diag(raw16, npix, qf.frame->data_len, s_stream_open_us);
+        p2_log_first_clean(raw16, npix, s_stream_open_us);
 
         /* --- flat-field correction --- */
         if (s_ffc_req) { /* start a capture; accumulate UNcorrected frames */
@@ -1473,22 +1817,21 @@ static void render_task(void *arg)
                     sum += s_ffc_accum[i];
                 }
                 int32_t mean = (int32_t)(sum / npix / FFC_FRAMES);
+                int sat = 0;
                 for (size_t i = 0; i < npix; i++) {
-                    s_ffc_offset[i] = (int16_t)((int32_t)(s_ffc_accum[i] / FFC_FRAMES) - mean);
+                    int32_t d = (int32_t)(s_ffc_accum[i] / FFC_FRAMES) - mean;
+                    if (d >  127) { d =  127; sat++; }
+                    if (d < -128) { d = -128; sat++; }
+                    s_ffc_offset[i] = (int8_t)d;
+                }
+                if (sat) {
+                    ESP_LOGW(TAG, "FFC: %d pixels saturated the int8 offset range", sat);
                 }
                 s_ffc_active = true;
                 ESP_LOGI(TAG, "FFC captured over %d frames (mean %d)", FFC_FRAMES, (int)mean);
+                ffc_store_save(npix);
             }
             s_osd_dirty = true;
-        }
-        if (s_ffc_active) {
-            for (size_t i = 0; i < npix; i++) {
-                int32_t v = (int32_t)raw16[i] - s_ffc_offset[i];
-                if (v < 0) v = 0;
-                if (v > 65535) v = 65535;
-                s_ffc_corrected[i] = (uint16_t)v;
-            }
-            raw16 = s_ffc_corrected; /* everything downstream uses corrected data */
         }
 
         /* Recompute the min/max normalization range every MINMAX_PERIOD frames by default, OR
@@ -1532,7 +1875,7 @@ static void render_task(void *arg)
         if (!manual && (minmax_counter == 0 || need_recompute || s_osd_dirty)) {
             uint16_t min_v = 0xFFFF, max_v = 0;
             for (size_t i = 0; i < npix; i++) {
-                uint16_t v = raw16[i];
+                uint16_t v = ffc_px(raw16, i);
                 if (v < min_v) min_v = v;
                 if (v > max_v) max_v = v;
             }
@@ -1553,7 +1896,7 @@ static void render_task(void *arg)
         const uint16_t *lut = s_palettes[s_palette];
 
         for (size_t i = 0; i < npix; i++) {
-            uint16_t v = raw16[i];
+            uint16_t v = ffc_px(raw16, i);
             /* min_v/max_v can be stale (see MINMAX_PERIOD above), so a pixel can legitimately
              * fall outside [min_v, max_v] between recalculations. Clamp instead of letting the
              * uint8_t cast wrap: a hot pixel above the stale max must saturate to 255 (white),
@@ -1614,20 +1957,34 @@ static void render_task(void *arg)
                    (size_t)(s_fb_h - s_img_h) * s_img_w * sizeof(uint16_t));
         }
 
-        /* A cold camera emits a constant 0x8000 in every radiometric pixel until it runs its
-         * first calibration (~3s after the stream opens, measured). Mapping that through the
-         * palette yields a meaningless flat field, so say what is happening instead. The camera's
-         * command channel is not reachable during this window either, so there is nothing to do
-         * but wait it out. */
-        const bool uncalibrated = (min_v == P2_RAW_UNCAL && max_v == P2_RAW_UNCAL);
+        /* A cold camera goes through two distinct unusable phases, and they need different
+         * labels - the earlier version called both "CALIBRATING", which was wrong for the first
+         * and absent for the second.
+         *
+         *   STARTING    every radiometric pixel is the constant 0x8000 sentinel. The camera is
+         *               booting: its command channel does not even answer yet, and the shutter
+         *               has not fired. Nothing is being calibrated.
+         *   CALIBRATING real but uncorrected data (~53x spatially rougher than a finished image).
+         *               The camera is waiting on its scheduled shutter, and the flat-field lands
+         *               at the END of this window. This is the phase that is genuinely calibration,
+         *               and it is the one that used to show through as a garbled picture.
+         *
+         * The roughness test is bounded to the startup window and stops once a clean frame has
+         * been seen, so a high-contrast scene can never cause a spurious overlay later on. */
+        const bool flat = (min_v == P2_RAW_UNCAL && max_v == P2_RAW_UNCAL);
+        const bool in_startup_window =
+            !s_clean_logged && (esp_timer_get_time() - s_stream_open_us) < 10000000;
+        const bool uncorrected = in_startup_window && !flat && s_startup_roughness >= 100;
+        const char *notice = flat ? "STARTING" : (uncorrected ? "CALIBRATING" : NULL);
+
+        const bool uncalibrated = (notice != NULL);
         if (uncalibrated) {
             memset(s_rgb_buf, 0, (size_t)s_img_w * s_fb_h * sizeof(uint16_t));
-            const char *msg = "CALIBRATING";
             const int cal_scale = 3;
-            int tw = (int)strlen(msg) * (FONT_W + 1) * cal_scale;
+            int tw = (int)strlen(notice) * (FONT_W + 1) * cal_scale;
             draw_text_to(s_rgb_buf, s_img_w, s_fb_h,
                          (s_img_w - tw) / 2, (s_fb_h - FONT_H * cal_scale) / 2,
-                         cal_scale, 0xFFFF, msg);
+                         cal_scale, 0xFFFF, notice);
         }
 
         if (s_osd_enabled && !uncalibrated) { /* OSD toggle covers the overlays too, not just the bar */
@@ -1770,6 +2127,29 @@ static void streaming_task(void *arg)
             continue;
         }
         BOOT_MARK("uvc: stream_open returned");
+#if P2_EARLY_CONFIG
+        /* The shutter delays are counted from preview start, so configuring after stream_start
+         * may be too late to move the FIRST shutter - by then the camera has already scheduled
+         * it. The device handle exists from stream_open, so try the channel here. On a cold
+         * camera it may well not answer yet; that is why the late path still exists. */
+        s_shutter_cfg_done = false;
+        s_p2_wait_ms = 60;
+        for (int i = 0; i < 12 && !s_shutter_cfg_done; i++) {
+            uint8_t probe[2];
+            if (p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, P2_ASP_MIN_INTERVAL,
+                                 probe, sizeof(probe)) == ESP_OK) {
+                s_p2_wait_ms = 1000;
+                ESP_LOGW(TAG, "p2: channel answered BEFORE preview start (attempt %d)", i + 1);
+                p2_write_shutter_schedule("early");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        s_p2_wait_ms = 1000;
+        if (!s_shutter_cfg_done) {
+            ESP_LOGW(TAG, "p2: channel not up before preview start - will configure after");
+        }
+#endif
         err = uvc_host_stream_start(s_stream);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "uvc_host_stream_start failed: %s - retrying", esp_err_to_name(err));
@@ -1780,6 +2160,11 @@ static void streaming_task(void *arg)
         }
         BOOT_MARK("uvc: stream_start returned (first image)");
         s_stream_open_us = esp_timer_get_time();
+        s_clean_logged = false;   /* re-arm for this stream */
+        /* The camera forgets the shutter schedule whenever it loses power, so this must be
+         * re-armed per stream, NOT left latched from the first successful write after boot.
+         * Getting that wrong silently restored the stock 5s+4s on every replug. */
+        s_shutter_cfg_done = false;
         ESP_LOGI(TAG, "Stream opened, starting continuous render");
         p2_camera_init();
         s_stream_restart_req = false;
@@ -1808,6 +2193,7 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
     if (event->type != UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED) {
         return;
     }
+    s_connect_us = esp_timer_get_time();
     ESP_LOGI(TAG, "Device connected, addr=%d, starting streaming task", event->device_connected.dev_addr);
 
     /* Dump what the camera actually advertises - this is how we tell "image-only mode" apart
@@ -1898,10 +2284,17 @@ void app_main(void)
     }
     assert(s_rgb_buf && s_rgb_tx);
 
-    s_ffc_offset    = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(int16_t),  MALLOC_CAP_SPIRAM);
-    s_ffc_corrected = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    /* Kept in PSRAM. Moving these two (96KB each) to internal SRAM made the apply pass cheaper
+     * but starved the USB stack, which needs internal DMA memory for its ISOC transfers: the
+     * camera dropped out with a continuous "Frame buffer underflow". Internal RAM here is not
+     * free real estate. If the ~4.8ms/frame apply cost needs fixing, fold the offset into the
+     * existing palette/min-max passes instead of buying speed with internal memory. */
+    s_ffc_offset    = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(int8_t),   MALLOC_CAP_SPIRAM);
     s_ffc_accum     = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
-    assert(s_ffc_offset && s_ffc_corrected && s_ffc_accum);
+    assert(s_ffc_offset && s_ffc_accum);
+    if (ffc_store_load((size_t)RAW_H_RES * RAW_V_RES)) {
+        s_ffc_active = true;   /* the side-bar button shows CLR, so this is visible and undoable */
+    }
 
     const ppa_client_config_t ppa_client_config = {
         .oper_type = PPA_OPERATION_SRM,

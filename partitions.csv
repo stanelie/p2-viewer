@@ -1,0 +1,8 @@
+# Name,     Type, SubType,  Offset,    Size,     Flags
+# Default single-app layout, plus a partition for the flat-field table.
+nvs,        data, nvs,      0x9000,    0x6000,
+phy_init,   data, phy,      0xf000,    0x1000,
+factory,    app,  factory,  0x10000,   0x100000,
+# The FFC offset table is 256*192 int8 = 48KB plus a 16-byte header; NVS at 24KB cannot hold it.
+# A raw partition avoids NVS blob overhead and lets it be written in one erase+write.
+ffc,        data, 0x40,     0x110000,  0x10000,

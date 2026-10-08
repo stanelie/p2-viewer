@@ -163,6 +163,38 @@ Reads work and are safe (`get_device_info`, `cur_vtemp`, `prop_tpd_params`). The
 Note `preview_start 0xc10f` already contains the `0x4000` SET bit — don't blindly OR it. Invalid
 commands do **not** USB-stall; they return a camera status error in the ready byte.
 
+## Flat-field correction button
+
+The FFC button closes the camera's own shutter (`shutter_manual_switch` `0x420c`, param 1), averages
+32 frames of it, reopens, and applies each pixel's deviation from the frame mean. The shutter is a
+far better uniform reference than any surface you can point at, so there is nothing to aim at.
+
+Before accumulating, the firmware checks the field really is uniform (a closed shutter measures
+~110-130 counts of spread, a real scene 530-730). If the shutter did not close it **aborts** rather
+than averaging - otherwise the live scene gets baked into the offset table, which is the classic way
+a flat-field table goes wrong.
+
+The correction is RAM-only and never persisted, so a power cycle always starts from the camera's own
+calibration.
+
+**Cost, and why it is built the way it is.** Applying the offset is per-pixel work inside a 40 ms
+frame budget that already has only ~3 ms spare:
+
+| implementation | convert | e2e |
+|---|---|---|
+| separate corrected-copy pass (PSRAM) | 13.9 ms | 90-110 ms, runaway backlog |
+| folded into the existing passes, `int16` | 12.0 ms | 39.4 ms, stable |
+| folded, `int8` offsets | — | — |
+
+Materialising a corrected copy costs read-raw + read-offset + write-copy + re-read-copy, all PSRAM.
+Folding the offset into the loops that already read each pixel removes three of those four streams.
+The table is `int8` because 1 count is 1/64 K, so +/-127 covers +/-2 C - ample for FPN residual -
+and halving the table halves what the per-pixel loop reads.
+
+**Do not move these buffers to internal SRAM.** It makes the apply pass cheaper but starves the USB
+stack, which needs internal DMA memory for its ISOC transfers: the camera drops out with a
+continuous `Frame buffer underflow`. Measured, not theorised.
+
 ## Known limitations
 
 - **Screen tearing is not fixable on this board.** Confirmed from the schematic: there is no TE net

@@ -14,6 +14,7 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"   /* esp_ptr_internal() */
 #include "esp_check.h"
 
 #include "freertos/FreeRTOS.h"
@@ -119,16 +120,26 @@ static int s_bar_w, s_bar_h, s_bar_x, s_bar_y;
 #define SLOT_MINPLUS 5
 #define SLOT_MINMINUS 6
 
-/* Software flat-field correction. The camera's own shutter FFC is strictly better (it has a
- * real uniform reference); this corrects residual drift between those, and needs the user to
- * aim at something thermally uniform before pressing. Never persisted - RAM only. */
+/* Software flat-field correction, using the camera's OWN SHUTTER as the uniform reference:
+ * close it, average frames of the closed shutter, reopen. That removes the old requirement to
+ * aim at something thermally uniform - the shutter is a far better reference than any wall.
+ * Never persisted - RAM only, so a power cycle always starts from the camera's own correction. */
 #define FFC_FRAMES 32          /* ~1.3s at 25fps - averages the temporal noise down */
-static int16_t  *s_ffc_offset;    /* per-pixel deviation from the frame mean */
-static uint16_t *s_ffc_corrected; /* raw minus offset, so downstream code is unchanged */
+#define FFC_SETTLE_FRAMES 6    /* ~240ms for the shutter to physically close before sampling */
+/* A closed shutter measured 132 counts of spread; a real scene 532-730. If the field is not
+ * uniform the shutter did not close, and averaging would bake the SCENE into the table - which
+ * is exactly how a flat-field table goes wrong. Abort rather than capture garbage. */
+#define FFC_SHUTTER_MAX_SPREAD 300
+/* int8, not int16: halves the PSRAM read this table costs in the per-pixel loop. 1 count is
+ * 1/64 K, so +/-127 covers +/-2 C of offset - ample for FPN residual (a closed shutter measured
+ * 112 counts of total spread, i.e. deviations within about +/-56). Saturation is counted and
+ * reported, so if a camera ever needs more range we will know rather than silently clip. */
+static int8_t   *s_ffc_offset;    /* per-pixel deviation from the frame mean, counts */
 static uint32_t *s_ffc_accum;
 static volatile bool s_ffc_active = false;
 static volatile bool s_ffc_req = false;
 static int s_ffc_remaining = 0;
+static int s_ffc_settle = 0;
 
 /* One press = 2 C. Raw counts are Kelvin*64, so a 2 K step is 2*64. */
 #define ADJ_STEP_RAW (2 * 64)
@@ -1029,7 +1040,7 @@ static void update_status_bar(uint16_t min_v, uint16_t max_v, uint16_t centre_v)
     memset(s_status_buf, 0, (size_t)s_bar_w * s_bar_h * sizeof(uint16_t));
 
     /* Flat-field correction button */
-    const char *ffc = s_ffc_remaining ? "WAIT" : (s_ffc_active ? "CLR" : "FFC");
+    const char *ffc = (s_ffc_remaining || s_ffc_settle) ? "WAIT" : (s_ffc_active ? "CLR" : "FFC");
     int fby = slot_btn_y(SLOT_FFC);
     draw_rect(btn_x(), fby, BTN_W, BTN_H, 0xFFFF);
     draw_text(btn_x() + (BTN_W - text_width(ffc, scale)) / 2,
@@ -1069,13 +1080,28 @@ static void update_status_bar(uint16_t min_v, uint16_t max_v, uint16_t centre_v)
 
 /* 3x3 average at the native sensor centre: a single pixel is noisy enough to make the reading
  * jitter by a degree or more frame to frame. */
+/* Applies the flat-field offset to one pixel. Folded into the passes that already read the
+ * pixel rather than materialising a corrected copy: the separate pass cost ~4.8ms/frame (read
+ * raw + read offset + write copy, then re-read the copy, all PSRAM) which exceeded the ~3ms of
+ * headroom in the 40ms budget and tipped the pipeline into backlog. */
+static inline uint16_t ffc_px(const uint16_t *raw, size_t i)
+{
+    if (!s_ffc_active) {
+        return raw[i];
+    }
+    int32_t v = (int32_t)raw[i] - s_ffc_offset[i];
+    if (v < 0) { v = 0; }
+    if (v > 65535) { v = 65535; }
+    return (uint16_t)v;
+}
+
 static uint16_t centre_raw(const uint16_t *raw16)
 {
     uint32_t sum = 0;
     const int cx = RAW_H_RES / 2, cy = RAW_V_RES / 2;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
-            sum += raw16[(cy + dy) * RAW_H_RES + (cx + dx)];
+            sum += ffc_px(raw16, (size_t)(cy + dy) * RAW_H_RES + (cx + dx));
         }
     }
     return (uint16_t)(sum / 9);
@@ -1406,13 +1432,14 @@ static void touch_task(void *arg)
 
         if (in_bar && !was_pressed) {
             if (in_ffc) {
-                if (s_ffc_active || s_ffc_remaining) {
+                if (s_ffc_active || s_ffc_remaining || s_ffc_settle) {
                     s_ffc_active = false;
                     s_ffc_remaining = 0;
+                    s_ffc_settle = 0;
                     ESP_LOGI(TAG, "FFC cleared");
                 } else {
                     s_ffc_req = true;
-                    ESP_LOGI(TAG, "FFC capture requested - aim at a uniform surface");
+                    ESP_LOGI(TAG, "FFC capture requested - closing shutter for a uniform reference");
                 }
             } else if (in_pal) {
                 s_palette = (s_palette + 1) % PALETTE_COUNT;
@@ -1585,41 +1612,72 @@ static void render_task(void *arg)
         p2_log_first_clean(raw16, npix, s_stream_open_us);
 
         /* --- flat-field correction --- */
-        if (s_ffc_req) { /* start a capture; accumulate UNcorrected frames */
+        if (s_ffc_req) { /* close the shutter, then accumulate UNcorrected frames of it */
             s_ffc_req = false;
             s_ffc_active = false;
-            s_ffc_remaining = FFC_FRAMES;
             memset(s_ffc_accum, 0, npix * sizeof(uint32_t));
+            esp_err_t se = p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_CLOSE);
+            if (se == ESP_OK) {
+                s_ffc_settle = FFC_SETTLE_FRAMES;
+                s_ffc_remaining = FFC_FRAMES;
+                ESP_LOGI(TAG, "FFC: shutter closed, settling");
+            } else {
+                s_ffc_settle = 0;
+                s_ffc_remaining = 0;
+                ESP_LOGE(TAG, "FFC: could not close shutter (%s) - aborted", p2_err(se));
+            }
             s_osd_dirty = true;
         }
-        if (s_ffc_remaining > 0) {
+        if (s_ffc_settle > 0) {
+            if (--s_ffc_settle == 0) {
+                /* Confirm we are looking at the shutter and not the scene. Subsampled min/max -
+                 * the full scan happens later in this loop and is not available yet. */
+                uint16_t lo = 0xFFFF, hi = 0;
+                for (size_t i = 0; i < npix; i += 7) {
+                    const uint16_t v = raw16[i];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+                const int spread = (int)hi - (int)lo;
+                if (spread > FFC_SHUTTER_MAX_SPREAD) {
+                    ESP_LOGE(TAG, "FFC: field not uniform (spread %d) - shutter did not close, "
+                                  "aborting rather than capturing the scene", spread);
+                    p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+                    s_ffc_remaining = 0;
+                } else {
+                    ESP_LOGI(TAG, "FFC: shutter confirmed closed (spread %d), sampling %d frames",
+                             spread, FFC_FRAMES);
+                }
+            }
+            s_osd_dirty = true;
+        } else if (s_ffc_remaining > 0) {
             for (size_t i = 0; i < npix; i++) {
                 s_ffc_accum[i] += raw16[i];
             }
             if (--s_ffc_remaining == 0) {
-                /* Each pixel's deviation from the frame mean IS its offset error - valid only
-                 * because the operator pointed the camera at a uniform surface. */
+                /* Each pixel's deviation from the frame mean IS its offset error - valid
+                 * because the closed shutter presents a genuinely uniform field. */
                 uint64_t sum = 0;
                 for (size_t i = 0; i < npix; i++) {
                     sum += s_ffc_accum[i];
                 }
                 int32_t mean = (int32_t)(sum / npix / FFC_FRAMES);
+                int sat = 0;
                 for (size_t i = 0; i < npix; i++) {
-                    s_ffc_offset[i] = (int16_t)((int32_t)(s_ffc_accum[i] / FFC_FRAMES) - mean);
+                    int32_t d = (int32_t)(s_ffc_accum[i] / FFC_FRAMES) - mean;
+                    if (d >  127) { d =  127; sat++; }
+                    if (d < -128) { d = -128; sat++; }
+                    s_ffc_offset[i] = (int8_t)d;
+                }
+                if (sat) {
+                    ESP_LOGW(TAG, "FFC: %d pixels saturated the int8 offset range", sat);
                 }
                 s_ffc_active = true;
-                ESP_LOGI(TAG, "FFC captured over %d frames (mean %d)", FFC_FRAMES, (int)mean);
+                esp_err_t oe = p2_cmd(P2_CMD_SHUTTER_MANUAL, P2_SHUTTER_OPEN);
+                ESP_LOGI(TAG, "FFC captured over %d frames (mean %d), shutter reopen %s",
+                         FFC_FRAMES, (int)mean, (oe == ESP_OK) ? "OK" : p2_err(oe));
             }
             s_osd_dirty = true;
-        }
-        if (s_ffc_active) {
-            for (size_t i = 0; i < npix; i++) {
-                int32_t v = (int32_t)raw16[i] - s_ffc_offset[i];
-                if (v < 0) v = 0;
-                if (v > 65535) v = 65535;
-                s_ffc_corrected[i] = (uint16_t)v;
-            }
-            raw16 = s_ffc_corrected; /* everything downstream uses corrected data */
         }
 
         /* Recompute the min/max normalization range every MINMAX_PERIOD frames by default, OR
@@ -1663,7 +1721,7 @@ static void render_task(void *arg)
         if (!manual && (minmax_counter == 0 || need_recompute || s_osd_dirty)) {
             uint16_t min_v = 0xFFFF, max_v = 0;
             for (size_t i = 0; i < npix; i++) {
-                uint16_t v = raw16[i];
+                uint16_t v = ffc_px(raw16, i);
                 if (v < min_v) min_v = v;
                 if (v > max_v) max_v = v;
             }
@@ -1684,7 +1742,7 @@ static void render_task(void *arg)
         const uint16_t *lut = s_palettes[s_palette];
 
         for (size_t i = 0; i < npix; i++) {
-            uint16_t v = raw16[i];
+            uint16_t v = ffc_px(raw16, i);
             /* min_v/max_v can be stale (see MINMAX_PERIOD above), so a pixel can legitimately
              * fall outside [min_v, max_v] between recalculations. Clamp instead of letting the
              * uint8_t cast wrap: a hot pixel above the stale max must saturate to 255 (white),
@@ -2072,10 +2130,14 @@ void app_main(void)
     }
     assert(s_rgb_buf && s_rgb_tx);
 
-    s_ffc_offset    = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(int16_t),  MALLOC_CAP_SPIRAM);
-    s_ffc_corrected = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    /* Kept in PSRAM. Moving these two (96KB each) to internal SRAM made the apply pass cheaper
+     * but starved the USB stack, which needs internal DMA memory for its ISOC transfers: the
+     * camera dropped out with a continuous "Frame buffer underflow". Internal RAM here is not
+     * free real estate. If the ~4.8ms/frame apply cost needs fixing, fold the offset into the
+     * existing palette/min-max passes instead of buying speed with internal memory. */
+    s_ffc_offset    = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(int8_t),   MALLOC_CAP_SPIRAM);
     s_ffc_accum     = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
-    assert(s_ffc_offset && s_ffc_corrected && s_ffc_accum);
+    assert(s_ffc_offset && s_ffc_accum);
 
     const ppa_client_config_t ppa_client_config = {
         .oper_type = PPA_OPERATION_SRM,

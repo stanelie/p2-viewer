@@ -165,17 +165,15 @@ commands do **not** USB-stall; they return a camera status error in the ready by
 
 ## Flat-field correction button
 
-The FFC button closes the camera's own shutter (`shutter_manual_switch` `0x420c`, param 1), averages
-32 frames of it, reopens, and applies each pixel's deviation from the frame mean. The shutter is a
-far better uniform reference than any surface you can point at, so there is nothing to aim at.
+Aim at something thermally uniform and press FFC. It averages 32 frames (~1.3 s) and applies each
+pixel's deviation from the frame mean. RAM-only, never persisted, so a power cycle always starts
+from the camera's own calibration.
 
-Before accumulating, the firmware checks the field really is uniform (a closed shutter measures
-~110-130 counts of spread, a real scene 530-730). If the shutter did not close it **aborts** rather
-than averaging - otherwise the live scene gets baked into the offset table, which is the classic way
-a flat-field table goes wrong.
-
-The correction is RAM-only and never persisted, so a power cycle always starts from the camera's own
-calibration.
+**The camera's own shutter is NOT used as the reference, although it was tried.** Mechanically it
+is the obvious choice - `shutter_manual_switch` (`0x420c`) closes it and it presents a field with
+only ~110-130 counts of spread. But the shutter has a thermal gradient of its own, so a table
+captured from it encodes that gradient and corrects visibly worse than a plain uniform surface at a
+distance. Reverted after testing on hardware.
 
 **Cost, and why it is built the way it is.** Applying the offset is per-pixel work inside a 40 ms
 frame budget that already has only ~3 ms spare:
@@ -184,7 +182,6 @@ frame budget that already has only ~3 ms spare:
 |---|---|---|
 | separate corrected-copy pass (PSRAM) | 13.9 ms | 90-110 ms, runaway backlog |
 | folded into the existing passes, `int16` | 12.0 ms | 39.4 ms, stable |
-| folded, `int8` offsets | — | — |
 
 Materialising a corrected copy costs read-raw + read-offset + write-copy + re-read-copy, all PSRAM.
 Folding the offset into the loops that already read each pixel removes three of those four streams.
@@ -194,6 +191,10 @@ and halving the table halves what the per-pixel loop reads.
 **Do not move these buffers to internal SRAM.** It makes the apply pass cheaper but starves the USB
 stack, which needs internal DMA memory for its ISOC transfers: the camera drops out with a
 continuous `Frame buffer underflow`. Measured, not theorised.
+
+**The 5x7 font only carries the characters the UI happens to need.** A missing glyph renders as a
+hollow box (deliberately - it used to render blank, which made `CALIBRATING` silently appear as
+`CALI RATING` and `FFC` as two squares). Adding a label means checking its characters exist.
 
 ## Known limitations
 

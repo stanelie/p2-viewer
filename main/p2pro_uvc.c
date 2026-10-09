@@ -113,14 +113,17 @@ static int s_bar_w, s_bar_h, s_bar_x, s_bar_y;
  * vertically - one per slot, full button width, instead of two squeezed side by side. */
 #define ADJ_BTN_W BTN_W
 #define ADJ_BTN_H 38
-#define BAR_SLOTS 7    /* top to bottom */
+/* 8 slots over a 320px bar is 40px each, which keeps BTN_H at 38 - the gaps shrink to 2px but
+ * the touch targets do not. */
+#define BAR_SLOTS 8    /* top to bottom */
 #define SLOT_MAXPLUS 0
 #define SLOT_MAXMINUS 1
 #define SLOT_FFC 2
-#define SLOT_PAL 3
-#define SLOT_SCL 4
-#define SLOT_MINPLUS 5
-#define SLOT_MINMINUS 6
+#define SLOT_SHUT 3
+#define SLOT_PAL 4
+#define SLOT_SCL 5
+#define SLOT_MINPLUS 6
+#define SLOT_MINMINUS 7
 
 /* Software flat-field correction. Aim at something thermally uniform and press.
  *
@@ -276,6 +279,7 @@ static volatile int64_t  s_stream_open_us = 0;  /* when the current stream opene
  * camera applies its flat-field - so a collapse here IS the FFC-completed signal. */
 static volatile uint32_t s_dbg_neigh_mad = 0;
 static volatile bool s_clean_logged = false;  /* one-shot: time-to-calibrated per stream */
+static volatile bool s_autoshutter_req = false; /* first calibration done - settle the schedule */
 static volatile uint32_t s_startup_roughness = 0; /* only meaningful until s_clean_logged */
 static volatile bool s_shutter_cfg_done = false; /* set when the schedule write verified */
 static volatile int64_t s_connect_us = 0;  /* device-connect time: what the user actually waits */
@@ -315,6 +319,11 @@ static void p2_log_first_clean(const uint16_t *raw16, size_t npix, int64_t t_ope
     const int spread = (int)s_dbg_max_v - (int)s_dbg_min_v;
     if (mad > 0 && mad < 100 && spread > 300) {
         s_clean_logged = true;
+        /* The camera's first flat-field has landed. Raising a request rather than acting here:
+         * this function is defined well above the command transport, and an #if referencing a
+         * macro defined further down silently evaluates to 0 - which is exactly how the first
+         * attempt at this compiled away to nothing. */
+        s_autoshutter_req = true;
         /* Report from device connect, not from stream open: anything done before stream_start
          * would otherwise be invisible in this number and make a change look better than it is. */
         const int64_t now = esp_timer_get_time();
@@ -591,6 +600,17 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * something is being investigated. BOOT_MARK stays on; it is ~12 lines and worth it. */
 #define P2_DIAG 0
 
+
+/* Whether the camera runs its own periodic flat-field (every MAX_INTERVAL = 60s), which closes
+ * the shutter and briefly freezes the image. Toggled by the AS1/AS0 button; AS0 suppresses it.
+ *
+ * Defaults to suppressed, but is only ever applied AFTER the camera's first calibration has
+ * completed - that startup calibration is itself an auto-shutter event (the PREVIEW_START
+ * delays), so disabling any earlier leaves the image permanently uncorrected.
+ *
+ * Not persisted: every boot starts suppressed, and the camera always gets to do its one
+ * startup calibration first. */
+static volatile bool s_autoshutter_on = false;
 
 #define P2_SET_SHUTTER_DELAYS 1
 #define P2_SHUTTER_1ST_DELAY  1
@@ -1135,6 +1155,14 @@ static void update_status_bar(uint16_t min_v, uint16_t max_v, uint16_t centre_v)
     draw_text(btn_x() + (BTN_W - text_width(ffc, scale)) / 2,
               fby + (BTN_H - FONT_H * scale) / 2, scale, ffc);
 
+    /* Auto-shutter button. AS1 = the camera runs its own flat-field every 60s, closing the
+     * shutter and briefly freezing the image. AS0 = suppressed. */
+    const char *shut = s_autoshutter_on ? "AS1" : "AS0";
+    int shby = slot_btn_y(SLOT_SHUT);
+    draw_rect(btn_x(), shby, BTN_W, BTN_H, 0xFFFF);
+    draw_text(btn_x() + (BTN_W - text_width(shut, scale)) / 2,
+              shby + (BTN_H - FONT_H * scale) / 2, scale, shut);
+
     /* Palette button (label shows the palette currently in use) */
     const char *pal = PALETTE_NAME[s_palette];
     int pby = slot_btn_y(SLOT_PAL);
@@ -1590,11 +1618,15 @@ static void touch_task(void *arg)
         bool in_bar = pressed && point_num > 0 && x >= (uint16_t)s_bar_x;
         int bx = s_bar_x + btn_x();
         int ffc_y = s_bar_y + slot_btn_y(SLOT_FFC);
+        int shut_y = s_bar_y + slot_btn_y(SLOT_SHUT);
         int pal_y = s_bar_y + slot_btn_y(SLOT_PAL);
         int scl_y = s_bar_y + slot_btn_y(SLOT_SCL);
         bool in_ffc = in_bar && s_osd_enabled &&
                       x >= (uint16_t)bx && x < (uint16_t)(bx + BTN_W) &&
                       y >= (uint16_t)ffc_y && y < (uint16_t)(ffc_y + BTN_H);
+        bool in_shut = in_bar && s_osd_enabled &&
+                       x >= (uint16_t)bx && x < (uint16_t)(bx + BTN_W) &&
+                       y >= (uint16_t)shut_y && y < (uint16_t)(shut_y + BTN_H);
         bool in_pal = in_bar && s_osd_enabled &&
                       x >= (uint16_t)bx && x < (uint16_t)(bx + BTN_W) &&
                       y >= (uint16_t)pal_y && y < (uint16_t)(pal_y + BTN_H);
@@ -1627,6 +1659,10 @@ static void touch_task(void *arg)
                     s_ffc_req = true;
                     ESP_LOGI(TAG, "FFC capture requested - aim at a uniform surface");
                 }
+            } else if (in_shut) {
+                s_autoshutter_on = !s_autoshutter_on;
+                s_autoshutter_req = true;   /* render_task issues the write next frame */
+                ESP_LOGI(TAG, "auto-shutter -> %s", s_autoshutter_on ? "ON" : "OFF");
             } else if (in_pal) {
                 s_palette = (s_palette + 1) % PALETTE_COUNT;
                 ESP_LOGI(TAG, "palette -> %s", PALETTE_NAME[s_palette]);
@@ -1796,6 +1832,24 @@ static void render_task(void *arg)
         size_t npix = RAW_H_RES * RAW_V_RES;
         p2_frame_diag(raw16, npix, qf.frame->data_len, s_stream_open_us);
         p2_log_first_clean(raw16, npix, s_stream_open_us);
+
+        /* The camera re-runs its flat-field every MAX_INTERVAL (60s), closing the shutter and
+         * freezing the image each time. PROP_SWITCH turns that off. Only ever applied AFTER the
+         * first calibration: the startup calibration is itself an auto-shutter event, so doing
+         * this any earlier leaves the image permanently uncorrected. */
+        if (s_autoshutter_req) {
+            s_autoshutter_req = false;
+            const uint16_t want = s_autoshutter_on ? 1 : 0;
+            esp_err_t we = p2_long_cmd_write(P2_CMD_SET_AUTO_SHUTTER, P2_ASP_PROP_SWITCH, want);
+            uint8_t rb[2] = {0xFF, 0xFF};
+            esp_err_t re = p2_long_cmd_read(P2_CMD_GET_AUTO_SHUTTER, P2_ASP_PROP_SWITCH,
+                                            rb, sizeof(rb));
+            const unsigned got = (re == ESP_OK) ? (unsigned)((rb[0] << 8) | rb[1]) : 0xFFFFu;
+            ESP_LOGW(TAG, "auto-shutter: PROP_SWITCH := %u -> write %s, reads back %u%s",
+                     want, (we == ESP_OK) ? "OK" : p2_err(we), got,
+                     (got == want) ? "" : "  <== REFUSED");
+            s_osd_dirty = true;
+        }
 
         /* --- flat-field correction --- */
         if (s_ffc_req) { /* start a capture; accumulate UNcorrected frames */

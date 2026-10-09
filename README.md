@@ -220,6 +220,26 @@ continuous `Frame buffer underflow`. Measured, not theorised.
 hollow box (deliberately - it used to render blank, which made `CALIBRATING` silently appear as
 `CALI RATING` and `FFC` as two squares). Adding a label means checking its characters exist.
 
+## Auto-shutter toggle (AS1 / AS0)
+
+The camera runs its own flat-field every `MAX_INTERVAL` (60 s), closing the shutter and briefly
+freezing the image. The **AS1 / AS0** button suppresses that: `PROP_SWITCH` (auto-shutter param 0)
+written to 0. Verified by read-back - unlike `MIN_INTERVAL`, which the camera refuses, this write
+is accepted.
+
+**It is only ever applied after the camera's first calibration completes.** That startup
+calibration is itself an auto-shutter event (the `PREVIEW_START` delays above), so disabling it any
+earlier means the camera never runs a flat-field and the image stays permanently uncorrected. The
+clean-frame detector is what marks the right moment.
+
+Defaults to suppressed, and is not persisted, so every boot lets the camera do its one startup
+calibration and then goes quiet.
+
+**The trade-off is real.** Bolometer fixed-pattern noise drifts as the sensor warms, which is
+exactly why the camera re-corrects periodically. With AS0 the image will slowly degrade over
+minutes, and temperature readings with it. The FFC button is the manual compensation, and AS1 puts
+the camera back in charge.
+
 ## Power button
 
 Holding the power button for **2 s** powers the device off. The AXP2101's own `PWROFF` long-press

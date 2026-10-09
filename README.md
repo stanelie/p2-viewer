@@ -18,7 +18,7 @@ The [latest release](https://github.com/stanelie/p2-viewer/releases/latest) carr
 image. Flash it at `0x0` via the **UART** Type-C port, so the OTG port stays free for the camera:
 
 ```bash
-esptool.py --chip esp32p4 -b 460800 write_flash 0x0 p2-viewer-v1.0.0-esp32p4.bin
+esptool.py --chip esp32p4 -b 460800 write_flash 0x0 p2-viewer-v1.0.1-esp32p4.bin
 ```
 
 That writes the bootloader, partition table and app, and leaves a stored flat-field table intact.

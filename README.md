@@ -232,8 +232,9 @@ calibration is itself an auto-shutter event (the `PREVIEW_START` delays above), 
 earlier means the camera never runs a flat-field and the image stays permanently uncorrected. The
 clean-frame detector is what marks the right moment.
 
-Defaults to suppressed, and is not persisted, so every boot lets the camera do its one startup
-calibration and then goes quiet.
+Defaults to **ON** (the camera's own behaviour) and is not persisted, so every boot returns to the
+camera keeping fixed-pattern noise corrected. Either state is applied only after that first
+calibration.
 
 **The trade-off is real.** Bolometer fixed-pattern noise drifts as the sensor warms, which is
 exactly why the camera re-corrects periodically. With AS0 the image will slowly degrade over
@@ -242,12 +243,14 @@ the camera back in charge.
 
 ## Power button
 
-Holding the power button for **2 s** powers the device off. The AXP2101's own `PWROFF` long-press
+Holding the power button for **1 s** powers the device off. The AXP2101's own `PWROFF` long-press
 (REG `0x27` bits 3:2) only offers 4/6/8/10 s and shipped set to 6 s, so 2 s is not reachable by
 configuration. Instead the chip's long-press *interrupt* (bits 5:4, options 1/1.5/2/2.5 s) is set to
-2 s and the firmware commands the shutdown itself via `0x10` bit 0.
+1 s and the firmware commands the shutdown itself via `0x10` bit 0. The IRQLEVEL mapping was
+confirmed from two measured points: `01` produced a 1.48 s gap between the press and long-press
+interrupts, and `10` produced a verified 2 s power-off, so `00` is 1 s.
 
-`OFFLEVEL` is also dropped to its 4 s minimum. That is deliberately longer than the 2 s software
+`OFFLEVEL` is also dropped to its 4 s minimum. That is deliberately longer than the 1 s software
 path, so it acts as a backstop: if the firmware wedges, holding the button still cuts power in
 hardware.
 

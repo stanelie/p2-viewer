@@ -604,13 +604,15 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
 /* Whether the camera runs its own periodic flat-field (every MAX_INTERVAL = 60s), which closes
  * the shutter and briefly freezes the image. Toggled by the AS1/AS0 button; AS0 suppresses it.
  *
- * Defaults to suppressed, but is only ever applied AFTER the camera's first calibration has
- * completed - that startup calibration is itself an auto-shutter event (the PREVIEW_START
- * delays), so disabling any earlier leaves the image permanently uncorrected.
+ * Defaults to ON - the camera's own behaviour, which keeps fixed-pattern noise corrected as the
+ * sensor warms. AS0 trades that away for an uninterrupted image.
  *
- * Not persisted: every boot starts suppressed, and the camera always gets to do its one
- * startup calibration first. */
-static volatile bool s_autoshutter_on = false;
+ * Either way the state is only applied AFTER the camera's first calibration has completed: that
+ * startup calibration is itself an auto-shutter event (the PREVIEW_START delays), so touching
+ * this any earlier can leave the image permanently uncorrected.
+ *
+ * Not persisted: every boot returns to the camera's own behaviour. */
+static volatile bool s_autoshutter_on = true;
 
 #define P2_SET_SHUTTER_DELAYS 1
 #define P2_SHUTTER_1ST_DELAY  1
@@ -1451,16 +1453,16 @@ static esp_err_t display_init(void)
 
 /* ---------------- Touch (OSD toggle) ---------------- */
 
-/* ---- power button: 2s hold to power off -------------------------------------------------------
+/* ---- power button: 1s hold to power off -------------------------------------------------------
  * The AXP2101's own PWROFF long-press (REG 0x27 bits 3:2) only offers 4/6/8/10s, and shipped
  * configured for 6s. 2s is therefore not reachable by configuration - but the chip can raise a
- * long-press IRQ at 1/1.5/2/2.5s (bits 5:4), so we take that at 2s and command the shutdown.
+ * long-press IRQ at 1/1.5/2/2.5s (bits 5:4), so we take that at 1s and command the shutdown.
  *
  * Observed on hardware, status register 0x49: bit 1 = press, bit 2 = long press at IRQLEVEL,
  * bit 0 = release. Those latch even with the IRQ masked in 0x41, so polling is enough and the
  * interrupt-enable registers are left alone.
  *
- * OFFLEVEL is also dropped to its 4s minimum. That is deliberately LONGER than our 2s software
+ * OFFLEVEL is also dropped to its 4s minimum. That is deliberately LONGER than our 1s software
  * path, so it acts as a backstop: if this task ever wedges, holding the button still cuts power
  * in hardware. */
 #define PMIC_ADDR            0x34
@@ -1470,8 +1472,10 @@ static esp_err_t display_init(void)
 #define PMIC_IRQ_PRESS       0x02
 #define PMIC_IRQ_LONGPRESS   0x04
 #define PMIC_IRQ_RELEASE     0x01
-/* IRQLEVEL=10 (2s), OFFLEVEL=00 (4s), ONLEVEL=00 (128ms) */
-#define PMIC_PWRON_CFG_VALUE 0x20
+/* IRQLEVEL=00 (1s), OFFLEVEL=00 (4s), ONLEVEL=00 (128ms).
+ * IRQLEVEL mapping confirmed on hardware from two points: 01 produced a measured 1.48s gap
+ * between the press and long-press interrupts, and 10 produced a verified 2s power-off. */
+#define PMIC_PWRON_CFG_VALUE 0x00
 
 static i2c_master_dev_handle_t s_pmic;
 
@@ -1491,12 +1495,14 @@ static void pmic_power_task(void *arg)
     (void)arg;
     uint8_t before = 0;
     pmic_rd(PMIC_REG_PWRON_CFG, &before);
+    /* A 1s hold is short enough that a careless press powers the device down - that is the
+     * requested behaviour, not an oversight. */
     if (pmic_wr(PMIC_REG_PWRON_CFG, PMIC_PWRON_CFG_VALUE) != ESP_OK) {
         ESP_LOGW(TAG, "power: could not configure PWRON timing - leaving hardware default");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "power: PWRON cfg 0x%02x -> 0x%02x (irq 2s, hw off 4s backstop)",
+    ESP_LOGI(TAG, "power: PWRON cfg 0x%02x -> 0x%02x (irq 1s, hw off 4s backstop)",
              before, PMIC_PWRON_CFG_VALUE);
 
     /* Clear anything latched from the power-on press itself, then require a FRESH press before
@@ -1520,7 +1526,7 @@ static void pmic_power_task(void *arg)
                 armed = false;
             }
             if (armed && (st & PMIC_IRQ_LONGPRESS)) {
-                ESP_LOGW(TAG, "power: 2s hold - powering off");
+                ESP_LOGW(TAG, "power: 1s hold - powering off");
                 uint8_t cc = 0;
                 if (pmic_rd(PMIC_REG_COMMON_CFG, &cc) == ESP_OK) {
                     pmic_wr(PMIC_REG_COMMON_CFG, (uint8_t)(cc | 0x01));

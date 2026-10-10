@@ -2197,16 +2197,26 @@ static void uframe_check_task(void *arg)
 
 /* ---------------- UVC callbacks ---------------- */
 
+/* Frames are queued by the UVC driver task and consumed by render_task, so a disconnect can
+ * free the driver's buffers while up to 3 pointers to them are still in the queue. The epoch
+ * stamp is what makes a stale pointer recognisable: it is bumped on every open and every
+ * disconnect, and render_task refuses to dereference an entry whose stamp does not match.
+ * Without this, swapping cameras reads freed memory - and does it with the NEW camera's
+ * geometry, which is why a reset was needed. */
 typedef struct {
     uvc_host_frame_t *frame;
     int64_t arrival_us;
+    uint32_t epoch;
 } queued_frame_t;
+
+static volatile uint32_t s_stream_epoch;
 
 static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
 {
     queued_frame_t qf = {
         .frame = (uvc_host_frame_t *)frame,
         .arrival_us = esp_timer_get_time(),
+        .epoch = s_stream_epoch,
     };
     if (xQueueSendToBack(s_frame_queue, &qf, 0) != pdPASS) {
         return true; /* queue full: drop this frame, return it immediately */
@@ -2243,9 +2253,29 @@ static void stream_event_callback(const uvc_host_stream_event_data_t *event, voi
             port_trace_dump("disconnect");
         }
 #endif
-        ESP_LOGW(TAG, "P2 Pro disconnected");
+        ESP_LOGW(TAG, "camera disconnected");
         s_camera_connected = false;
         s_ffc_active = false; /* the sensor's pattern won't be the same after it re-powers */
+        /* Forget what was attached. Otherwise the streaming task reopens with the OLD camera's
+         * format - asking a webcam for 256x384 YUY2 - and burns a 5s stream_open timeout before
+         * the retry picks up the newly detected values. It also lets render_task notice the
+         * kind change and release the JPEG decoder. */
+        s_cam_kind = CAM_NONE;
+        /* Invalidate first, so anything still queued is recognisably stale, then hand the
+         * queued frames back while the stream handle is alive. Closing with frames outstanding
+         * frees the buffers under render_task's feet. */
+        s_stream_epoch++;
+        {
+            queued_frame_t stale;
+            int drained = 0;
+            while (xQueueReceive(s_frame_queue, &stale, 0) == pdPASS) {
+                uvc_host_frame_return(event->device_disconnected.stream_hdl, stale.frame);
+                drained++;
+            }
+            if (drained) {
+                ESP_LOGI(TAG, "drained %d queued frame(s) on disconnect", drained);
+            }
+        }
         uvc_host_stream_close(event->device_disconnected.stream_hdl);
         s_stream = NULL;
         break;
@@ -2416,6 +2446,12 @@ static void render_task(void *arg)
             continue;
         }
         no_frame_ticks = 0;
+        /* A frame queued before the last open/disconnect points at buffers the driver has
+         * already freed. Drop it WITHOUT dereferencing it, and without returning it - whatever
+         * owned it is gone. This is the camera hot-swap fix. */
+        if (qf.epoch != s_stream_epoch) {
+            continue;
+        }
         if (disconnect_shown) {
             disconnect_shown = false;
             s_osd_dirty = true; /* bring the temperature readout back */
@@ -2434,6 +2470,21 @@ static void render_task(void *arg)
         if (s_cam_kind != last_kind) {
             ESP_LOGI(TAG, "camera kind %d -> %d, clearing panel", (int)last_kind, (int)s_cam_kind);
             last_kind = s_cam_kind;
+            /* Hand back the JPEG decoder's buffers when the new camera does not need them -
+             * 640x480 costs ~1.2 MB of PSRAM across input and output. Done here rather than in
+             * the connect callback because this runs on the task that does the decoding, so it
+             * cannot free the buffers out from under a decode in progress. */
+            if (s_cam_kind != CAM_GENERIC && s_jpeg_dec) {
+                ESP_LOGI(TAG, "jpeg: releasing decoder (%dx%d) - camera no longer needs it",
+                         s_jpeg_w, s_jpeg_h);
+                jpeg_del_decoder_engine(s_jpeg_dec);
+                s_jpeg_dec = NULL;
+                free(s_jpeg_in);  s_jpeg_in  = NULL;
+                free(s_jpeg_out); s_jpeg_out = NULL;
+                s_jpeg_in_cap = s_jpeg_out_cap = 0;
+                s_jpeg_w = s_jpeg_h = 0;
+                s_jpeg_failed = false;   /* a fresh camera deserves a fresh attempt */
+            }
             memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
             s_pending_arrival_us = esp_timer_get_time();
             esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
@@ -3079,6 +3130,17 @@ static void streaming_task(void *arg)
     while (true) {
         /* Re-read per iteration: the struct is built once, but swapping cameras changes the
          * format we should ask for, and a stale value here would request 256x384 from a webcam. */
+        /* Wait for the connect callback to say what is actually attached. Opening before that
+         * means opening with the previous camera's format. */
+        if (s_cam_kind == CAM_NONE) {
+            static int waited = 0;
+            if (++waited % 100 == 0) {   /* ~10s */
+                ESP_LOGW(TAG, "no usable camera detected yet (waiting)");
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         stream_config.vs_format.h_res = s_cam_w;
         stream_config.vs_format.v_res = s_cam_h;
         stream_config.vs_format.format = s_cam_fmt;
@@ -3187,6 +3249,7 @@ static void streaming_task(void *arg)
             p2_camera_init();
         }
         s_stream_restart_req = false;
+        s_stream_epoch++;
         s_camera_connected = true;
 
         /* Hold here until something asks for a renegotiation, or the device vanishes (in which

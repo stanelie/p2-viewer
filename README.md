@@ -545,6 +545,47 @@ gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 
 microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
 within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
 
+### Camera hot-swap (no reset needed)
+
+Swapping between the P2 Pro and a generic camera used to need a reset. That was not a missing
+feature - it was a **use-after-free** being papered over by a reboot.
+
+`s_frame_queue` holds up to 3 frames and was never drained. `uvc_host_stream_close()` frees the
+driver's frame buffers on disconnect, but those three pointers survived in the queue, so
+render_task dequeued them and read `frame->data` from freed memory - and on a swap it did so with
+the *new* camera's geometry and format.
+
+Three fixes on that path:
+
+1. **Epoch-stamped frames.** Every queue entry carries a counter bumped on each open and each
+   disconnect; render_task drops any entry whose stamp does not match, *without dereferencing it*.
+2. **Drain before close.** The disconnect handler hands queued frames back while the stream handle
+   is still valid, then closes. Closing with frames outstanding is what freed buffers under
+   render_task.
+3. **Never reopen blind.** `s_cam_kind` is reset to `CAM_NONE` on disconnect and the streaming task
+   waits for fresh detection. It previously called `stream_open` with the *previous* camera's
+   format - asking a webcam for 256x384 YUY2 - and burned the 5 s timeout before the retry used
+   the right values.
+
+Also, the JPEG decoder is released when the new camera does not need it, reclaiming ~1.2 MB of
+PSRAM at 640x480. Done on render_task, so it cannot free buffers mid-decode.
+
+### Measured: generic preview, steady state
+
+Borescope on the USB-A path, 640x480 MJPEG, over ~4 minutes:
+
+```
+generic displayed=51 avg_convert=13915us avg_e2e=38784us (640x480 MJPEG -> 400x300)
+mjpeg ok=51 truncated=0 decode_err=0 (100% complete)
+```
+
+| metric | value | note |
+|---|---|---|
+| framerate | **25.4 fps** | 51 frames / 2.01 s - the camera's 25 fps ceiling |
+| end-to-end latency | **38.8 ms** | inside the 40 ms frame period |
+| decode + 2x PPA | 13.9 ms | hardware JPEG at 640x480, plus scale and byte-swap |
+| truncated frames | **0 of ~6000** | the USB-A path is clean, not merely working |
+
 ### Generic cameras: mode choice is oversampled, not fitted
 
 The mode is picked as **the largest advertised mode up to `P2_GEN_OVERSAMPLE` (2) x the panel in

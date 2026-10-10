@@ -414,10 +414,18 @@ experimental design and its conclusion was worthless), 25 s windows:
 | `DEBOUNCE_DELAY_MS=500` | 27 | 3 | 3 | no |
 
 **A powered USB-C dock does not help either, but inconclusively:** with the dock between board and
-camera the board sees *nothing at all* - no hub, no device, silence after boot. The dock never
-attaches, most likely because the OTG port's VBUS net was severed to feed the camera from an
-external boost, so a dock has no valid host to attach to. That test therefore cannot say whether a
-hub would fix the signalling.
+camera the board sees *nothing at all* - no `HUB: Root port reset`, no device tree node, silence
+after boot. Enumeration never starts, so this is at connection-detect level, not a descriptor or
+protocol problem.
+
+Why the dock does not attach is **unknown**. It is NOT because VBUS is fed from the external boost
+rather than from the host cable - a hub sees 5 V on the pin and does not care what sources it. The
+measurement that would settle it is **VBUS at the OTG connector with the dock plugged in**: a dock
+draws real current for its own hub controller before any downstream device, and if the boost cannot
+source that, VBUS collapses and nothing can attach. That would fit the silence, and is consistent
+with the scope attaching fine on its own at a measured 150 mA.
+
+Either way the test cannot say whether a hub would fix the signalling.
 
 A plain **bus-powered USB 2.0 hub** (not a USB-C PD dock), taking power from the boosted VBUS pin,
 would be the remaining way to put a signal repeater in the path. Otherwise this needs a scope on

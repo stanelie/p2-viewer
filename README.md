@@ -545,6 +545,45 @@ gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 
 microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
 within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
 
+### Generic cameras: mode choice is oversampled, not fitted
+
+The mode is picked as **the largest advertised mode up to `P2_GEN_OVERSAMPLE` (2) x the panel in
+each axis**, not the largest that fits inside it. On the 480x320 panel that lands on 640x480,
+downscaled to 400x300.
+
+Why, measured on hardware with the two candidates cycling on the panel:
+
+| preset | source | on screen | result |
+|---|---|---|---|
+| 320x240 scale | 22.8 KB/frame | 420x315 (**upscaled**) | softer |
+| **640x480 scale** | 77.6 KB/frame | 400x300 (**downscaled**) | **chosen - visibly sharper, no discernible fps or latency difference** |
+| 640x480 crop | 77.6 KB/frame | 480x320 1:1 | **rejected - clearly worse latency** |
+
+The old rule took the largest mode that *fit* the panel, which meant upscaling 320x240 and
+discarding detail the camera was happy to supply. Downscaling from a larger capture is sharper at
+the same framerate, and on this camera it costs nothing measurable.
+
+The cap is the important half of the rule. Past ~2x the panel the extra pixels cannot be seen and
+are not free: this camera's 1280x720 MJPEG wants 46 MB/s and 4x the JPEG decode of 640x480 for no
+visible gain, so the cap rejects it (1280 > 960) while accepting 640x480 (640 <= 960, 480 <= 640).
+
+Two notes on geometry. 400x300 rather than something closer to full panel is PPA's 1/16 scale grid:
+10/16 gives 400x300 and 11/16 would give 440x330, whose 330 rows do not fit 320. Filling the panel
+completely from a 4:3 source would mean cropping it to 3:2 first (640x427 at 12/16 = 480x320
+exactly), which loses ~11% of the top and bottom - bad for a borescope's circular image, so it is
+not done.
+
+**`640x480 crop` was built, measured and removed.** 1:1 centre crop has identical bus traffic and
+decode cost to `640x480 scale`, but blits 480x320 = 153600 px against the letterbox's 132300, and
+the SPI blit is this board's bottleneck. Cropping to a *smaller* 1:1 box (420x315) would equalise
+SPI and decode while keeping native pixels, but narrows the field of view to 66% per axis - that is
+a zoom feature, not a quality setting.
+
+**Framerate has no headroom to find.** Every mode this camera offers is capped at 25 fps
+(`dwFrameInterval = 400000`); only 1280x720 MJPEG offers alternatives and they all go *downward*
+(25/20/15/10/5), and YUY2 1280x720 is 10 fps only. There is also a hard 40 ms floor on end-to-end
+latency, because at 25 fps a frame only exists every 40 ms.
+
 ### Generic cameras use MJPEG with hardware JPEG decode
 
 A generic (non-thermal) camera is now asked for **MJPEG** when it advertises it, and the frames go

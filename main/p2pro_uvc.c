@@ -89,6 +89,61 @@ static volatile enum uvc_host_stream_format s_cam_fmt = UVC_VS_FORMAT_YUY2;
  * Set to 0 to go back to YUY2 for every generic camera. */
 #define P2_GENERIC_PREFER_MJPEG 1
 
+/* Override the generic-camera mode for A/B measurement. 0 = auto (largest advertised mode of the
+ * preferred format that fits the panel). The borescope caps at 25 fps in EVERY mode, so framerate
+ * cannot be bought with resolution - but the auto rule picks 320x240 and UPSCALES it to 420x315,
+ * where 640x480 downscaled to the same box is sharper for the same 25 fps. Which one actually
+ * sustains 25 fps end to end is a measurement, not a guess. */
+#define P2_GENERIC_FORCE_W 0
+#define P2_GENERIC_FORCE_H 0
+
+/* ---- generic-preview benchmark ---------------------------------------------------------------
+ * Cycles the three candidate presets automatically, ~12 s each, so one flash produces all the
+ * numbers instead of three reflashes and three cable swaps. The preset name and the live stats
+ * are both on the panel.
+ *
+ * What differs between them, and what cannot:
+ *  - Bus traffic and JPEG decode cost are set by the CAMERA'S mode. Cropping cannot reduce
+ *    either: the camera sends the whole frame regardless, and the P4's decoder has no ROI
+ *    option, so a 640x480 JPEG is fully decoded whether we use all of it or not.
+ *  - Only PPA read/write volume and the SPI blit size change. At full-panel 1:1 the crop blits
+ *    480x320 = 153600 px against the letterbox's 420x315 = 132300, i.e. ~16% MORE SPI - and SPI
+ *    is the bottleneck here. So crop should cost throughput and buy sharpness. Measure it.
+ *  - 25 fps is the camera's ceiling in every mode, so no preset can beat that. */
+/* How much larger than the panel a capture may be, per axis. 2 was chosen on measurement:
+ * 640x480 (1.33x / 1.5x the 480x320 panel) is sharper than 320x240 at no measurable cost, while
+ * 1280x720 is past the cap and would cost 46 MB/s and 4x the decode for nothing visible. */
+#define P2_GEN_OVERSAMPLE 2
+
+#define P2_GEN_BENCH 0
+#define P2_GEN_BENCH_MS 15000
+
+#if P2_GEN_BENCH
+typedef struct {
+    const char *name;
+    uint16_t cam_w, cam_h;   /* mode requested from the camera */
+    bool     crop;           /* true: 1:1 centre crop; false: fit-and-scale */
+} gen_preset_t;
+
+static const gen_preset_t s_gen_presets[] = {
+    { "320X240 SCALE", 320, 240, false },   /* least bus + decode, upscaled - softest */
+    { "640X480 SCALE", 640, 480, false },   /* same output box, downscaled - sharper */
+    /* "640X480 CROP" (1:1 centre, full panel) was measured and REMOVED: visibly worse latency,
+     * as predicted. Identical bus traffic and decode cost to 640X480 SCALE, but it blits
+     * 480x320 = 153600 px against the letterbox's 420x315 = 132300, and the SPI blit is the
+     * bottleneck on this board. Cropping to a SMALLER 1:1 box (420x315) would equalise SPI and
+     * decode while keeping native pixels, but it narrows the field of view to 66% per axis -
+     * that is a zoom feature, not a quality setting, so it is not the default's business. */
+};
+static volatile int s_gen_preset = 0;
+#endif /* P2_GEN_BENCH */
+
+/* The advertised mode list, cached at connect. A preset change has to re-select from it, and
+ * the connect callback's own copy is long gone by then. */
+#define P2_MAX_ADVERTISED 16
+static uvc_host_frame_info_t s_adv[P2_MAX_ADVERTISED];
+static size_t s_adv_n;
+
 /* Hardware JPEG decoder, brought up lazily the first time an MJPEG frame arrives so the
  * thermal path never pays for it. */
 static jpeg_decoder_handle_t s_jpeg_dec;
@@ -97,14 +152,20 @@ static size_t    s_jpeg_in_cap;
 static uint8_t  *s_jpeg_out;       /* decoded RGB565 at the camera's native size */
 static size_t    s_jpeg_out_cap;
 static bool      s_jpeg_failed;    /* bring-up failed once: stop retrying every frame */
+static int       s_jpeg_w, s_jpeg_h;   /* resolution the buffers were sized for */
 
 /* Diagnostics: on a marginal link these three counters ARE the measurement - they separate
  * "the frame never completed" from "the decoder could not handle it". */
 static uint32_t s_mj_ok, s_mj_truncated, s_mj_decode_err;
-static uint32_t s_port_disables;   /* survives a stream teardown, unlike the mjpeg counters */
+static uint32_t s_port_disables __attribute__((unused));   /* survives a stream teardown, unlike the mjpeg counters */
+/* Latest 2-second window, snapshotted for the on-screen readout. */
+static uint32_t s_stat_fps_x10, s_stat_convert_us, s_stat_e2e_us;
 
 /* Generic-preview output geometry, computed once per connect. */
 static int s_gen_w, s_gen_h, s_gen_x, s_gen_y;
+/* Source sub-rectangle PPA reads. Equal to the full frame unless a preset crops. */
+static int s_src_w, s_src_h, s_src_x, s_src_y;
+static bool s_gen_crop;
 static size_t s_fb_bytes;   /* allocated size of s_rgb_buf/s_rgb_tx, cache-line aligned */
 
 /* --- Display (ST7796 over SPI, pins from the Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5 BSP) --- */
@@ -1574,11 +1635,21 @@ static inline size_t ppa_out_bytes(int w, int h)
  * on PPA's out.buffer_size. */
 static bool jpeg_decoder_ensure(int w, int h)
 {
-    if (s_jpeg_dec) {
+    if (s_jpeg_dec && s_jpeg_w == w && s_jpeg_h == h) {
         return true;
     }
     if (s_jpeg_failed) {
         return false;
+    }
+    if (s_jpeg_dec) {
+        /* Resolution changed under us (a mode switch). The buffers are sized from w*h, so
+         * reusing them would silently undersize the input and overflow the output. */
+        ESP_LOGI(TAG, "jpeg: resizing %dx%d -> %dx%d", s_jpeg_w, s_jpeg_h, w, h);
+        jpeg_del_decoder_engine(s_jpeg_dec);
+        s_jpeg_dec = NULL;
+        free(s_jpeg_in);  s_jpeg_in  = NULL;
+        free(s_jpeg_out); s_jpeg_out = NULL;
+        s_jpeg_in_cap = s_jpeg_out_cap = 0;
     }
 
     const size_t want = (size_t)w * h * sizeof(uint16_t);
@@ -1610,6 +1681,8 @@ static bool jpeg_decoder_ensure(int w, int h)
         return false;
     }
 
+    s_jpeg_w = w;
+    s_jpeg_h = h;
     ESP_LOGI(TAG, "jpeg: decoder up for %dx%d (in %u B, out %u B)",
              w, h, (unsigned)s_jpeg_in_cap, (unsigned)s_jpeg_out_cap);
     return true;
@@ -2053,7 +2126,7 @@ static bool usb_isoc_chan_info(unsigned *mps, unsigned *ec, unsigned *epnum)
  * with the picture and comes out the right way round. */
 static void usb_osd_draw(uint16_t *buf, int bw, int bh)
 {
-    char l1[32], l2[32], l3[32];
+    char l1[48], l2[48], l3[48];
     unsigned mps = 0, ec = 0, epnum = 0;
     const bool have = usb_isoc_chan_info(&mps, &ec, &epnum);
 
@@ -2064,16 +2137,23 @@ static void usb_osd_draw(uint16_t *buf, int bw, int bh)
     } else {
         snprintf(l2, sizeof(l2), "MPS -");
     }
-    snprintf(l3, sizeof(l3), "OK %u TR %u PDIS %u",
+    snprintf(l3, sizeof(l3), "%u.%u FPS  C%u E%u MS",
+             (unsigned)(s_stat_fps_x10 / 10), (unsigned)(s_stat_fps_x10 % 10),
+             (unsigned)((s_stat_convert_us + 500) / 1000),
+             (unsigned)((s_stat_e2e_us + 500) / 1000));
+
+    char l4[48];
+    snprintf(l4, sizeof(l4), "OK %u TR %u PDIS %u",
              (unsigned)s_mj_ok, (unsigned)s_mj_truncated, (unsigned)s_port_disables);
 
     const int sc = 2;
     const int lh = (FONT_H + 2) * sc;
     const int w  = 23 * (FONT_W + 1) * sc;
-    fill_rect_to(buf, bw, bh, 0, 0, w < bw ? w : bw, lh * 3 + 4, 0x0000);
+    fill_rect_to(buf, bw, bh, 0, 0, w < bw ? w : bw, lh * 4 + 4, 0x0000);
     draw_text_to(buf, bw, bh, 2, 2,          sc, 0xFFFF, l1);
     draw_text_to(buf, bw, bh, 2, 2 + lh,     sc, 0x07FF, l2);
-    draw_text_to(buf, bw, bh, 2, 2 + lh * 2, sc, 0xFFE0, l3);
+    draw_text_to(buf, bw, bh, 2, 2 + lh * 2, sc, 0x07E0, l3);
+    draw_text_to(buf, bw, bh, 2, 2 + lh * 3, sc, 0xFFE0, l4);
 }
 #endif /* P2_USB_OSD */
 
@@ -2454,8 +2534,8 @@ static void render_task(void *arg)
                 .in = {
                     .buffer = ppa_src,
                     .pic_w = s_cam_w, .pic_h = s_cam_h,
-                    .block_w = s_cam_w, .block_h = s_cam_h,
-                    .block_offset_x = 0, .block_offset_y = 0,
+                    .block_w = s_src_w, .block_h = s_src_h,
+                    .block_offset_x = s_src_x, .block_offset_y = s_src_y,
                     .srm_cm = ppa_src_cm,
                     .yuv_range = PPA_COLOR_RANGE_LIMIT,   /* UVC YUY2 is studio-range */
                     .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
@@ -2468,8 +2548,8 @@ static void render_task(void *arg)
                     .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
                 },
                 .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-                .scale_x = (float)s_gen_w / s_cam_w,
-                .scale_y = (float)s_gen_h / s_cam_h,
+                .scale_x = (float)s_gen_w / s_src_w,
+                .scale_y = (float)s_gen_h / s_src_h,
                 .mirror_x = false,
                 .mirror_y = false,
                 .mode = PPA_TRANS_MODE_BLOCKING,
@@ -2523,6 +2603,13 @@ static void render_task(void *arg)
             if (gnow - s_last_report_us >= 2000000) {
                 int n_e2e = s_frames_rendered, n_conv = frames_converted;
                 if (n_e2e > 0 && n_conv > 0) {
+                    /* Snapshot for the on-screen readout: the serial adapter and the camera's
+                     * adapter cannot always share the board's two sockets, so the panel has to
+                     * be able to report this on its own. */
+                    s_stat_fps_x10    = (uint32_t)((int64_t)n_e2e * 10 * 1000000 /
+                                                   (gnow - s_last_report_us));
+                    s_stat_convert_us = (uint32_t)(convert_time_sum_us / n_conv);
+                    s_stat_e2e_us     = (uint32_t)(s_e2e_time_sum_us / n_e2e);
                     ESP_LOGI(TAG, "generic displayed=%d avg_convert=%" PRId64
                                   "us avg_e2e=%" PRId64 "us (%ux%u %s -> %dx%d)",
                              n_e2e, convert_time_sum_us / n_conv, s_e2e_time_sum_us / n_e2e,
@@ -2890,6 +2977,71 @@ static void render_task(void *arg)
     }
 }
 
+#if P2_GEN_BENCH
+/* Advance to the next preset and renegotiate. Re-selection reuses the cached advertised list, so
+ * this does not need the camera to be replugged. */
+static void gen_bench_task(void *arg)
+{
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(P2_GEN_BENCH_MS));
+        if (s_cam_kind != CAM_GENERIC || !s_camera_connected || s_adv_n == 0) {
+            continue;
+        }
+        const int next = (s_gen_preset + 1) %
+                         (int)(sizeof(s_gen_presets) / sizeof(s_gen_presets[0]));
+        const gen_preset_t *p = &s_gen_presets[next];
+
+        /* Only accept the preset if the camera actually advertises its mode. */
+        bool have = false;
+        for (size_t i = 0; i < s_adv_n; i++) {
+            if (s_adv[i].format == s_cam_fmt &&
+                s_adv[i].h_res == p->cam_w && s_adv[i].v_res == p->cam_h) {
+                have = true;
+                break;
+            }
+        }
+        if (!have) {
+            ESP_LOGW(TAG, "bench: camera does not advertise %ux%u, skipping preset %s",
+                     p->cam_w, p->cam_h, p->name);
+            s_gen_preset = next;
+            continue;
+        }
+
+        s_gen_preset = next;
+        const bool res_changed = (s_cam_w != p->cam_w || s_cam_h != p->cam_h);
+        s_cam_w = p->cam_w;
+        s_cam_h = p->cam_h;
+
+        s_src_w = p->cam_w; s_src_h = p->cam_h; s_src_x = 0; s_src_y = 0;
+        s_gen_crop = p->crop && p->cam_w >= s_disp_w && p->cam_h >= s_disp_h;
+        if (s_gen_crop) {
+            s_gen_w = s_disp_w; s_gen_h = s_disp_h;
+            s_src_w = s_disp_w; s_src_h = s_disp_h;
+            s_src_x = ((int)p->cam_w - s_disp_w) / 2 & ~1;
+            s_src_y = ((int)p->cam_h - s_disp_h) / 2 & ~1;
+        } else {
+            fit_preserving_aspect(p->cam_w, p->cam_h, s_disp_w, s_disp_h, &s_gen_w, &s_gen_h);
+        }
+        s_gen_x = (s_disp_w - s_gen_w) / 2;
+        s_gen_y = (s_disp_h - s_gen_h) / 2;
+
+        /* Stats belong to the preset that produced them. */
+        s_stat_fps_x10 = s_stat_convert_us = s_stat_e2e_us = 0;
+        s_mj_ok = s_mj_truncated = s_mj_decode_err = 0;
+
+        ESP_LOGW(TAG, "bench: preset %s (%ux%u -> %dx%d%s)", p->name,
+                 p->cam_w, p->cam_h, s_gen_w, s_gen_h, s_gen_crop ? " crop" : " scale");
+        if (res_changed) {
+            s_stream_restart_req = true;   /* a new resolution needs renegotiation */
+        } else {
+            /* scale <-> crop is a PPA change only; wipe the panel so the old letterbox
+             * margins do not linger around a full-screen crop. */
+            s_osd_dirty = true;
+        }
+    }
+}
+#endif
+
 /* ---------------- UVC stream open ---------------- */
 
 static void streaming_task(void *arg)
@@ -3084,6 +3236,9 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                          list[i].h_res, list[i].v_res);
             }
 
+            s_adv_n = (actual < P2_MAX_ADVERTISED) ? actual : P2_MAX_ADVERTISED;
+            memcpy(s_adv, list, s_adv_n * sizeof(uvc_host_frame_info_t));
+
             /* Thermal if the 256x384 stacked format is on offer, otherwise a plain preview. */
             bool thermal = false;
             for (size_t i = 0; i < actual; i++) {
@@ -3100,10 +3255,18 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                 s_cam_fmt = UVC_VS_FORMAT_YUY2;   /* the raw half must not be compressed */
                 ESP_LOGI(TAG, "camera: P2 Pro thermal (%ux%u)", s_cam_w, s_cam_h);
             } else {
-                /* Pick the YUY2 mode closest to the panel without exceeding it. The panel is
-                 * only 480x320, so a larger capture buys no visible detail and costs isochronous
-                 * bandwidth - this camera's largest endpoint sustains ~8 MB/s, which is already
-                 * below what 640x480 YUY2 needs at 25fps. */
+                /* Pick the largest mode up to P2_GEN_OVERSAMPLE x the panel in each axis.
+                 *
+                 * The previous rule took the largest mode that FIT inside the panel, which meant
+                 * 320x240 upscaled to 420x315 - throwing away detail the camera was willing to
+                 * give. Downscaling from a larger capture is sharper for the same framerate, and
+                 * measured on the borescope the cost is nil: 320x240 and 640x480 showed no
+                 * discernible difference in fps or end-to-end latency, confirmed on hardware.
+                 *
+                 * The cap matters though. Past ~2x the panel the extra pixels cannot be seen and
+                 * are not free: this camera's 1280x720 MJPEG wants 46 MB/s and 4x the JPEG decode
+                 * of 640x480 for no visible gain. With the cap at 2 the rule lands on 640x480
+                 * here (640 <= 960, 480 <= 640) and rejects 1280x720 (1280 > 960). */
                 /* Prefer MJPEG when the camera offers it: ~7x fewer isochronous packets per
                  * frame, which on a marginal link is the only lever that matters (see
                  * P2_GENERIC_PREFER_MJPEG). YUY2 is the fallback. */
@@ -3117,18 +3280,55 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                 }
 #endif
                 uint16_t bw = 0, bh = 0;
+#if P2_GEN_BENCH_UNUSED
+                for (size_t i = 0; i < actual; i++) {
+                    if (list[i].format == want_fmt &&
+                        list[i].h_res == s_gen_presets[s_gen_preset].cam_w &&
+                        list[i].v_res == s_gen_presets[s_gen_preset].cam_h) {
+                        bw = list[i].h_res;
+                        bh = list[i].v_res;
+                        break;
+                    }
+                }
+                if (!bw)
+#endif
+#if P2_GENERIC_FORCE_W && P2_GENERIC_FORCE_H
+                for (size_t i = 0; i < actual; i++) {
+                    if (list[i].format == want_fmt &&
+                        list[i].h_res == P2_GENERIC_FORCE_W &&
+                        list[i].v_res == P2_GENERIC_FORCE_H) {
+                        bw = list[i].h_res;
+                        bh = list[i].v_res;
+                        ESP_LOGW(TAG, "generic: forced mode %ux%u", bw, bh);
+                        break;
+                    }
+                }
+                if (!bw)
+#endif
                 for (size_t i = 0; i < actual; i++) {
                     if (list[i].format != want_fmt) {
                         continue;
                     }
-                    const uint32_t px = (uint32_t)list[i].h_res * list[i].v_res;
-                    const bool fits = list[i].h_res <= s_disp_w && list[i].v_res <= s_disp_h;
-                    const bool better = fits ? (px > (uint32_t)bw * bh ||
-                                                (uint32_t)bw * bh > (uint32_t)s_disp_w * s_disp_h)
-                                             : (bw == 0);
-                    if (better) {
+                    const bool within = list[i].h_res <= s_disp_w * P2_GEN_OVERSAMPLE &&
+                                        list[i].v_res <= s_disp_h * P2_GEN_OVERSAMPLE;
+                    if (within && (uint32_t)list[i].h_res * list[i].v_res >
+                                  (uint32_t)bw * bh) {
                         bw = list[i].h_res;
                         bh = list[i].v_res;
+                    }
+                }
+                if (!bw) {
+                    /* Every advertised mode is over the cap. Take the smallest rather than
+                     * nothing - a picture at some cost beats no picture. */
+                    for (size_t i = 0; i < actual; i++) {
+                        if (list[i].format != want_fmt) {
+                            continue;
+                        }
+                        if (!bw || (uint32_t)list[i].h_res * list[i].v_res <
+                                   (uint32_t)bw * bh) {
+                            bw = list[i].h_res;
+                            bh = list[i].v_res;
+                        }
                     }
                 }
                 if (bw && bh) {
@@ -3136,7 +3336,23 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                     s_cam_w = bw;
                     s_cam_h = bh;
                     s_cam_fmt = want_fmt;
-                    fit_preserving_aspect(bw, bh, s_disp_w, s_disp_h, &s_gen_w, &s_gen_h);
+                    /* Default: read the whole frame. A cropping preset narrows this instead
+                     * of scaling, so PPA runs at 1:1 and the pixels are native. */
+                    s_src_w = bw; s_src_h = bh; s_src_x = 0; s_src_y = 0;
+                    s_gen_crop = false;
+                    if (s_gen_crop && bw >= s_disp_w && bh >= s_disp_h) {
+                        /* 1:1 centre crop. Offsets are kept even: PPA reads YUV422 in pairs and
+                         * an odd x offset would swap the chroma siting. */
+                        s_gen_w = s_disp_w;
+                        s_gen_h = s_disp_h;
+                        s_src_w = s_disp_w;
+                        s_src_h = s_disp_h;
+                        s_src_x = ((bw - s_disp_w) / 2) & ~1;
+                        s_src_y = ((bh - s_disp_h) / 2) & ~1;
+                    } else {
+                        s_gen_crop = false;
+                        fit_preserving_aspect(bw, bh, s_disp_w, s_disp_h, &s_gen_w, &s_gen_h);
+                    }
                     s_gen_x = (s_disp_w - s_gen_w) / 2;
                     s_gen_y = (s_disp_h - s_gen_h) / 2;
                     ESP_LOGI(TAG, "camera: generic %s %ux%u -> %dx%d at (%d,%d)",
@@ -3150,6 +3366,13 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
         }
         free(list);
     }
+#if P2_GEN_BENCH
+    static bool bench_started = false;
+    if (!bench_started) {
+        bench_started = true;
+        xTaskCreate(gen_bench_task, "genbench", 3072, NULL, 2, NULL);
+    }
+#endif
     static bool streaming_task_started = false; /* the task now loops forever and handles
                                                  * reconnects itself - only ever spawn one */
     if (!streaming_task_started) {

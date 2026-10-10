@@ -644,19 +644,38 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  *   adj_vref_sq 0x0 = 92 mV,  0x2 = 124 mV (default), 0x3 = 152 mV   squelch threshold
  *   adj_vsw_hs  0x0 = 320 mV, 0x4 = 400 mV (default), 0x7 = 460 mV   TX eye / swing
  *
- * WRITING THESE AFTER usb_host_install() BREAKS ENUMERATION regardless of value. Control test:
- * writing the exact hardware defaults gave 0 enumerations in 22s, twice, where not writing at all
- * gives 5-10. So every trim "result" measured the damage from the write, not the trim - the whole
- * sweep was invalid. If these are ever to be used they must be written at the right point in PHY
- * bring-up (skip_phy_setup = true and configure the PHY manually), not poked afterwards.
+ * MEASURED FACTS, and the header's documented defaults are NOT all correct:
  *
- * Also note the baseline is noisy: identical runs give 3, 7, 8, 10 enumerations per 22s. Only
- * "does a stream open" is stable - it is reliably 0 - so that is the metric any future sweep
- * should use. Single-run enumeration counts are noise. */
+ *   fc_00 = 0x00000080  -> adj_res_hs  = 0x4 (45 ohm)   as documented
+ *   fc_01 = 0x000000f8  -> adj_vref_sq = 0x8            header documents 0x2 - IT IS 0x8
+ *                          adj_pw_hs   = 0xF (400 mV)   as documented
+ *   fc_02 = 0x00000047  -> adj_iref_res= 0x7, adj_vsw_hs = 0x4 (400 mV)
+ *
+ * Writing a register is harmless; writing a WRONG VALUE is not. Writing adj_vref_sq = 0x2 (the
+ * header's "default") actually cuts the squelch threshold hard and kills enumeration: HUB errors
+ * 42-43 and 0 enumerations, against 20-31 and 2-10 at the real 0x8. An earlier conclusion that
+ * "the write itself breaks it" was wrong - it was the value.
+ *
+ * Squelch sweep: 0x9, 0xA, 0xC, 0xF all make the device invisible (no hub activity at all), so
+ * 0x8 is already at the edge of detection and there is no headroom upward. ONE run at 0xA did
+ * produce enum=3 AND streamopen=3 - the only stream opens ever observed on this camera - but it
+ * was not reproducible and the camera went absent shortly after, so it is unconfirmed and worth
+ * retrying.
+ *
+ * VALIDITY RULE for any future sweep: a run with HUB == 0 AND enum == 0 means nothing was
+ * attached - discard it, do not score it as "this setting failed". Several of my sweep results
+ * were exactly that. And use "does a stream open" as the metric; enumeration counts are noisy
+ * (identical runs give 2-10).
+ *
+ * Write them between usb_host_install() and powering the root port (P2_MANUAL_PORT_POWER), which
+ * is verified harmless on its own: HUB 25-27, enum 4-6, same as baseline. */
 #define P2_UTMI_TRIM     0
+#define P2_UTMI_W_FC00   1   /* write fc_00 (adj_res_hs)  */
+#define P2_UTMI_W_FC01   1   /* write fc_01 (adj_vref_sq) */
+#define P2_UTMI_W_FC02   1   /* write fc_02 (adj_vsw_hs)  */
 #define P2_UTMI_RES_HS   0x4   /* 45 ohm, the default */
-#define P2_UTMI_VREF_SQ  0x2   /* 124 mV, unchanged */
-#define P2_UTMI_VSW_HS   0x4   /* 400 mV, unchanged */
+#define P2_UTMI_VREF_SQ  0x8   /* MEASURED actual value; the header documents 0x2 but hardware reads 0x8 */
+#define P2_UTMI_VSW_HS   0x4   /* 400 mV, the measured hardware value */
 
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
  * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
@@ -2719,6 +2738,15 @@ void app_main(void)
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LOWMED,
+#if P2_MANUAL_PORT_POWER
+        /* Install with the root port UNPOWERED so the UTMI trims can be written after PHY
+         * init (which does usb_utmi_ll_reset_register(), wiping anything written earlier) but
+         * BEFORE anything is attached. Writing them after the port is live glitches the link -
+         * measured: writing even the hardware defaults post-install dropped enumerations from
+         * 5-10 per 22s to 0. This also makes set_root_port_power(true) valid; it returns
+         * ESP_ERR_INVALID_STATE ("already powered") otherwise. */
+        .root_port_unpowered = true,
+#endif
 #if P2_FORCE_FULL_SPEED
         .peripheral_map = BIT1,
 #endif
@@ -2743,29 +2771,32 @@ void app_main(void)
     ESP_LOGW(TAG, "USB: HS disconnect interrupt MASKED (experiment)");
 #endif
 #if P2_UTMI_TRIM
-    /* The P4's UTMI PHY exposes analogue trims that IDF never touches (usb_phy.c leaves its
-     * utmi_hal_context "unused for now"), so they sit at hardware defaults. No IDF change is
-     * needed - the register header is already on the include path.
-     *
-     * Relevant to a false HS disconnect: the host decides a device detached by measuring the
-     * differential amplitude during each SOF's EOP, so the HS termination trim changes exactly
-     * the quantity being compared. Tightening to 40 ohm loads the bus harder, which lowers both
-     * reflections and the measured amplitude.
-     *
-     *   adj_res_hs  3'b000 = 40 ohm, 3'b100 = 45 ohm (default), 3'b110 = 50 ohm
-     *   adj_vref_sq 4'b0000 = 92mV, 4'b0010 = 124mV (default), 4'b0011 = 152mV
-     *   adj_vsw_hs  3'b000 = 320mV, 3'b100 = 400mV (default), 3'b111 = 460mV
-     *
-     * Applied after usb_host_install(), which is what configures the PHY. */
-    ESP_LOGW(TAG, "UTMI before: res_hs=%u vref_sq=%u vsw_hs=%u pw_hs=%u",
-             (unsigned)USB_UTMI.fc_00.adj_res_hs, (unsigned)USB_UTMI.fc_01.adj_vref_sq,
-             (unsigned)USB_UTMI.fc_02.adj_vsw_hs, (unsigned)USB_UTMI.fc_01.adj_pw_hs);
+    /* Written here: after usb_host_install() has brought the PHY up (and done its register
+     * reset), but before the root port is powered and anything can attach. */
+    ESP_LOGW(TAG, "UTMI before: fc00=0x%08x fc01=0x%08x fc02=0x%08x",
+             (unsigned)USB_UTMI.fc_00.val, (unsigned)USB_UTMI.fc_01.val,
+             (unsigned)USB_UTMI.fc_02.val);
+    /* Written individually: a bitfield assignment is a read-modify-write of the whole 32-bit
+     * register, so if any register has bits that do not read back what must be written, touching
+     * it corrupts them. Testing one at a time shows which. */
+#if P2_UTMI_W_FC00
     USB_UTMI.fc_00.adj_res_hs  = P2_UTMI_RES_HS;
+#endif
+#if P2_UTMI_W_FC01
     USB_UTMI.fc_01.adj_vref_sq = P2_UTMI_VREF_SQ;
+#endif
+#if P2_UTMI_W_FC02
     USB_UTMI.fc_02.adj_vsw_hs  = P2_UTMI_VSW_HS;
-    ESP_LOGW(TAG, "UTMI after : res_hs=%u vref_sq=%u vsw_hs=%u",
-             (unsigned)USB_UTMI.fc_00.adj_res_hs, (unsigned)USB_UTMI.fc_01.adj_vref_sq,
-             (unsigned)USB_UTMI.fc_02.adj_vsw_hs);
+#endif
+    ESP_LOGW(TAG, "UTMI after : fc00=0x%08x fc01=0x%08x fc02=0x%08x",
+             (unsigned)USB_UTMI.fc_00.val, (unsigned)USB_UTMI.fc_01.val,
+             (unsigned)USB_UTMI.fc_02.val);
+#endif
+#if P2_MANUAL_PORT_POWER
+    {
+        esp_err_t pwr = usb_host_lib_set_root_port_power(true);
+        ESP_LOGW(TAG, "usb: root port powered manually -> %s", esp_err_to_name(pwr));
+    }
 #endif
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
 #if P2_PORT_POWER_RECOVERY

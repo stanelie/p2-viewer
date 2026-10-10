@@ -483,19 +483,40 @@ from application code via `USB_UTMI`:
 | `adj_pw_hs` | `0xF` = 400 mV | `0x1`=100 mV … | reduced-swing power saving |
 | `adj_iref_res`, `adj_pll`, `adj_txclk_phase` | | | other analogue trims |
 
-`P2_UTMI_TRIM` wires these up, but **writing them after `usb_host_install()` breaks enumeration
-regardless of value.** Control test: writing the *exact hardware defaults* gave 0 enumerations in
-22 s, twice, where not writing at all gives 5-10. So the sweep measured the damage done by the
-write, not the effect of any trim - it produced no information about the values at all. Turning the
-write back off restored the baseline immediately (8 and 5 enumerations), confirming the causality.
+`P2_UTMI_TRIM` wires these up. **Write them between `usb_host_install()` and powering the root
+port** - use `root_port_unpowered = true` and call `usb_host_lib_set_root_port_power(true)`
+afterwards. That sequencing is verified harmless on its own (HUB 25-27, enum 4-6, same as
+baseline), and it is also what makes the power call valid; it returns `ESP_ERR_INVALID_STATE`
+("already powered") otherwise.
 
-To test these properly they must be written at the right point in PHY bring-up - `skip_phy_setup =
-true` with the PHY configured manually - rather than poked afterwards. That is untried.
+**The header's documented defaults are not all correct.** Measured on hardware:
 
-**The baseline is also noisy**, which invalidated an earlier sweep of mine that used one run per
-setting: identical runs give **3, 5, 7, 8, 10** enumerations per 22 s. Only *"does a stream open"*
-is stable - reliably 0 - so that is the metric any future sweep must use. Single-run enumeration
-counts are noise.
+```
+fc_00 = 0x00000080  ->  adj_res_hs  = 0x4 (45 ohm)      as documented
+fc_01 = 0x000000f8  ->  adj_vref_sq = 0x8               header says 0x2 - IT IS 0x8
+                        adj_pw_hs   = 0xF (400 mV)      as documented
+fc_02 = 0x00000047  ->  adj_iref_res = 0x7, adj_vsw_hs = 0x4 (400 mV)
+```
+
+This matters: writing `adj_vref_sq = 0x2` because the header calls it the default actually *cuts*
+the squelch threshold hard and kills enumeration - 42-43 HUB errors and 0 enumerations, against
+20-31 and 2-10 at the real `0x8`. An earlier claim here that "the write itself breaks enumeration"
+was wrong; it was the value. Writing a register with its true value is harmless (verified
+per-register).
+
+Squelch sweep result: `0x9`, `0xA`, `0xC`, `0xF` all make the device **invisible** - no hub
+activity at all - so `0x8` already sits at the edge of detection with no headroom upward. **One
+run at `0xA` did produce `enum=3` and `streamopen=3`, the only stream opens ever observed on this
+camera**, but it was not reproducible and the camera went electrically absent shortly afterwards.
+Unconfirmed, and worth retrying on a known-good rig.
+
+### Validity rule for any future sweep
+
+A run with **`HUB == 0` and `enum == 0` means nothing was attached** - discard it, do not score it
+as "this setting failed". Several of my sweep results were exactly that, and I initially scored
+them as negative results for the trims. Check for device presence before attributing an outcome to
+a setting. Use *"does a stream open"* as the metric; enumeration counts are noisy (identical runs
+give 2-10).
 
 Masking the disconnect interrupt does **not** work (5 enumerations, 0 stream opens, unchanged):
 `disconnint` is the OTG-level disconnect, whereas the host port state machine detects removal via

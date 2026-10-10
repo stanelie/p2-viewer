@@ -597,8 +597,36 @@ gintsts: disconn=0 throughout
 
 `prtconnsts` stays 1 (device still electrically present) while `prtena` goes 0, and `DISCONNINT`
 never fires at all. Per IDF's own HAL documentation that combination is a **port error** - the
-babble class (USB 2.0 spec 11.8.1). Containing babble on a downstream port, and not propagating
-it upstream, is a *mandatory* hub function; that is what the hub is doing for us.
+babble class (USB 2.0 spec 11.8.1).
+
+Note what the hub is *not* doing: it is not absorbing these errors. Through the hub the counters
+read `TR 0 PDIS 0` over a sustained 25-30 fps stream, so **no babble occurs at all** on that path.
+The hub prevents the condition rather than containing it - it gives the camera a short, properly
+terminated link and presents the P4 with a clean signal driven from 2 cm away instead of through a
+metre of thin cable.
+
+### Can the ESP32 be made "dumb enough" to cope, or emulate the hub? No - and the reason is in silicon
+
+Both forms of the idea are blocked:
+
+**Ignore the port error and keep streaming** is impossible. `HPRT.prtena` is **W1C - writing 1
+disables it** (`usb_dwc_ll_hprt_port_dis`: `hprt.prtena = 1; //W1C to disable`). Software can only
+ever *clear* that bit; it is the core that sets it, and only on completion of a port reset. So once
+the core disables the port there is no way back except a reset, and a reset drops the device's
+address and forces re-enumeration. That is exactly the loop in the logs. No amount of leniency in
+our code can override it, because the leniency would have to live in the host controller.
+
+**Emulate the hub** is a category error on our side: a USB 2.0 hub's contribution here is a second
+PHY physically in the signal path, close to the camera. We have one PHY at one end of the cable.
+There is no protocol behaviour to imitate - the hub is doing an electrical job, not a logical one.
+
+And the hub is not "dumber" in any useful sense. It is a purpose-built retimer/repeater: simpler in
+function, but *better* at the one thing that matters - receiving and re-driving on a marginal link.
+The P4 is not failing because it is too strict; it is failing because its PHY sits at the far end of
+a bad cable.
+
+Full speed would be genuinely dumber, but the P4's FS controller pins are not routed on this board
+(`P2_FORCE_FULL_SPEED`, kept as a record).
 
 The Anker dock reproduces the direct-connection failure exactly (same negotiation, same port
 disable, 0 frames) - it is not a workaround and not a useful control. The **plain USB 2.0 hub** is

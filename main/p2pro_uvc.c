@@ -33,6 +33,7 @@
 #include "esp_lcd_st7796.h"
 
 #include "usb/usb_host.h"
+#include "soc/usb_dwc_struct.h"   /* USB_DWC_HS: for the disconnect-mask experiment */
 #include "usb/uvc_host.h"
 /* Declared rather than included: esp_private/uvc_control.h pulls in the component's private
  * usb_types_uvc.h, which is not on the public include path. The symbol itself is exported and is
@@ -627,6 +628,13 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * connector, so full speed is not available as a way to dodge high-speed disconnect detection.
  * Kept as a record; do not retry on this board. */
 #define P2_FORCE_FULL_SPEED 0
+
+/* Experiment, answered: masking the OTG disconnect interrupt does NOT stop the spurious teardown
+ * (5 enumerations, 0 stream opens, unchanged). Wrong register - `disconnint` is the OTG-level
+ * disconnect, while the host port state machine detects removal via HPRT.prtconndet and the port
+ * interrupt. Masking that would mask connect events too and break enumeration. No software lever
+ * exists here. Kept as a record; do not retry. */
+#define P2_MASK_HS_DISCONNECT 0
 
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
  * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
@@ -2668,6 +2676,20 @@ void app_main(void)
 #endif
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
+#if P2_MASK_HS_DISCONNECT
+    /* EXPERIMENT. The borescope completes every enumeration stage and is then reported
+     * "device gone" - a FALSE high-speed disconnect. HS disconnect is detected purely
+     * electrically (the host samples the differential amplitude during each SOF's EOP; an
+     * unloaded bus roughly doubles it past ~625mV), so reflections on a marginal cable can trip
+     * it while the device is still physically present and fine. The P4's USB register space
+     * exposes no PHY tuning - no squelch, no threshold, no termination trim - only this mask.
+     *
+     * Masking it reaches behind the host library, which owns this register. If it works, genuine
+     * removal is no longer detected by interrupt; the existing "no frames for ~3s -> restart"
+     * supervisor in render_task is the fallback. */
+    USB_DWC_HS.gintmsk_reg.disconnintmsk = 0;
+    ESP_LOGW(TAG, "USB: HS disconnect interrupt MASKED (experiment)");
+#endif
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
 #if P2_USB_PROBE
     xTaskCreate(usb_probe_task, "usbprobe", 4096, NULL, USB_HOST_PRIORITY - 3, NULL);

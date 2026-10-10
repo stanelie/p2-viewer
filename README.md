@@ -456,6 +456,28 @@ It would have cost framerate anyway: full speed gives ~1.1 MB/s realistically, s
 manages ~7 fps against 25 through the hub. Recovering 25 fps at full speed would mean MJPEG plus
 the P4's hardware JPEG decoder.
 
+### Why it works on a phone but not here
+
+High-speed disconnect detection is **purely electrical and has no handshake**: the host samples the
+differential amplitude during the EOP of each SOF, and an unloaded bus roughly doubles it past
+~625 mV. On a long thin cable, attenuation and impedance discontinuities mean reflections in that
+EOP window can cross the threshold while the device is still present and perfectly healthy - which
+is exactly the observed "every stage OK, then device gone".
+
+Phone and PC SoCs tolerate the same cable because their PHYs have trimmed terminations and
+*adjustable* disconnect thresholds and squelch, plus impedance-controlled routing to the connector.
+
+**The ESP32-P4's USB register space exposes no PHY tuning whatsoever** - no squelch, no disconnect
+threshold, no termination trim, no pre-emphasis. The only disconnect-related fields are
+`disconnint` and `disconnintmsk`. Masking that interrupt was tried and changes nothing (5
+enumerations, 0 stream opens): it is the OTG-level disconnect, whereas the host port state machine
+detects removal via `HPRT.prtconndet` and the port interrupt, and masking *that* would mask connect
+events as well.
+
+So there is no software lever. A hub is not a workaround but the correct answer - it is precisely
+what the USB specification provides repeaters for, and it re-drives the marginal segment with a
+properly terminated PHY at the camera's end.
+
 Anything further needs a scope on D+/D-, not more software.
 
 ## Flash layout (16MB)

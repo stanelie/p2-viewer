@@ -483,11 +483,19 @@ from application code via `USB_UTMI`:
 | `adj_pw_hs` | `0xF` = 400 mV | `0x1`=100 mV … | reduced-swing power saving |
 | `adj_iref_res`, `adj_pll`, `adj_txclk_phase` | | | other analogue trims |
 
-`P2_UTMI_TRIM` wires these up for sweeping. Swept at 40/45/50 Ω and at 460 mV swing against the
-borescope: **no combination produced an enumeration - but the sweep was inconclusive**, because the
-baseline at defaults also gave 0 enumerations in that session where it had managed 6 per 25 s
-earlier. The link had degraded, so there was no signal to measure. Worth re-running when the
-baseline enumerates again.
+`P2_UTMI_TRIM` wires these up, but **writing them after `usb_host_install()` breaks enumeration
+regardless of value.** Control test: writing the *exact hardware defaults* gave 0 enumerations in
+22 s, twice, where not writing at all gives 5-10. So the sweep measured the damage done by the
+write, not the effect of any trim - it produced no information about the values at all. Turning the
+write back off restored the baseline immediately (8 and 5 enumerations), confirming the causality.
+
+To test these properly they must be written at the right point in PHY bring-up - `skip_phy_setup =
+true` with the PHY configured manually - rather than poked afterwards. That is untried.
+
+**The baseline is also noisy**, which invalidated an earlier sweep of mine that used one run per
+setting: identical runs give **3, 5, 7, 8, 10** enumerations per 22 s. Only *"does a stream open"*
+is stable - reliably 0 - so that is the metric any future sweep must use. Single-run enumeration
+counts are noise.
 
 Masking the disconnect interrupt does **not** work (5 enumerations, 0 stream opens, unchanged):
 `disconnint` is the OTG-level disconnect, whereas the host port state machine detects removal via

@@ -644,10 +644,15 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  *   adj_vref_sq 0x0 = 92 mV,  0x2 = 124 mV (default), 0x3 = 152 mV   squelch threshold
  *   adj_vsw_hs  0x0 = 320 mV, 0x4 = 400 mV (default), 0x7 = 460 mV   TX eye / swing
  *
- * Swept against the borescope at 40/45/50 ohm and at 460 mV swing: no combination produced an
- * enumeration. That sweep was INCONCLUSIVE, though - the baseline at defaults gave 0 enumerations
- * in the same session, where it had managed 6 per 25s earlier, so the link had degraded and there
- * was no signal to measure. Worth re-running when the baseline enumerates again. */
+ * WRITING THESE AFTER usb_host_install() BREAKS ENUMERATION regardless of value. Control test:
+ * writing the exact hardware defaults gave 0 enumerations in 22s, twice, where not writing at all
+ * gives 5-10. So every trim "result" measured the damage from the write, not the trim - the whole
+ * sweep was invalid. If these are ever to be used they must be written at the right point in PHY
+ * bring-up (skip_phy_setup = true and configure the PHY manually), not poked afterwards.
+ *
+ * Also note the baseline is noisy: identical runs give 3, 7, 8, 10 enumerations per 22s. Only
+ * "does a stream open" is stable - it is reliably 0 - so that is the metric any future sweep
+ * should use. Single-run enumeration counts are noise. */
 #define P2_UTMI_TRIM     0
 #define P2_UTMI_RES_HS   0x4   /* 45 ohm, the default */
 #define P2_UTMI_VREF_SQ  0x2   /* 124 mV, unchanged */
@@ -1903,6 +1908,36 @@ static void usb_probe_task(void *arg)
 }
 #endif
 
+
+#if P2_PORT_POWER_RECOVERY
+/* If the port sits failing with nothing enumerated, cycle root port power. Two things this can
+ * fix: a wedged host port state machine, and - if HPRT.prtpwr actually gates VBUS on this board -
+ * a wedged device, by power-cycling it. The borescope appears to wedge after repeated failed
+ * resets and then stay dead until it loses power, which is what makes its own baseline drift. */
+static void usb_port_recovery_task(void *arg)
+{
+    (void)arg;
+    const int idle_limit = 10;          /* ~10s with no camera before intervening */
+    int idle = 0;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_camera_connected) {
+            idle = 0;
+            continue;
+        }
+        if (++idle < idle_limit) {
+            continue;
+        }
+        idle = 0;
+        ESP_LOGW(TAG, "usb: no camera for %ds - cycling root port power", idle_limit);
+        esp_err_t e1 = usb_host_lib_set_root_port_power(false);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_err_t e2 = usb_host_lib_set_root_port_power(true);
+        ESP_LOGW(TAG, "usb: port power off=%s on=%s", esp_err_to_name(e1), esp_err_to_name(e2));
+    }
+}
+#endif
+
 static void usb_lib_task(void *arg)
 {
     while (1) {
@@ -2733,6 +2768,9 @@ void app_main(void)
              (unsigned)USB_UTMI.fc_02.adj_vsw_hs);
 #endif
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
+#if P2_PORT_POWER_RECOVERY
+    xTaskCreate(usb_port_recovery_task, "usbrecov", 3072, NULL, 3, NULL);
+#endif
 #if P2_USB_PROBE
     xTaskCreate(usb_probe_task, "usbprobe", 4096, NULL, USB_HOST_PRIORITY - 3, NULL);
 #endif

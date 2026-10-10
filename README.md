@@ -329,6 +329,27 @@ hub between board and camera would regenerate the signal and is the next thing t
 root port reset failed outright and enumeration never started at all; at the defaults it at least
 enumerates intermittently. Do not retry that.
 
+## Flash layout (16MB)
+
+The board carries 16MB but the image header declared 2MB, so the bootloader logged
+`Detected size(16384k) larger than the size in the binary image header(2048k)` and ignored the
+rest. With `CONFIG_ESPTOOLPY_FLASHSIZE_16MB` the whole chip is addressable:
+
+| partition | type | offset | size | |
+|---|---|---|---|---|
+| `nvs` | data/nvs | 0x9000 | 24K | |
+| `phy_init` | data/phy | 0xf000 | 4K | |
+| `factory` | app | 0x10000 | 1M | app is ~509KB, 49% used |
+| `ffc` | data/0x40 | 0x110000 | 64K | flat-field table, 48KB + header |
+| `storage` | data/fat | 0x120000 | **14.875M** | declared, not mounted |
+
+Every offset below `0x120000` is deliberately unchanged from the 2MB layout, so a stored
+flat-field table survives the change and previously released merged binaries stay
+layout-compatible. The app's 1M is left alone at 49% used.
+
+`storage` is **declared but not mounted** — nothing consumes it yet, and mounting a filesystem at
+boot would cost time against a ~1.7s startup. Mount it on demand when something needs it.
+
 ## Known limitations
 
 - **Screen tearing is not fixable on this board.** Confirmed from the schematic: there is no TE net

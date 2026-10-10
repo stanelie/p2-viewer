@@ -1,8 +1,15 @@
 # Name,     Type, SubType,  Offset,    Size,     Flags
-# Default single-app layout, plus a partition for the flat-field table.
+# Single-app layout on the board's 16MB flash.
+#
+# Offsets below 0x120000 are deliberately UNCHANGED from the 2MB layout: moving them would
+# relocate the ffc partition and discard a stored flat-field table, and would make previously
+# released merged binaries incompatible. The app is ~509KB, so its 1MB stays ample.
 nvs,        data, nvs,      0x9000,    0x6000,
 phy_init,   data, phy,      0xf000,    0x1000,
 factory,    app,  factory,  0x10000,   0x100000,
 # The FFC offset table is 256*192 int8 = 48KB plus a 16-byte header; NVS at 24KB cannot hold it.
 # A raw partition avoids NVS blob overhead and lets it be written in one erase+write.
 ffc,        data, 0x40,     0x110000,  0x10000,
+# Everything else: 0x1000000 - 0x120000 = 0xEE0000 = 14.875MB. Declared but NOT mounted - nothing
+# consumes it yet, and mounting a filesystem at boot would cost time against a 1.7s startup.
+storage,    data, fat,      0x120000,  0xEE0000,

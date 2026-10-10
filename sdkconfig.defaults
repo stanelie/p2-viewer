@@ -34,3 +34,8 @@ CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+
+# The board carries 16MB of flash but the image header declared 2MB, so the bootloader logged
+# "Detected size(16384k) larger than the size in the binary image header(2048k)" and ignored the
+# rest. Declaring the true size makes the whole chip addressable.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

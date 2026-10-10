@@ -467,16 +467,34 @@ is exactly the observed "every stage OK, then device gone".
 Phone and PC SoCs tolerate the same cable because their PHYs have trimmed terminations and
 *adjustable* disconnect thresholds and squelch, plus impedance-controlled routing to the connector.
 
-**The ESP32-P4's USB register space exposes no PHY tuning whatsoever** - no squelch, no disconnect
-threshold, no termination trim, no pre-emphasis. The only disconnect-related fields are
-`disconnint` and `disconnintmsk`. Masking that interrupt was tried and changes nothing (5
-enumerations, 0 stream opens): it is the OTG-level disconnect, whereas the host port state machine
-detects removal via `HPRT.prtconndet` and the port interrupt, and masking *that* would mask connect
-events as well.
+**The P4 DOES expose analogue PHY trims**, and no IDF change is needed to reach them. They are not
+in the DWC core register map (which is where I first looked, and wrongly concluded there was
+nothing) but in a separate UTMI PHY block - `soc/usb_utmi_struct.h` under
+`components/soc/esp32p4/register/hw_ver3/`, already on the include path because soc's CMakeLists
+appends the `hw_ver` directory for the chip revision. `usb_phy.c` never writes them (its
+`utmi_hal_context` is "unused for now"), so they sit at hardware defaults and can be set straight
+from application code via `USB_UTMI`:
 
-So there is no software lever. A hub is not a workaround but the correct answer - it is precisely
-what the USB specification provides repeaters for, and it re-drives the marginal segment with a
-properly terminated PHY at the camera's end.
+| field | default | options | relevance |
+|---|---|---|---|
+| `adj_res_hs` | `0x4` = 45 Ω | `0x0`=40 Ω, `0x6`=50 Ω | HS termination trim - changes the very amplitude disconnect is judged on |
+| `adj_vref_sq` | `0x2` = 124 mV | `0x0`=92 mV, `0x3`=152 mV | squelch detection threshold |
+| `adj_vsw_hs` | `0x4` = 400 mV | `0x0`=320 mV, `0x7`=460 mV | TX eye / output swing |
+| `adj_pw_hs` | `0xF` = 400 mV | `0x1`=100 mV … | reduced-swing power saving |
+| `adj_iref_res`, `adj_pll`, `adj_txclk_phase` | | | other analogue trims |
+
+`P2_UTMI_TRIM` wires these up for sweeping. Swept at 40/45/50 Ω and at 460 mV swing against the
+borescope: **no combination produced an enumeration - but the sweep was inconclusive**, because the
+baseline at defaults also gave 0 enumerations in that session where it had managed 6 per 25 s
+earlier. The link had degraded, so there was no signal to measure. Worth re-running when the
+baseline enumerates again.
+
+Masking the disconnect interrupt does **not** work (5 enumerations, 0 stream opens, unchanged):
+`disconnint` is the OTG-level disconnect, whereas the host port state machine detects removal via
+`HPRT.prtconndet` and the port interrupt, and masking *that* would mask connect events too.
+
+A hub remains the reliable answer - it is what the USB specification provides repeaters for, and it
+re-drives the marginal segment with a properly terminated PHY at the camera's end.
 
 Anything further needs a scope on D+/D-, not more software.
 

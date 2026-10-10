@@ -33,7 +33,8 @@
 #include "esp_lcd_st7796.h"
 
 #include "usb/usb_host.h"
-#include "soc/usb_dwc_struct.h"   /* USB_DWC_HS: for the disconnect-mask experiment */
+#include "soc/usb_dwc_struct.h"   /* USB_DWC_HS */
+#include "soc/usb_utmi_struct.h"  /* USB_UTMI: analogue PHY trims (termination, squelch, swing) */
 #include "usb/uvc_host.h"
 /* Declared rather than included: esp_private/uvc_control.h pulls in the component's private
  * usb_types_uvc.h, which is not on the public include path. The symbol itself is exported and is
@@ -635,6 +636,22 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * interrupt. Masking that would mask connect events too and break enumeration. No software lever
  * exists here. Kept as a record; do not retry. */
 #define P2_MASK_HS_DISCONNECT 0
+
+/* Override the UTMI PHY analogue trims. Values are the raw register encodings, and the ones below
+ * are the hardware defaults. IDF never writes these, so with P2_UTMI_TRIM 0 they stay at default.
+ *
+ *   adj_res_hs  0x0 = 40 ohm, 0x4 = 45 ohm (default), 0x6 = 50 ohm   HS termination trim
+ *   adj_vref_sq 0x0 = 92 mV,  0x2 = 124 mV (default), 0x3 = 152 mV   squelch threshold
+ *   adj_vsw_hs  0x0 = 320 mV, 0x4 = 400 mV (default), 0x7 = 460 mV   TX eye / swing
+ *
+ * Swept against the borescope at 40/45/50 ohm and at 460 mV swing: no combination produced an
+ * enumeration. That sweep was INCONCLUSIVE, though - the baseline at defaults gave 0 enumerations
+ * in the same session, where it had managed 6 per 25s earlier, so the link had degraded and there
+ * was no signal to measure. Worth re-running when the baseline enumerates again. */
+#define P2_UTMI_TRIM     0
+#define P2_UTMI_RES_HS   0x4   /* 45 ohm, the default */
+#define P2_UTMI_VREF_SQ  0x2   /* 124 mV, unchanged */
+#define P2_UTMI_VSW_HS   0x4   /* 400 mV, unchanged */
 
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
  * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
@@ -2689,6 +2706,31 @@ void app_main(void)
      * supervisor in render_task is the fallback. */
     USB_DWC_HS.gintmsk_reg.disconnintmsk = 0;
     ESP_LOGW(TAG, "USB: HS disconnect interrupt MASKED (experiment)");
+#endif
+#if P2_UTMI_TRIM
+    /* The P4's UTMI PHY exposes analogue trims that IDF never touches (usb_phy.c leaves its
+     * utmi_hal_context "unused for now"), so they sit at hardware defaults. No IDF change is
+     * needed - the register header is already on the include path.
+     *
+     * Relevant to a false HS disconnect: the host decides a device detached by measuring the
+     * differential amplitude during each SOF's EOP, so the HS termination trim changes exactly
+     * the quantity being compared. Tightening to 40 ohm loads the bus harder, which lowers both
+     * reflections and the measured amplitude.
+     *
+     *   adj_res_hs  3'b000 = 40 ohm, 3'b100 = 45 ohm (default), 3'b110 = 50 ohm
+     *   adj_vref_sq 4'b0000 = 92mV, 4'b0010 = 124mV (default), 4'b0011 = 152mV
+     *   adj_vsw_hs  3'b000 = 320mV, 3'b100 = 400mV (default), 3'b111 = 460mV
+     *
+     * Applied after usb_host_install(), which is what configures the PHY. */
+    ESP_LOGW(TAG, "UTMI before: res_hs=%u vref_sq=%u vsw_hs=%u pw_hs=%u",
+             (unsigned)USB_UTMI.fc_00.adj_res_hs, (unsigned)USB_UTMI.fc_01.adj_vref_sq,
+             (unsigned)USB_UTMI.fc_02.adj_vsw_hs, (unsigned)USB_UTMI.fc_01.adj_pw_hs);
+    USB_UTMI.fc_00.adj_res_hs  = P2_UTMI_RES_HS;
+    USB_UTMI.fc_01.adj_vref_sq = P2_UTMI_VREF_SQ;
+    USB_UTMI.fc_02.adj_vsw_hs  = P2_UTMI_VSW_HS;
+    ESP_LOGW(TAG, "UTMI after : res_hs=%u vref_sq=%u vsw_hs=%u",
+             (unsigned)USB_UTMI.fc_00.adj_res_hs, (unsigned)USB_UTMI.fc_01.adj_vref_sq,
+             (unsigned)USB_UTMI.fc_02.adj_vsw_hs);
 #endif
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
 #if P2_USB_PROBE

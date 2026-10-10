@@ -18,6 +18,7 @@
 #include "esp_partition.h"
 #include "esp_crc.h"
 #include "esp_check.h"
+#include "esp_rom_sys.h"      /* esp_rom_delay_us() in the port tracer */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,6 +28,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/ppa.h"
+#include "driver/jpeg_decode.h"   /* P4 hardware JPEG: the MJPEG generic path */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -70,6 +72,36 @@ typedef enum {
 static volatile cam_kind_t s_cam_kind = CAM_NONE;
 static volatile uint16_t s_cam_w = STREAM_H_RES;   /* format actually requested */
 static volatile uint16_t s_cam_h = STREAM_V_RES;
+static volatile enum uvc_host_stream_format s_cam_fmt = UVC_VS_FORMAT_YUY2;
+
+/* ---- why a generic camera is asked for MJPEG ------------------------------------------------
+ * Isochronous packets are never retried, so a frame only arrives if EVERY one of its packets
+ * does: completion goes as (1-p)^N in the packet count N, and N is set by bytes-per-frame, not
+ * by the endpoint size. Measured on the Sunplus borescope, 320x240:
+ *
+ *     YUY2   153600 B/frame  ~151 loss units of 1020 B
+ *     MJPEG   22824 B/frame   ~22   (mean of 20 frames, 19184..24468)
+ *
+ * That is the whole reason an earlier MAX_MPS_IN patch (3060 -> 944 MPS) changed nothing: it
+ * cut packet SIZE and left the count alone. Only the format moves the count, and ~7x fewer
+ * loss units is the difference between (1-p)^151 and (1-p)^22.
+ *
+ * Set to 0 to go back to YUY2 for every generic camera. */
+#define P2_GENERIC_PREFER_MJPEG 1
+
+/* Hardware JPEG decoder, brought up lazily the first time an MJPEG frame arrives so the
+ * thermal path never pays for it. */
+static jpeg_decoder_handle_t s_jpeg_dec;
+static uint8_t  *s_jpeg_in;        /* DMA-capable copy of the compressed frame */
+static size_t    s_jpeg_in_cap;
+static uint8_t  *s_jpeg_out;       /* decoded RGB565 at the camera's native size */
+static size_t    s_jpeg_out_cap;
+static bool      s_jpeg_failed;    /* bring-up failed once: stop retrying every frame */
+
+/* Diagnostics: on a marginal link these three counters ARE the measurement - they separate
+ * "the frame never completed" from "the decoder could not handle it". */
+static uint32_t s_mj_ok, s_mj_truncated, s_mj_decode_err;
+static uint32_t s_port_disables;   /* survives a stream teardown, unlike the mjpeg counters */
 
 /* Generic-preview output geometry, computed once per connect. */
 static int s_gen_w, s_gen_h, s_gen_x, s_gen_y;
@@ -679,6 +711,54 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
                                 * and stream opens 0 -> 7-11 - but UNTESTED against the P2 Pro and the
                                 * webcam, so it is NOT the default. See the README. */
 #define P2_UTMI_VSW_HS   0x4   /* 400 mV, the measured hardware value */
+
+/* ---- HS bus turn-around sweep ---------------------------------------------------------------
+ * fc_06.hs_tx2rx_dly_cnt_sel is "PHY High-Speed bus turn-around time select", 3 bits, hardware
+ * default 0b100. It sets how long the PHY waits after transmitting before it starts receiving.
+ *
+ * Why this knob and not another: the borescope's failure is NOT corrupted data. Every control
+ * transfer over the same cable succeeds, repeatedly. What happens is that ~20ms after isochronous
+ * traffic starts the core raises DISCONNINT - a purely analogue decision, taken by sampling the
+ * differential amplitude in a narrow window after each SOF's EOP, with no handshake and no retry.
+ * Sparse control traffic leaves the bus idle around that window; continuous isoc does not. If
+ * ringing from a metre of thin unterminated cable is still settling when the PHY turns around,
+ * a longer turn-around is exactly the fix.
+ *
+ * Swept in firmware rather than one value per build: each data point otherwise costs a physical
+ * replug, and this camera wedges off the bus after repeated failures. */
+#define P2_TX2RX_SWEEP 0
+
+/* ---- port-register tracer ------------------------------------------------------------------
+ * Stops the guessing. Every explanation so far (packets per frame, burst size, bus turn-around)
+ * predicted DEGRADED data; the sweep measured ok=0 truncated=0 decode_err=0 across all eight
+ * turn-around values, i.e. the frame callback never fires at all. So read the hardware.
+ *
+ * The decisive bit is HPRT.prtconnsts sampled at the instant of the "disconnect": if the device
+ * is still electrically connected, the core raised DISCONNINT on a device that never left, and
+ * this is a detector problem. If it really is 0, the device is genuinely dropping off and no
+ * host-side register will help.
+ *
+ * GINTSTS is sampled too, for incompisoin / incompip - those are periodic-scheduling faults
+ * rather than analogue ones, and would point somewhere else entirely. Note the ISR clears
+ * GINTSTS, so these samples under-report; a bit seen set is meaningful, a bit seen clear is not. */
+#define P2_PORT_TRACE 0
+
+/* ---- on-screen USB diagnostics ---------------------------------------------------------------
+ * The two USB sockets on this board are too close together to have the serial adapter and the
+ * borescope's USB-A adapter plugged in at once, so the ONE case that still needs measuring - the
+ * working plain-USB-2.0-hub case - cannot be captured over serial. Put the numbers on the panel
+ * instead and read them off the screen.
+ *
+ * What matters is read straight out of the controller rather than echoed from the driver's log:
+ * HCCHAR.mps is the per-transaction max packet size the core was actually programmed with, and
+ * HCCHAR.ec is MULTCNT - transactions per microframe for a high-bandwidth periodic endpoint.
+ * ESP-IDF never writes ec (verified: no write anywhere in the tree, and USB_EP_DESC_GET_MULT is
+ * unused by hcd_dwc.c), so if the hub case streams with ec=0 at mps=1020 then high-bandwidth
+ * isoc works here and MULTCNT is NOT the cause. That is the comparison this overlay exists for.
+ *
+ * Glyph set has no lowercase and no J, hence FMT1 rather than MJPEG. */
+#define P2_USB_OSD 0
+#define P2_TRACE_N    384
 
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
  * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
@@ -1467,6 +1547,56 @@ static inline size_t ppa_out_bytes(int w, int h)
     return ((size_t)w * h * sizeof(uint16_t) + 63u) & ~(size_t)63u;
 }
 
+/* Bring up the hardware JPEG decoder and its two DMA buffers for a w*h MJPEG stream.
+ *
+ * The input buffer gets the uncompressed size as its ceiling: a JPEG larger than its own
+ * raw bitmap is not a thing, so this cannot be undersized, and it saves having to trust
+ * dwMaxVideoFrameBufferSize. Both buffers come from jpeg_alloc_decoder_mem, which applies the
+ * alignment the peripheral needs - the same class of requirement that cost us a black screen
+ * on PPA's out.buffer_size. */
+static bool jpeg_decoder_ensure(int w, int h)
+{
+    if (s_jpeg_dec) {
+        return true;
+    }
+    if (s_jpeg_failed) {
+        return false;
+    }
+
+    const size_t want = (size_t)w * h * sizeof(uint16_t);
+
+    const jpeg_decode_engine_cfg_t eng = {
+        .intr_priority = 0,
+        .timeout_ms    = 100,   /* a 25fps frame budget is 40ms; 100 flags a real stall */
+    };
+    esp_err_t err = jpeg_new_decoder_engine(&eng, &s_jpeg_dec);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "jpeg: engine init failed: %s", esp_err_to_name(err));
+        s_jpeg_dec = NULL;
+        s_jpeg_failed = true;
+        return false;
+    }
+
+    const jpeg_decode_memory_alloc_cfg_t in_cfg  = { .buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER };
+    const jpeg_decode_memory_alloc_cfg_t out_cfg = { .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER };
+    s_jpeg_in  = jpeg_alloc_decoder_mem(want, &in_cfg,  &s_jpeg_in_cap);
+    s_jpeg_out = jpeg_alloc_decoder_mem(want, &out_cfg, &s_jpeg_out_cap);
+    if (!s_jpeg_in || !s_jpeg_out) {
+        ESP_LOGE(TAG, "jpeg: buffer alloc failed (wanted %u each, in=%p out=%p)",
+                 (unsigned)want, s_jpeg_in, s_jpeg_out);
+        free(s_jpeg_in);  s_jpeg_in  = NULL;
+        free(s_jpeg_out); s_jpeg_out = NULL;
+        jpeg_del_decoder_engine(s_jpeg_dec);
+        s_jpeg_dec = NULL;
+        s_jpeg_failed = true;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "jpeg: decoder up for %dx%d (in %u B, out %u B)",
+             w, h, (unsigned)s_jpeg_in_cap, (unsigned)s_jpeg_out_cap);
+    return true;
+}
+
 static int ppa_quantized_out(int in_dim, int desired_out)
 {
     int sixteenths = (int)(((float)desired_out / in_dim) * 16.0f); /* floor, as the driver casts */
@@ -1819,6 +1949,116 @@ static void touch_task(void *arg)
     }
 }
 
+#if P2_PORT_TRACE
+typedef struct {
+    uint32_t t_us;
+    uint32_t hprt;
+    uint32_t gintsts;
+} port_sample_t;
+
+static port_sample_t s_trace[P2_TRACE_N];
+static volatile uint32_t s_trace_head;     /* monotonic; index is head % P2_TRACE_N */
+static volatile bool     s_trace_run;
+
+static void port_trace_task(void *arg)
+{
+    while (true) {
+        if (!s_trace_run) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        port_sample_t *e = &s_trace[s_trace_head % P2_TRACE_N];
+        e->t_us    = (uint32_t)esp_timer_get_time();
+        e->hprt    = USB_DWC_HS.hprt_reg.val;
+        e->gintsts = USB_DWC_HS.gintsts_reg.val;
+        s_trace_head++;
+        /* ~100us. The failure window is ~20ms, so 384 samples cover it with room to spare. */
+        esp_rom_delay_us(100);
+    }
+}
+
+static void port_trace_dump(const char *why)
+{
+    const uint32_t head = s_trace_head;
+    const uint32_t n    = (head < P2_TRACE_N) ? head : P2_TRACE_N;
+    ESP_LOGW(TAG, "trace[%s]: %u samples (newest last)", why, (unsigned)n);
+
+    /* Only transitions: 200 identical lines would bury the one that matters. */
+    uint32_t last_h = 0xFFFFFFFFu, last_g = 0xFFFFFFFFu;
+    int shown = 0;
+    for (uint32_t i = head - n; i < head && shown < 40; i++) {
+        const port_sample_t *e = &s_trace[i % P2_TRACE_N];
+        /* sof/rxflvl/hchint toggle constantly - ignore them when deciding "changed". */
+        const uint32_t gmask = ~(uint32_t)((1u << 3) | (1u << 4) | (1u << 25));
+        if (e->hprt == last_h && (e->gintsts & gmask) == (last_g & gmask)) {
+            continue;
+        }
+        last_h = e->hprt; last_g = e->gintsts;
+        usb_dwc_hprt_reg_t h = { .val = e->hprt };
+        usb_dwc_gintsts_reg_t g = { .val = e->gintsts };
+        ESP_LOGW(TAG, "  %10u hprt=%08x connsts=%u conndet=%u ena=%u enachng=%u ovrcur=%u "
+                      "lnsts=%u spd=%u | gintsts=%08x disconn=%u incompisoin=%u incompip=%u",
+                 (unsigned)e->t_us, (unsigned)e->hprt,
+                 (unsigned)h.prtconnsts, (unsigned)h.prtconndet, (unsigned)h.prtena,
+                 (unsigned)h.prtenchng, (unsigned)h.prtovrcurract,
+                 (unsigned)h.prtlnsts, (unsigned)h.prtspd,
+                 (unsigned)e->gintsts, (unsigned)g.disconnint,
+                 (unsigned)g.incompisoin, (unsigned)g.incompip);
+        shown++;
+    }
+    /* The live register, read now - after the stack has already torn the port down. */
+    usb_dwc_hprt_reg_t now = { .val = USB_DWC_HS.hprt_reg.val };
+    ESP_LOGW(TAG, "  live: hprt=%08x connsts=%u ena=%u lnsts=%u",
+             (unsigned)now.val, (unsigned)now.prtconnsts,
+             (unsigned)now.prtena, (unsigned)now.prtlnsts);
+}
+#endif /* P2_PORT_TRACE */
+
+#if P2_USB_OSD || P2_PORT_TRACE
+/* Scan the 16 host channels for the isochronous IN one and report what the core was actually
+ * programmed with. eptype 1 = isochronous (usb_dwc_xfer_type_t), epdir 1 = IN. */
+static bool usb_isoc_chan_info(unsigned *mps, unsigned *ec, unsigned *epnum)
+{
+    for (int i = 0; i < 16; i++) {
+        usb_dwc_hcchar_reg_t c = { .val = USB_DWC_HS.host_chans[i].hcchar_reg.val };
+        if (c.eptype == 1 && c.epdir == 1 && c.mps != 0) {
+            *mps = c.mps; *ec = c.ec; *epnum = c.epnum;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
+#if P2_USB_OSD
+/* Drawn into the scaled RGB565 image BEFORE the byte-swap pass, so the text gets swapped along
+ * with the picture and comes out the right way round. */
+static void usb_osd_draw(uint16_t *buf, int bw, int bh)
+{
+    char l1[32], l2[32], l3[32];
+    unsigned mps = 0, ec = 0, epnum = 0;
+    const bool have = usb_isoc_chan_info(&mps, &ec, &epnum);
+
+    snprintf(l1, sizeof(l1), "FMT%d %dX%d",
+             (s_cam_fmt == UVC_VS_FORMAT_MJPEG) ? 1 : 2, (int)s_cam_w, (int)s_cam_h);
+    if (have) {
+        snprintf(l2, sizeof(l2), "MPS %u EC %u EP %u", mps, ec, epnum);
+    } else {
+        snprintf(l2, sizeof(l2), "MPS -");
+    }
+    snprintf(l3, sizeof(l3), "OK %u TR %u PDIS %u",
+             (unsigned)s_mj_ok, (unsigned)s_mj_truncated, (unsigned)s_port_disables);
+
+    const int sc = 2;
+    const int lh = (FONT_H + 2) * sc;
+    const int w  = 23 * (FONT_W + 1) * sc;
+    fill_rect_to(buf, bw, bh, 0, 0, w < bw ? w : bw, lh * 3 + 4, 0x0000);
+    draw_text_to(buf, bw, bh, 2, 2,          sc, 0xFFFF, l1);
+    draw_text_to(buf, bw, bh, 2, 2 + lh,     sc, 0x07FF, l2);
+    draw_text_to(buf, bw, bh, 2, 2 + lh * 2, sc, 0xFFE0, l3);
+}
+#endif /* P2_USB_OSD */
+
 /* ---------------- UVC callbacks ---------------- */
 
 typedef struct {
@@ -1845,6 +2085,28 @@ static void stream_event_callback(const uvc_host_stream_event_data_t *event, voi
         ESP_LOGW(TAG, "Transfer error, err_no=%d", event->transfer_error.error);
         break;
     case UVC_HOST_DEVICE_DISCONNECTED:
+#if P2_PORT_TRACE
+        /* Before anything else: this callback runs on the UVC driver task, so the port may
+         * still hold the state that caused the event. */
+        {
+            usb_dwc_hprt_reg_t h = { .val = USB_DWC_HS.hprt_reg.val };
+            ESP_LOGE(TAG, "DISCONNECT: hprt=%08x connsts=%u ena=%u lnsts=%u <- connsts=1 means "
+                          "the device never left",
+                     (unsigned)h.val, (unsigned)h.prtconnsts,
+                     (unsigned)h.prtena, (unsigned)h.prtlnsts);
+            s_trace_run = false;
+            if (h.prtconnsts) {
+                s_port_disables++;   /* port error, not an unplug */
+            }
+            {
+                unsigned mps = 0, ec = 0, epnum = 0;
+                if (usb_isoc_chan_info(&mps, &ec, &epnum)) {
+                    ESP_LOGE(TAG, "at failure, isoc chan: MPS=%u EC=%u EP=%u", mps, ec, epnum);
+                }
+            }
+            port_trace_dump("disconnect");
+        }
+#endif
         ESP_LOGW(TAG, "P2 Pro disconnected");
         s_camera_connected = false;
         s_ffc_active = false; /* the sensor's pattern won't be the same after it re-powers */
@@ -2053,28 +2315,92 @@ static void render_task(void *arg)
          * scaling to the letterboxed box, the second does the byte swap the ST7796 needs (its
          * byte_swap flag affects how PPA READS, so it cannot be folded into the first pass). */
         if (s_cam_kind == CAM_GENERIC) {
-            const size_t need_px = (size_t)s_cam_w * s_cam_h * 2;
-            if (qf.frame->data_len < need_px) {
-                static bool warned_short = false;
-                if (!warned_short) {
-                    ESP_LOGW(TAG, "generic frame is %d bytes, expected %d - skipping",
-                             (int)qf.frame->data_len, (int)need_px);
-                    warned_short = true;
+            /* What PPA will read, and in which colour space. YUY2 arrives ready to scale;
+             * MJPEG has to go through the hardware decoder first. */
+            void *ppa_src = qf.frame->data;
+            ppa_srm_color_mode_t ppa_src_cm = PPA_SRM_COLOR_MODE_YUV422_YUYV;
+
+            if (s_cam_fmt == UVC_VS_FORMAT_MJPEG) {
+                /* A frame that lost packets mid-stream still gets delivered (the component only
+                 * validates the SOI, and we have the payload error check disabled), so it turns
+                 * up here as a JPEG with no EOI. Counting those separately from decoder errors
+                 * is what tells us the link's real per-frame completion rate. */
+                const uint8_t *jd = qf.frame->data;
+                const size_t   jl = qf.frame->data_len;
+                const bool complete = (jl >= 4 && jd[jl - 2] == 0xFF && jd[jl - 1] == 0xD9);
+
+                if (!complete || !jpeg_decoder_ensure(s_cam_w, s_cam_h) || jl > s_jpeg_in_cap) {
+                    if (!complete) {
+                        s_mj_truncated++;
+                    } else {
+                        s_mj_decode_err++;
+                    }
+                    xSemaphoreGive(s_trans_done_sem);
+                    if (s_stream) {
+                        uvc_host_frame_return(s_stream, qf.frame);
+                    }
+                    continue;
                 }
-                xSemaphoreGive(s_trans_done_sem);
-                if (s_stream) {
-                    uvc_host_frame_return(s_stream, qf.frame);
+
+                /* Copy into the decoder's own buffer rather than handing it the UVC frame: the
+                 * JPEG peripheral has its own alignment requirements and the UVC driver's
+                 * PSRAM frame buffers carry no such guarantee. ~23 KB, so it does not show up
+                 * against a 40 ms frame budget. */
+                memcpy(s_jpeg_in, jd, jl);
+
+                /* BGR, not RGB: the decoder's "RGB" order writes the components in the
+                 * opposite byte order to the RGB565 that PPA produces from YUY2, and the
+                 * downstream byte-swap pass is tuned for PPA's convention. With RGB here the
+                 * picture arrives with red and blue traded. */
+                const jpeg_decode_cfg_t dcfg = {
+                    .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+                    .rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
+                    .conv_std      = JPEG_YUV_RGB_CONV_STD_BT601,
+                };
+                uint32_t out_len = 0;
+                esp_err_t je = jpeg_decoder_process(s_jpeg_dec, &dcfg, s_jpeg_in, jl,
+                                                    s_jpeg_out, s_jpeg_out_cap, &out_len);
+                if (je != ESP_OK) {
+                    s_mj_decode_err++;
+                    static bool warned_dec = false;
+                    if (!warned_dec) {
+                        ESP_LOGW(TAG, "jpeg: decode failed: %s (%u B in)",
+                                 esp_err_to_name(je), (unsigned)jl);
+                        warned_dec = true;
+                    }
+                    xSemaphoreGive(s_trans_done_sem);
+                    if (s_stream) {
+                        uvc_host_frame_return(s_stream, qf.frame);
+                    }
+                    continue;
                 }
-                continue;
+                s_mj_ok++;
+                ppa_src    = s_jpeg_out;
+                ppa_src_cm = PPA_SRM_COLOR_MODE_RGB565;
+            } else {
+                const size_t need_px = (size_t)s_cam_w * s_cam_h * 2;
+                if (qf.frame->data_len < need_px) {
+                    static bool warned_short = false;
+                    if (!warned_short) {
+                        ESP_LOGW(TAG, "generic frame is %d bytes, expected %d - skipping",
+                                 (int)qf.frame->data_len, (int)need_px);
+                        warned_short = true;
+                    }
+                    xSemaphoreGive(s_trans_done_sem);
+                    if (s_stream) {
+                        uvc_host_frame_return(s_stream, qf.frame);
+                    }
+                    continue;
+                }
             }
 
             const ppa_srm_oper_config_t yuv_cfg = {
                 .in = {
-                    .buffer = qf.frame->data,
+                    .buffer = ppa_src,
                     .pic_w = s_cam_w, .pic_h = s_cam_h,
                     .block_w = s_cam_w, .block_h = s_cam_h,
                     .block_offset_x = 0, .block_offset_y = 0,
-                    .srm_cm = PPA_SRM_COLOR_MODE_YUV422_YUYV,
+                    .srm_cm = ppa_src_cm,
                     .yuv_range = PPA_COLOR_RANGE_LIMIT,   /* UVC YUY2 is studio-range */
                     .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
                 },
@@ -2104,6 +2430,9 @@ static void render_task(void *arg)
                 }
             }
 
+#if P2_USB_OSD
+            usb_osd_draw(s_rgb_buf, s_gen_w, s_gen_h);
+#endif
             const ppa_srm_oper_config_t gswap = {
                 .in = {
                     .buffer = s_rgb_buf,
@@ -2139,9 +2468,23 @@ static void render_task(void *arg)
                 int n_e2e = s_frames_rendered, n_conv = frames_converted;
                 if (n_e2e > 0 && n_conv > 0) {
                     ESP_LOGI(TAG, "generic displayed=%d avg_convert=%" PRId64
-                                  "us avg_e2e=%" PRId64 "us (%ux%u -> %dx%d)",
+                                  "us avg_e2e=%" PRId64 "us (%ux%u %s -> %dx%d)",
                              n_e2e, convert_time_sum_us / n_conv, s_e2e_time_sum_us / n_e2e,
-                             s_cam_w, s_cam_h, s_gen_w, s_gen_h);
+                             s_cam_w, s_cam_h,
+                             (s_cam_fmt == UVC_VS_FORMAT_MJPEG) ? "MJPEG" : "YUY2",
+                             s_gen_w, s_gen_h);
+                }
+                /* Printed even when nothing was displayed: "delivered but all truncated" is
+                 * the single most informative state this link can be in, and a silent log
+                 * would look identical to no frames arriving at all. */
+                if (s_cam_fmt == UVC_VS_FORMAT_MJPEG) {
+                    const uint32_t tot = s_mj_ok + s_mj_truncated + s_mj_decode_err;
+                    if (tot) {
+                        ESP_LOGI(TAG, "mjpeg ok=%u truncated=%u decode_err=%u (%u%% complete)",
+                                 (unsigned)s_mj_ok, (unsigned)s_mj_truncated,
+                                 (unsigned)s_mj_decode_err, (unsigned)(s_mj_ok * 100 / tot));
+                    }
+                    s_mj_ok = s_mj_truncated = s_mj_decode_err = 0;
                 }
                 s_frames_rendered = 0;
                 s_e2e_time_sum_us = 0;
@@ -2514,7 +2857,7 @@ static void streaming_task(void *arg)
             .h_res = s_cam_w,     /* set by uvc_event_cb from what the camera advertises */
             .v_res = s_cam_h,
             .fps = STREAM_FPS,
-            .format = UVC_VS_FORMAT_YUY2,
+            .format = UVC_VS_FORMAT_YUY2,   /* re-read per iteration from s_cam_fmt */
         },
         .advanced = {
             .number_of_frame_buffers = 3,
@@ -2530,6 +2873,7 @@ static void streaming_task(void *arg)
          * format we should ask for, and a stale value here would request 256x384 from a webcam. */
         stream_config.vs_format.h_res = s_cam_w;
         stream_config.vs_format.v_res = s_cam_h;
+        stream_config.vs_format.format = s_cam_fmt;
 
 #if P2_NO_OPEN_GENERIC
         /* Experiment: for a generic camera, do NOT open a stream - just let the device sit
@@ -2545,8 +2889,20 @@ static void streaming_task(void *arg)
             continue;
         }
 #endif
+#if P2_TX2RX_SWEEP
+        /* One value per stream attempt. Written live rather than only at init: the PHY picks it
+         * up for subsequent traffic, which is what lets a single session cover the whole range
+         * instead of costing eight replugs. */
+        static const uint8_t tx2rx_vals[] = { 4, 5, 6, 7, 3, 2, 1, 0 };
+        static int tx2rx_i = 0;
+        USB_UTMI.fc_06.hs_tx2rx_dly_cnt_sel = tx2rx_vals[tx2rx_i];
+        ESP_LOGW(TAG, "sweep: hs_tx2rx_dly_cnt_sel = %u (fc06=0x%08x)",
+                 (unsigned)tx2rx_vals[tx2rx_i], (unsigned)USB_UTMI.fc_06.val);
+        s_mj_ok = s_mj_truncated = s_mj_decode_err = 0;
+#endif
         BOOT_MARK("uvc: calling stream_open");
-        ESP_LOGI(TAG, "Opening %ux%u YUY2 @%.1ffps (%s)...", s_cam_w, s_cam_h, STREAM_FPS,
+        ESP_LOGI(TAG, "Opening %ux%u %s @%.1ffps (%s)...", s_cam_w, s_cam_h,
+                 (s_cam_fmt == UVC_VS_FORMAT_MJPEG) ? "MJPEG" : "YUY2", STREAM_FPS,
                  (s_cam_kind == CAM_THERMAL) ? "thermal" : "generic");
         esp_err_t err = uvc_host_stream_open(&stream_config, pdMS_TO_TICKS(5000), &s_stream);
         if (err != ESP_OK) {
@@ -2595,6 +2951,26 @@ static void streaming_task(void *arg)
          * Getting that wrong silently restored the stock 5s+4s on every replug. */
         s_shutter_cfg_done = false;
         ESP_LOGI(TAG, "Stream opened, starting continuous render");
+#if P2_PORT_TRACE
+        s_trace_head = 0;
+        s_trace_run = true;
+        /* The comparison that matters. Measured on the WORKING plain-USB-2.0-hub path:
+         * MPS 1020, EC 3, EP 1, ~25-30 fps, TR 0, PDIS 0. So the host copes with
+         * high-bandwidth isoc (3 transactions per microframe) just fine, and if the failing
+         * path shows the same three numbers then nothing about the host configuration differs
+         * and the cause is not in software at all. */
+        {
+            unsigned mps = 0, ec = 0, epnum = 0;
+            /* Give the stack a moment to program the channel before reading it back. */
+            vTaskDelay(pdMS_TO_TICKS(5));
+            if (usb_isoc_chan_info(&mps, &ec, &epnum)) {
+                ESP_LOGW(TAG, "isoc chan: MPS=%u EC=%u EP=%u  (hub case measured 1020/3/1)",
+                         mps, ec, epnum);
+            } else {
+                ESP_LOGW(TAG, "isoc chan: none found");
+            }
+        }
+#endif
         /* P2-only. These are InfiRay vendor control requests; firing them at an ordinary webcam
          * makes it STALL EP0 on every one, and the channel-availability probe retries for 15s at
          * 25ms intervals - a control-transfer storm that drowns the stream it is supposed to
@@ -2619,6 +2995,13 @@ static void streaming_task(void *arg)
             s_stream = NULL;
         }
         s_stream_restart_req = false;
+#if P2_TX2RX_SWEEP
+        /* Scored on the way out, while the counters still describe THIS value. */
+        ESP_LOGW(TAG, "sweep: tx2rx=%u ended -> ok=%u truncated=%u decode_err=%u",
+                 (unsigned)tx2rx_vals[tx2rx_i], (unsigned)s_mj_ok,
+                 (unsigned)s_mj_truncated, (unsigned)s_mj_decode_err);
+        tx2rx_i = (tx2rx_i + 1) % (int)(sizeof(tx2rx_vals) / sizeof(tx2rx_vals[0]));
+#endif
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -2658,15 +3041,28 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                 s_cam_kind = CAM_THERMAL;
                 s_cam_w = RAW_H_RES;
                 s_cam_h = RAW_V_RES * 2;
+                s_cam_fmt = UVC_VS_FORMAT_YUY2;   /* the raw half must not be compressed */
                 ESP_LOGI(TAG, "camera: P2 Pro thermal (%ux%u)", s_cam_w, s_cam_h);
             } else {
                 /* Pick the YUY2 mode closest to the panel without exceeding it. The panel is
                  * only 480x320, so a larger capture buys no visible detail and costs isochronous
                  * bandwidth - this camera's largest endpoint sustains ~8 MB/s, which is already
                  * below what 640x480 YUY2 needs at 25fps. */
+                /* Prefer MJPEG when the camera offers it: ~7x fewer isochronous packets per
+                 * frame, which on a marginal link is the only lever that matters (see
+                 * P2_GENERIC_PREFER_MJPEG). YUY2 is the fallback. */
+                enum uvc_host_stream_format want_fmt = UVC_VS_FORMAT_YUY2;
+#if P2_GENERIC_PREFER_MJPEG
+                for (size_t i = 0; i < actual; i++) {
+                    if (list[i].format == UVC_VS_FORMAT_MJPEG) {
+                        want_fmt = UVC_VS_FORMAT_MJPEG;
+                        break;
+                    }
+                }
+#endif
                 uint16_t bw = 0, bh = 0;
                 for (size_t i = 0; i < actual; i++) {
-                    if (list[i].format != UVC_VS_FORMAT_YUY2) {
+                    if (list[i].format != want_fmt) {
                         continue;
                     }
                     const uint32_t px = (uint32_t)list[i].h_res * list[i].v_res;
@@ -2683,13 +3079,16 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                     s_cam_kind = CAM_GENERIC;
                     s_cam_w = bw;
                     s_cam_h = bh;
+                    s_cam_fmt = want_fmt;
                     fit_preserving_aspect(bw, bh, s_disp_w, s_disp_h, &s_gen_w, &s_gen_h);
                     s_gen_x = (s_disp_w - s_gen_w) / 2;
                     s_gen_y = (s_disp_h - s_gen_h) / 2;
-                    ESP_LOGI(TAG, "camera: generic YUY2 %ux%u -> %dx%d at (%d,%d)",
+                    ESP_LOGI(TAG, "camera: generic %s %ux%u -> %dx%d at (%d,%d)",
+                             (want_fmt == UVC_VS_FORMAT_MJPEG) ? "MJPEG" : "YUY2",
                              bw, bh, s_gen_w, s_gen_h, s_gen_x, s_gen_y);
                 } else {
-                    ESP_LOGW(TAG, "camera: no usable YUY2 format advertised");
+                    ESP_LOGW(TAG, "camera: no usable %s format advertised",
+                             (want_fmt == UVC_VS_FORMAT_MJPEG) ? "MJPEG" : "YUY2");
                 }
             }
         }
@@ -2795,6 +3194,10 @@ void app_main(void)
              (unsigned)USB_UTMI.fc_00.val, (unsigned)USB_UTMI.fc_01.val,
              (unsigned)USB_UTMI.fc_02.val);
 #endif
+#if P2_TX2RX_SWEEP
+    ESP_LOGW(TAG, "UTMI fc06=0x%08x (hs_tx2rx_dly_cnt_sel=%u)",
+             (unsigned)USB_UTMI.fc_06.val, (unsigned)USB_UTMI.fc_06.hs_tx2rx_dly_cnt_sel);
+#endif
 #if P2_MANUAL_PORT_POWER
     {
         esp_err_t pwr = usb_host_lib_set_root_port_power(true);
@@ -2802,6 +3205,10 @@ void app_main(void)
     }
 #endif
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
+#if P2_PORT_TRACE
+    /* Core 1, below the USB stack: sampling must not delay the transfers it is observing. */
+    xTaskCreatePinnedToCore(port_trace_task, "porttrace", 3072, NULL, 2, NULL, 1);
+#endif
 #if P2_PORT_POWER_RECOVERY
     xTaskCreate(usb_port_recovery_task, "usbrecov", 3072, NULL, 3, NULL);
 #endif

@@ -545,7 +545,90 @@ gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 
 microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
 within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
 
-### Why no host-side configuration can fix it: isoc has no retries
+### Generic cameras use MJPEG with hardware JPEG decode
+
+A generic (non-thermal) camera is now asked for **MJPEG** when it advertises it, and the frames go
+through the ESP32-P4's hardware JPEG decoder (`esp_driver_jpeg`, `SOC_JPEG_DECODE_SUPPORTED`) and
+then the existing PPA scale and byte-swap passes. YUY2 is the fallback. The thermal path is pinned
+to YUY2 - the raw radiometric half must never be compressed.
+
+Measured on the borescope at 320x240, 15-20 frames per mode:
+
+| format | bytes/frame |
+|---|---|
+| MJPEG 320x240 | **22,824** (19,184 - 24,468) |
+| MJPEG 640x480 | 77,600 |
+| YUY2 320x240 | 153,600 |
+| YUY2 640x480 | 614,400 |
+
+~6.7x less bus traffic for the same picture, decoded in hardware rather than on the CPU. Set
+`P2_GENERIC_PREFER_MJPEG 0` to go back to YUY2.
+
+Two traps worth recording. The decoder must be configured
+`JPEG_DEC_RGB_ELEMENT_ORDER_BGR`: its "RGB" order writes components in the opposite byte order to
+the RGB565 PPA produces from YUY2, and with `..._RGB` the picture arrives with red and blue
+traded. And a frame that lost packets mid-stream is still delivered (the component only validates
+the SOI, and we have the payload error check disabled), so it turns up as a JPEG with **no EOI** -
+checking for the `FF D9` terminator separates link losses (`truncated`) from real decoder failures
+(`decode_err`), which is what made the diagnosis above possible.
+
+### SETTLED: the host configuration is identical; the difference is physical
+
+Measured with the controller's own channel registers read back live (`P2_USB_OSD` draws them on
+the panel, `P2_PORT_TRACE` logs them over serial), because the two USB sockets on this board are
+too close together to have the serial adapter and the camera's USB-A adapter attached at once:
+
+| path | HCCHAR.MPS | HCCHAR.EC (MULTCNT) | EP | result |
+|---|---|---|---|---|
+| plain USB 2.0 hub | 1020 | 3 | 1 | **25-30 fps, 0 truncated, 0 port disables** |
+| Anker dock / direct | 1020 | 3 | 1 | 0 frames |
+
+5/5 at stream start and 5/5 at the moment of failure. **The host programs the controller
+byte-for-byte identically in both cases** - same endpoint, same packet size, same
+transactions-per-microframe - so there is no host-side difference left to find. The only
+remaining variable is the physical path.
+
+And the failure is **not** a disconnect. The root port disables itself:
+
+```
+DISCONNECT: hprt=00001001 connsts=1 ena=0 lnsts=0
+gintsts: disconn=0 throughout
+```
+
+`prtconnsts` stays 1 (device still electrically present) while `prtena` goes 0, and `DISCONNINT`
+never fires at all. Per IDF's own HAL documentation that combination is a **port error** - the
+babble class (USB 2.0 spec 11.8.1). Containing babble on a downstream port, and not propagating
+it upstream, is a *mandatory* hub function; that is what the hub is doing for us.
+
+The Anker dock reproduces the direct-connection failure exactly (same negotiation, same port
+disable, 0 frames) - it is not a workaround and not a useful control. The **plain USB 2.0 hub** is
+the thing that works.
+
+### Hypotheses killed by measurement
+
+Every one of these was proposed, built, measured and discarded. Recorded so none is tried again:
+
+| hypothesis | how it died |
+|---|---|
+| packets per frame (lossy link) | 8/8 turn-around values, 162 attempts: `ok=0 truncated=0 decode_err=0`. Zero *truncated* means no partial data ever arrives - the frame callback never fires once, so nothing is being "lost" |
+| burst size / high-bandwidth isoc | forcing single-transaction 944 MPS failed identically to 3060 |
+| HS bus turn-around time | swept `fc_06.hs_tx2rx_dly_cnt_sel` 0-7 in firmware (one value per stream attempt); all zero |
+| squelch threshold `adj_vref_sq` | reduced the *symptom* count but the cause is a port error, not a disconnect; reverted to the 0x8 hardware default, and it was never safe anyway (untested against the P2) |
+| payload / endpoint mismatch | clamped the committed `dwMaxPayloadTransferSize` to 944; the camera **re-raised it to 3060 on 64 of 64 attempts** |
+| ESP-IDF cannot do high-bandwidth isoc (`MULTCNT` never written) | the working hub path reads **EC=3**, correctly programmed. (The grep that suggested otherwise searched the databook name `multcnt`; this struct calls the field `ec`.) |
+
+### For a portable build: a hub IC inside the enclosure
+
+Measured, not inferred: through a plain USB 2.0 hub this camera runs 25-30 fps with zero truncated
+frames and zero port disables. So put the hub inside. One USB 2.0 hub IC (FE1.1s class, a few mm
+square, cents) between the OTG connector and the camera socket gives the babble containment
+permanently, with nothing to carry and **no firmware change at all**.
+
+The alternative is a borescope with a shorter or better-shielded cable; this one's ~1 m of thin
+non-detachable cable is the root cause.
+
+### Historical note: the isoc-no-retries reasoning
+
 
 With squelch `0xA` the link-level problem is solved - enumeration, format negotiation and
 `stream_open` all succeed. Frames still never complete, and two separate attempts to reduce the

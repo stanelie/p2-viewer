@@ -621,6 +621,13 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * something is being investigated. BOOT_MARK stays on; it is ~12 lines and worth it. */
 #define P2_DIAG 0
 
+/* Experiment, answered: installing the host on the P4's full-speed OTG controller
+ * (peripheral_map = BIT1) succeeds - no error from usb_host_install - but sees NO DEVICE at all,
+ * not even a root port reset. The FS controller's pins are not routed to this board's OTG
+ * connector, so full speed is not available as a way to dodge high-speed disconnect detection.
+ * Kept as a record; do not retry on this board. */
+#define P2_FORCE_FULL_SPEED 0
+
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
  * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
  * driver cannot claim the device. Off by default; it costs a task and a client slot. */
@@ -2643,10 +2650,22 @@ void app_main(void)
 #endif
     BOOT_MARK("usb: installing host");
     ESP_LOGI(TAG, "Installing USB Host (native HS OTG port)");
+    /* The P4 has two OTG controllers - USB_DWC_LL_GET_HW(num) gives USB_DWC_FS for num==1 and
+     * USB_DWC_HS otherwise - so peripheral_map = BIT1 puts the host on the FULL-SPEED controller.
+     * At 12 Mbit/s the signalling is far more tolerant and high-speed disconnect detection (which
+     * is what drops the borescope) does not apply. The cost is bandwidth: ~1.1 MB/s realistic,
+     * so 320x240 YUY2 manages ~7 fps rather than 25. Whether the FS controller's pins even reach
+     * this board's OTG connector is a schematic question - if they do not, nothing enumerates. */
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LOWMED,
+#if P2_FORCE_FULL_SPEED
+        .peripheral_map = BIT1,
+#endif
     };
+#if P2_FORCE_FULL_SPEED
+    ESP_LOGW(TAG, "USB: forcing the FULL-SPEED controller (peripheral_map=BIT1)");
+#endif
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);

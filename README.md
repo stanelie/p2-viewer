@@ -434,9 +434,29 @@ Either way this cannot say whether a hub would fix the signalling - a **plain bu
 hub**, which needs no CC negotiation and no PD, is the cheaper way to get a signal repeater into
 the path.
 
-A plain **bus-powered USB 2.0 hub** (not a USB-C PD dock), taking power from the boosted VBUS pin,
-would be the remaining way to put a signal repeater in the path. Otherwise this needs a scope on
-D+/D-, not more software.
+### The workaround: a plain USB 2.0 hub
+
+**Confirmed working.** A plain bus-powered USB 2.0 hub between the board and the borescope gives a
+clean, stable image at the full 25 fps. A hub terminates and re-drives the camera's link on its own
+downstream port, so the marginal cable stops being the ESP's problem - exactly what false
+high-speed disconnect detection predicts. This is the recommended fix: no firmware change, no
+framerate cost.
+
+**Full speed is NOT available as an alternative on this board.** Speed is settled by the chirp
+handshake during bus reset so it cannot be forced from the host for a given port, but the P4 has
+two OTG controllers - `USB_DWC_LL_GET_HW(num)` gives `USB_DWC_FS` for `num == 1` - so
+`usb_host_config_t.peripheral_map = BIT1` installs the host on the full-speed one, where 12 Mbit/s
+signalling would sidestep HS disconnect detection entirely.
+
+Tested (`P2_FORCE_FULL_SPEED`): `usb_host_install()` succeeds with no error, and then **nothing
+enumerates at all** - not one root port reset in 28 s. The FS controller's pins are not routed to
+this board's OTG connector. Do not retry on this hardware.
+
+It would have cost framerate anyway: full speed gives ~1.1 MB/s realistically, so 320x240 YUY2
+manages ~7 fps against 25 through the hub. Recovering 25 fps at full speed would mean MJPEG plus
+the P4's hardware JPEG decoder.
+
+Anything further needs a scope on D+/D-, not more software.
 
 ## Flash layout (16MB)
 

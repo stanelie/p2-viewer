@@ -52,6 +52,26 @@ esp_err_t uvc_host_usb_ctrl(uvc_host_stream_hdl_t stream_hdl, uint8_t bmRequestT
 #define RAW_V_RES             192
 #define STREAM_FPS            25.0f
 
+/* ---- camera kind ----------------------------------------------------------------------------
+ * The P2 Pro's signature is that it advertises 256x384 YUY2 - preview stacked on top of raw
+ * radiometric, which no ordinary webcam offers. Anything else gets a plain preview instead of
+ * having its frames parsed as though the bottom half were temperatures.
+ *
+ * Detecting on capability rather than VID:PID means any other UVC camera works too, and a P2
+ * that has somehow been left in image-only mode falls back to a picture rather than garbage. */
+typedef enum {
+    CAM_NONE = 0,
+    CAM_THERMAL,     /* 256x384: full thermal interface */
+    CAM_GENERIC,     /* any other YUY2 camera: just show the image */
+} cam_kind_t;
+
+static volatile cam_kind_t s_cam_kind = CAM_NONE;
+static volatile uint16_t s_cam_w = STREAM_H_RES;   /* format actually requested */
+static volatile uint16_t s_cam_h = STREAM_V_RES;
+
+/* Generic-preview output geometry, computed once per connect. */
+static int s_gen_w, s_gen_h, s_gen_x, s_gen_y;
+
 /* --- Display (ST7796 over SPI, pins from the Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5 BSP) --- */
 #define LCD_H_RES            320
 #define LCD_V_RES            480
@@ -1344,6 +1364,25 @@ static esp_err_t display_apply_orientation(const display_orientation_t *o)
  * whatever stale PSRAM was there - which showed up on hardware as a few rows of garbage along the
  * bottom edge of the image (292/192 quantizes down to 1.5, writing only 288 of 292 rows). So ask
  * for a target size and return what PPA will actually produce, mirroring the driver's arithmetic. */
+/* Largest PPA-exact box that fits the display while preserving the source aspect ratio. Both
+ * axes must share ONE 1/16 scale factor, otherwise the picture is subtly stretched - PPA
+ * quantizes each axis independently and picking each one's "best fit" does not give equal
+ * factors. Tries height-limited first, falls back to width-limited for a wide source. */
+static void fit_preserving_aspect(int in_w, int in_h, int max_w, int max_h,
+                                  int *out_w, int *out_h)
+{
+    int s16 = (int)(((float)max_h / in_h) * 16.0f);
+    int w = (s16 / 16) * in_w + ((s16 % 16) * in_w) / 16;
+    int h = (s16 / 16) * in_h + ((s16 % 16) * in_h) / 16;
+    if (w > max_w) {                       /* source is wider than the panel - limit on width */
+        s16 = (int)(((float)max_w / in_w) * 16.0f);
+        w = (s16 / 16) * in_w + ((s16 % 16) * in_w) / 16;
+        h = (s16 / 16) * in_h + ((s16 % 16) * in_h) / 16;
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
 static int ppa_quantized_out(int in_dim, int desired_out)
 {
     int sixteenths = (int)(((float)desired_out / in_dim) * 16.0f); /* floor, as the driver casts */
@@ -1764,6 +1803,7 @@ static void render_task(void *arg)
     int no_frame_ticks = 0;
     uint16_t last_min_v = 0, last_max_v = 0;
 
+    cam_kind_t last_kind = CAM_NONE;
     queued_frame_t qf;
     while (true) {
         /* Timeout rather than block forever: with no camera there are no frames, and this is
@@ -1801,7 +1841,129 @@ static void render_task(void *arg)
          * draw_bitmap() is async, so without this we could rewrite the buffer mid-transfer. */
         xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
 
+        /* Swapping between a thermal camera and a webcam changes the whole layout, so wipe the
+         * panel once rather than leaving the old picture, side bar or letterbox margins behind.
+         * Done as ONE full-screen draw: the completion callback gives a binary semaphore and
+         * counts a frame, so a burst of strip draws would unbalance it and skew the e2e stats.
+         * Skipping this frame lets the next iteration re-take the semaphore normally. */
+        if (s_cam_kind != last_kind) {
+            ESP_LOGI(TAG, "camera kind %d -> %d, clearing panel", (int)last_kind, (int)s_cam_kind);
+            last_kind = s_cam_kind;
+            memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
+            s_pending_arrival_us = esp_timer_get_time();
+            esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+            s_osd_dirty = true;            /* thermal mode has to repaint its side bar */
+            if (s_stream) {
+                uvc_host_frame_return(s_stream, qf.frame);
+            }
+            continue;
+        }
+
         int64_t convert_start_us = esp_timer_get_time();
+
+        /* ---- generic camera: just show the picture ----------------------------------------
+         * Two PPA passes and no per-pixel CPU work: the first converts YUY2 to RGB565 while
+         * scaling to the letterboxed box, the second does the byte swap the ST7796 needs (its
+         * byte_swap flag affects how PPA READS, so it cannot be folded into the first pass). */
+        if (s_cam_kind == CAM_GENERIC) {
+            const size_t need_px = (size_t)s_cam_w * s_cam_h * 2;
+            if (qf.frame->data_len < need_px) {
+                static bool warned_short = false;
+                if (!warned_short) {
+                    ESP_LOGW(TAG, "generic frame is %d bytes, expected %d - skipping",
+                             (int)qf.frame->data_len, (int)need_px);
+                    warned_short = true;
+                }
+                xSemaphoreGive(s_trans_done_sem);
+                if (s_stream) {
+                    uvc_host_frame_return(s_stream, qf.frame);
+                }
+                continue;
+            }
+
+            const ppa_srm_oper_config_t yuv_cfg = {
+                .in = {
+                    .buffer = qf.frame->data,
+                    .pic_w = s_cam_w, .pic_h = s_cam_h,
+                    .block_w = s_cam_w, .block_h = s_cam_h,
+                    .block_offset_x = 0, .block_offset_y = 0,
+                    .srm_cm = PPA_SRM_COLOR_MODE_YUV422_YUYV,
+                    .yuv_range = PPA_COLOR_RANGE_LIMIT,   /* UVC YUY2 is studio-range */
+                    .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
+                },
+                .out = {
+                    .buffer = s_rgb_buf,
+                    .buffer_size = (size_t)s_gen_w * s_gen_h * sizeof(uint16_t),
+                    .pic_w = s_gen_w, .pic_h = s_gen_h,
+                    .block_offset_x = 0, .block_offset_y = 0,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+                .scale_x = (float)s_gen_w / s_cam_w,
+                .scale_y = (float)s_gen_h / s_cam_h,
+                .mirror_x = false,
+                .mirror_y = false,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            esp_err_t ge = ppa_do_scale_rotate_mirror(s_ppa_client, &yuv_cfg);
+            if (ge != ESP_OK) {
+                static bool warned_ppa = false;
+                if (!warned_ppa) {
+                    /* Most likely cause is alignment: PPA wants its buffers on a cache line and
+                     * the UVC driver's frame buffers carry no such guarantee. */
+                    ESP_LOGE(TAG, "generic: PPA YUV pass failed: %s (frame data %p)",
+                             esp_err_to_name(ge), qf.frame->data);
+                    warned_ppa = true;
+                }
+            }
+
+            const ppa_srm_oper_config_t gswap = {
+                .in = {
+                    .buffer = s_rgb_buf,
+                    .pic_w = s_gen_w, .pic_h = s_gen_h,
+                    .block_w = s_gen_w, .block_h = s_gen_h,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .out = {
+                    .buffer = s_rgb_tx,
+                    .buffer_size = (size_t)s_gen_w * s_gen_h * sizeof(uint16_t),
+                    .pic_w = s_gen_w, .pic_h = s_gen_h,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+                .scale_x = 1.0f, .scale_y = 1.0f,
+                .byte_swap = true,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            ppa_do_scale_rotate_mirror(s_ppa_client, &gswap);
+
+            convert_time_sum_us += (esp_timer_get_time() - convert_start_us);
+            frames_converted++;
+            if (s_stream) {
+                uvc_host_frame_return(s_stream, qf.frame);
+            }
+
+            s_pending_arrival_us = qf.arrival_us;
+            esp_lcd_panel_draw_bitmap(s_panel, s_gen_x, s_gen_y,
+                                       s_gen_x + s_gen_w, s_gen_y + s_gen_h, s_rgb_tx);
+
+            int64_t gnow = esp_timer_get_time();
+            if (gnow - s_last_report_us >= 2000000) {
+                int n_e2e = s_frames_rendered, n_conv = frames_converted;
+                if (n_e2e > 0 && n_conv > 0) {
+                    ESP_LOGI(TAG, "generic displayed=%d avg_convert=%" PRId64
+                                  "us avg_e2e=%" PRId64 "us (%ux%u -> %dx%d)",
+                             n_e2e, convert_time_sum_us / n_conv, s_e2e_time_sum_us / n_e2e,
+                             s_cam_w, s_cam_h, s_gen_w, s_gen_h);
+                }
+                s_frames_rendered = 0;
+                s_e2e_time_sum_us = 0;
+                frames_converted = 0;
+                convert_time_sum_us = 0;
+                s_last_report_us = gnow;
+            }
+            continue;
+        }
 
         /* The 256x384 format is preview on top + radiometric below. If the camera has been put
          * into image-only mode (256x192, 98304 bytes) the second half simply isn't there, and
@@ -2162,8 +2324,8 @@ static void streaming_task(void *arg)
             .uvc_stream_index = 0,
         },
         .vs_format = {
-            .h_res = STREAM_H_RES,
-            .v_res = STREAM_V_RES,
+            .h_res = s_cam_w,     /* set by uvc_event_cb from what the camera advertises */
+            .v_res = s_cam_h,
             .fps = STREAM_FPS,
             .format = UVC_VS_FORMAT_YUY2,
         },
@@ -2177,8 +2339,14 @@ static void streaming_task(void *arg)
     };
 
     while (true) {
+        /* Re-read per iteration: the struct is built once, but swapping cameras changes the
+         * format we should ask for, and a stale value here would request 256x384 from a webcam. */
+        stream_config.vs_format.h_res = s_cam_w;
+        stream_config.vs_format.v_res = s_cam_h;
+
         BOOT_MARK("uvc: calling stream_open");
-        ESP_LOGI(TAG, "Opening %dx%d YUY2 @%.1ffps...", STREAM_H_RES, STREAM_V_RES, STREAM_FPS);
+        ESP_LOGI(TAG, "Opening %ux%u YUY2 @%.1ffps (%s)...", s_cam_w, s_cam_h, STREAM_FPS,
+                 (s_cam_kind == CAM_THERMAL) ? "thermal" : "generic");
         esp_err_t err = uvc_host_stream_open(&stream_config, pdMS_TO_TICKS(5000), &s_stream);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "uvc_host_stream_open failed: %s - retrying", esp_err_to_name(err));
@@ -2269,6 +2437,54 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                 ESP_LOGI(TAG, "  advertised[%d]: fmt=%d %ux%u", (int)i, (int)list[i].format,
                          list[i].h_res, list[i].v_res);
             }
+
+            /* Thermal if the 256x384 stacked format is on offer, otherwise a plain preview. */
+            bool thermal = false;
+            for (size_t i = 0; i < actual; i++) {
+                if (list[i].format == UVC_VS_FORMAT_YUY2 &&
+                    list[i].h_res == RAW_H_RES && list[i].v_res == RAW_V_RES * 2) {
+                    thermal = true;
+                    break;
+                }
+            }
+            if (thermal) {
+                s_cam_kind = CAM_THERMAL;
+                s_cam_w = RAW_H_RES;
+                s_cam_h = RAW_V_RES * 2;
+                ESP_LOGI(TAG, "camera: P2 Pro thermal (%ux%u)", s_cam_w, s_cam_h);
+            } else {
+                /* Pick the YUY2 mode closest to the panel without exceeding it. The panel is
+                 * only 480x320, so a larger capture buys no visible detail and costs isochronous
+                 * bandwidth - this camera's largest endpoint sustains ~8 MB/s, which is already
+                 * below what 640x480 YUY2 needs at 25fps. */
+                uint16_t bw = 0, bh = 0;
+                for (size_t i = 0; i < actual; i++) {
+                    if (list[i].format != UVC_VS_FORMAT_YUY2) {
+                        continue;
+                    }
+                    const uint32_t px = (uint32_t)list[i].h_res * list[i].v_res;
+                    const bool fits = list[i].h_res <= s_disp_w && list[i].v_res <= s_disp_h;
+                    const bool better = fits ? (px > (uint32_t)bw * bh ||
+                                                (uint32_t)bw * bh > (uint32_t)s_disp_w * s_disp_h)
+                                             : (bw == 0);
+                    if (better) {
+                        bw = list[i].h_res;
+                        bh = list[i].v_res;
+                    }
+                }
+                if (bw && bh) {
+                    s_cam_kind = CAM_GENERIC;
+                    s_cam_w = bw;
+                    s_cam_h = bh;
+                    fit_preserving_aspect(bw, bh, s_disp_w, s_disp_h, &s_gen_w, &s_gen_h);
+                    s_gen_x = (s_disp_w - s_gen_w) / 2;
+                    s_gen_y = (s_disp_h - s_gen_h) / 2;
+                    ESP_LOGI(TAG, "camera: generic YUY2 %ux%u -> %dx%d at (%d,%d)",
+                             bw, bh, s_gen_w, s_gen_h, s_gen_x, s_gen_y);
+                } else {
+                    ESP_LOGW(TAG, "camera: no usable YUY2 format advertised");
+                }
+            }
         }
         free(list);
     }
@@ -2335,12 +2551,17 @@ void app_main(void)
     s_small_rgb = heap_caps_aligned_alloc(64, RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     assert(s_small_rgb);
 
-    s_rgb_buf = heap_caps_aligned_alloc(64, (size_t)s_img_w * s_fb_h * sizeof(uint16_t),
+    /* Sized for the LARGER of the thermal image and a full-screen generic preview: a webcam's
+     * picture is letterboxed to the panel, which can exceed the thermal image's 416x312. Only
+     * the used region is ever transferred, so the extra PSRAM costs nothing per frame. */
+    const size_t fb_px = ((size_t)s_img_w * s_fb_h > (size_t)s_disp_w * s_disp_h)
+                         ? (size_t)s_img_w * s_fb_h : (size_t)s_disp_w * s_disp_h;
+    s_rgb_buf = heap_caps_aligned_alloc(64, fb_px * sizeof(uint16_t),
                                          MALLOC_CAP_SPIRAM);
-    s_rgb_tx = heap_caps_aligned_alloc(64, (size_t)s_img_w * s_fb_h * sizeof(uint16_t),
+    s_rgb_tx = heap_caps_aligned_alloc(64, fb_px * sizeof(uint16_t),
                                         MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
     if (!s_rgb_tx) {
-        s_rgb_tx = heap_caps_aligned_alloc(64, (size_t)s_img_w * s_fb_h * sizeof(uint16_t), MALLOC_CAP_DMA);
+        s_rgb_tx = heap_caps_aligned_alloc(64, fb_px * sizeof(uint16_t), MALLOC_CAP_DMA);
     }
     assert(s_rgb_buf && s_rgb_tx);
 

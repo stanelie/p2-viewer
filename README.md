@@ -263,6 +263,72 @@ long-press bit set and it would shut straight back down.
 The PMIC shares the touch I2C bus (port 1, SDA 7, SCL 8). A scan of that bus finds `0x18`,
 `0x34` (AXP2101), `0x36` and `0x38` (FT5x06 touch).
 
+## Other USB cameras (generic preview mode)
+
+Any UVC camera that is not a P2 Pro gets a plain full-screen preview instead of the thermal
+interface. Detection is on **capability, not VID:PID**: the P2's signature is that it advertises
+**256x384** YUY2 - preview stacked on raw radiometric, which no ordinary webcam offers. Anything
+else is treated as a generic camera, which also means a P2 left in image-only mode degrades to a
+picture rather than a garbled thermal parse.
+
+The generic path costs almost no CPU: one PPA pass converts YUY2 to RGB565 *and* scales
+(`PPA_SRM_COLOR_MODE_YUV422_YUYV` is a supported input mode), and a second does the byte swap the
+ST7796 needs. The swap cannot be folded into the first pass because PPA's `byte_swap` affects how
+it *reads*.
+
+Resolution is chosen as the largest YUY2 mode that fits the panel. The panel is only 480x320, so a
+larger capture buys no visible detail and costs isochronous bandwidth. Both axes share one 1/16
+scale factor so the aspect ratio is exact - picking each axis's own best fit would stretch the
+picture, since PPA quantizes them independently.
+
+Worked example, the camera tested here (Sunplus `1bcf:2085`, an auricular scope):
+
+| | |
+|---|---|
+| advertises | MJPEG and YUY2, each at 640x480 / 640x360 / 320x240 / 1280x720 |
+| speed | high speed (480 Mbps), largest isoc endpoint MPS 1020 -> **~8.16 MB/s** |
+| chosen | **320x240 YUY2 @ 25 fps** = 3.84 MB/s |
+| rejected | 640x360 needs 11.5 MB/s, 640x480 needs 15.4 MB/s, 1280x720 needs 46 MB/s |
+| scaled to | 420x315 at (30,2), aspect 1.3333 = exactly 4:3 |
+
+Check the **negotiated speed** before doing this arithmetic. At full speed the packet rate is
+1000/s rather than 8000/s, giving ~1 MB/s, and no YUY2 mode would be viable at 25 fps - the design
+would have to go through MJPEG and the P4's hardware JPEG decoder instead.
+
+> **Status: detection verified, streaming NOT verified.** The scope tested here never enumerates
+> reliably on the board, so no frame has been rendered through this path. The PPA YUV->RGB colour
+> conversion and whether the UVC frame buffers satisfy PPA's cache-line alignment are both
+> untested; on an alignment failure it logs `PPA YUV pass failed` with the pointer, and the fix is
+> a copy into an aligned scratch buffer.
+
+### That camera does not enumerate on this board
+
+Measured, and it appears to be physical rather than a software problem:
+
+- It enumerates and streams fine on a Linux host.
+- The **P2 Pro works reliably on the same port with the same firmware**, so the port and host stack
+  are fine.
+- It is plugged **directly** into the OTG connector, no adapter.
+- Failures land at varying enumeration stages - `CHECK_SHORT_DEV_DESC`, `CHECK_SHORT_LANGID_TABLE`,
+  `CHECK_FULL_CONFIG_DESC` - with `Dev N EP 0 Error` and ~120 `HUB: Root port reset failed` per
+  minute, and the device address incrementing as it re-enumerates. A size or parsing fault would
+  fail at the *same* stage every time; `CHECK_SHORT_DEV_DESC` is an 8-byte control read.
+- `stream_open` then fails `ESP_ERR_INVALID_STATE`, which in `usbh_ep_alloc` means
+  `dev_obj->constant.config_desc` is NULL - i.e. it is racing a device instance that already died,
+  not a fault in the streaming code.
+- It is **not** power: `bMaxPower` requests 500 mA, but the camera runs cooler than the P2, its
+  illumination LED stays steady and it never visibly drops out.
+
+The likely cause is high-speed signal integrity: the channel is the OTG connector wiring plus the
+scope's ~1 m of thin cable, where the P2 plugs straight in with no cable at all. A powered USB 2.0
+hub between board and camera would regenerate the signal and is the next thing to try
+(`CONFIG_USB_HOST_HUBS_SUPPORTED` is already enabled).
+
+**Raising the USB enumeration timings made it worse, not better.** With
+`DEBOUNCE_DELAY_MS=500 / RESET_HOLD_MS=50 / RESET_RECOVERY_MS=200 / SET_ADDR_RECOVERY_MS=50` the
+root port reset failed outright and enumeration never started at all; at the defaults it at least
+enumerates intermittently. Do not retry that.
+
 ## Known limitations
 
 - **Screen tearing is not fixable on this board.** Confirmed from the schematic: there is no TE net

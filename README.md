@@ -601,9 +601,26 @@ babble class (USB 2.0 spec 11.8.1).
 
 Note what the hub is *not* doing: it is not absorbing these errors. Through the hub the counters
 read `TR 0 PDIS 0` over a sustained 25-30 fps stream, so **no babble occurs at all** on that path.
-The hub prevents the condition rather than containing it - it gives the camera a short, properly
-terminated link and presents the P4 with a clean signal driven from 2 cm away instead of through a
-metre of thin cable.
+
+**Cable length is not the difference, and earlier wording here claiming otherwise was wrong.** The
+camera's ~1 m cable is not detachable: its plug goes either into the hub or into the ESP32, so the
+cable is present in *both* topologies and is a constant.
+
+```
+direct:   camera -[fixed 1 m cable]- USB-A plug -[A->C adapter]- P4 PHY
+via hub:  camera -[fixed 1 m cable]- USB-A plug - hub PHY | hub PHY -[short]- P4 PHY
+```
+
+What changes is **which transceiver terminates the degraded segment**: the hub's PHY in one case,
+the P4's in the other. The hub's tolerates it; the P4's does not. The hub removes the P4's PHY from
+that segment entirely - it only ever drives the short upstream link.
+
+**One variable remains un-isolated: the USB-A -> USB-C adapter.** The direct path has a passive
+adapter in series right at the host end, an extra connector pair and impedance discontinuity. If
+the hub's upstream does not use that same adapter, the adapter is unique to the failing path and is
+untested. (Weak counter-evidence: the iMac webcam presumably went through it and worked - but that
+is a single-transaction endpoint at much lower demand, so it does not clear the adapter for
+high-bandwidth isoc.)
 
 ### Can the ESP32 be made "dumb enough" to cope, or emulate the hub? No - and the reason is in silicon
 

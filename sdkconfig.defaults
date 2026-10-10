@@ -39,3 +39,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # "Detected size(16384k) larger than the size in the binary image header(2048k)" and ignored the
 # rest. Declaring the true size makes the whole chip addressable.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Some UVC cameras do not set the End-of-Header bit in the payload header, and the component
+# rejects every such payload ("uvc-frame: EOH bit not set"), so no frame ever completes. Measured
+# against an iMac webcam: the stream opened, data arrived, and every payload was discarded. The P2
+# Pro sets it correctly and is unaffected either way. This is a Kconfig option rather than a patch
+# to managed_components, so it survives a component upgrade.
+CONFIG_UVC_CHECK_PAYLOAD_HEADER_EOH=n

@@ -71,6 +71,7 @@ static volatile uint16_t s_cam_h = STREAM_V_RES;
 
 /* Generic-preview output geometry, computed once per connect. */
 static int s_gen_w, s_gen_h, s_gen_x, s_gen_y;
+static size_t s_fb_bytes;   /* allocated size of s_rgb_buf/s_rgb_tx, cache-line aligned */
 
 /* --- Display (ST7796 over SPI, pins from the Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5 BSP) --- */
 #define LCD_H_RES            320
@@ -1392,6 +1393,16 @@ static void fit_preserving_aspect(int in_w, int in_h, int max_w, int max_h,
     *out_h = h;
 }
 
+/* PPA validates out.buffer_size against the cache line, not just the address, so the size handed
+ * to it must be a multiple of 64. Rounding the USED extent up keeps each pass asking PPA to write
+ * back only what it needs: the thermal path's 416x312x2 = 259584 is already a multiple of 64 and
+ * is unchanged, while 374x306x2 = 228888 (24 over) becomes 228928. The buffers are allocated to
+ * the largest rounded-up case, so the extra bytes are always inside the allocation. */
+static inline size_t ppa_out_bytes(int w, int h)
+{
+    return ((size_t)w * h * sizeof(uint16_t) + 63u) & ~(size_t)63u;
+}
+
 static int ppa_quantized_out(int in_dim, int desired_out)
 {
     int sixteenths = (int)(((float)desired_out / in_dim) * 16.0f); /* floor, as the driver casts */
@@ -1975,7 +1986,7 @@ static void render_task(void *arg)
                 },
                 .out = {
                     .buffer = s_rgb_buf,
-                    .buffer_size = (size_t)s_gen_w * s_gen_h * sizeof(uint16_t),
+                    .buffer_size = ppa_out_bytes(s_gen_w, s_gen_h),
                     .pic_w = s_gen_w, .pic_h = s_gen_h,
                     .block_offset_x = 0, .block_offset_y = 0,
                     .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
@@ -2008,7 +2019,7 @@ static void render_task(void *arg)
                 },
                 .out = {
                     .buffer = s_rgb_tx,
-                    .buffer_size = (size_t)s_gen_w * s_gen_h * sizeof(uint16_t),
+                    .buffer_size = ppa_out_bytes(s_gen_w, s_gen_h),
                     .pic_w = s_gen_w, .pic_h = s_gen_h,
                     .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
                 },
@@ -2237,7 +2248,7 @@ static void render_task(void *arg)
             },
             .out = {
                 .buffer = s_rgb_buf,
-                .buffer_size = (size_t)s_img_w * s_fb_h * sizeof(uint16_t),
+                .buffer_size = ppa_out_bytes(s_img_w, s_fb_h),
                 .pic_w = s_img_w, .pic_h = s_fb_h,
                 .block_offset_x = 0, .block_offset_y = 0,
                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
@@ -2311,7 +2322,7 @@ static void render_task(void *arg)
             },
             .out = {
                 .buffer = s_rgb_tx,
-                .buffer_size = (size_t)s_img_w * s_fb_h * sizeof(uint16_t),
+                .buffer_size = ppa_out_bytes(s_img_w, s_fb_h),
                 .pic_w = s_img_w, .pic_h = s_fb_h,
                 .block_offset_x = 0, .block_offset_y = 0,
                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
@@ -2490,7 +2501,13 @@ static void streaming_task(void *arg)
          * Getting that wrong silently restored the stock 5s+4s on every replug. */
         s_shutter_cfg_done = false;
         ESP_LOGI(TAG, "Stream opened, starting continuous render");
-        p2_camera_init();
+        /* P2-only. These are InfiRay vendor control requests; firing them at an ordinary webcam
+         * makes it STALL EP0 on every one, and the channel-availability probe retries for 15s at
+         * 25ms intervals - a control-transfer storm that drowns the stream it is supposed to
+         * precede. Seen for real against an iMac webcam. */
+        if (s_cam_kind == CAM_THERMAL) {
+            p2_camera_init();
+        }
         s_stream_restart_req = false;
         s_camera_connected = true;
 
@@ -2655,12 +2672,17 @@ void app_main(void)
      * the used region is ever transferred, so the extra PSRAM costs nothing per frame. */
     const size_t fb_px = ((size_t)s_img_w * s_fb_h > (size_t)s_disp_w * s_disp_h)
                          ? (size_t)s_img_w * s_fb_h : (size_t)s_disp_w * s_disp_h;
-    s_rgb_buf = heap_caps_aligned_alloc(64, fb_px * sizeof(uint16_t),
+    /* PPA validates that out.buffer_size is cache-line aligned, not just the address. Declaring
+     * the USED extent fails whenever w*h*2 is not a multiple of 64 - 374x306 gives 228888, which
+     * is 24 over. The thermal path only passed because 416x312x2 = 259584 happens to divide by 64.
+     * The field means the size OF THE BUFFER, so publish the real allocation and round it up. */
+    s_fb_bytes = (fb_px * sizeof(uint16_t) + 63u) & ~(size_t)63u;  /* covers both paths */
+    s_rgb_buf = heap_caps_aligned_alloc(64, s_fb_bytes,
                                          MALLOC_CAP_SPIRAM);
-    s_rgb_tx = heap_caps_aligned_alloc(64, fb_px * sizeof(uint16_t),
+    s_rgb_tx = heap_caps_aligned_alloc(64, s_fb_bytes,
                                         MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
     if (!s_rgb_tx) {
-        s_rgb_tx = heap_caps_aligned_alloc(64, fb_px * sizeof(uint16_t), MALLOC_CAP_DMA);
+        s_rgb_tx = heap_caps_aligned_alloc(64, s_fb_bytes, MALLOC_CAP_DMA);
     }
     assert(s_rgb_buf && s_rgb_tx);
 

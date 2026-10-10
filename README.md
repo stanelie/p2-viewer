@@ -295,11 +295,32 @@ Check the **negotiated speed** before doing this arithmetic. At full speed the p
 1000/s rather than 8000/s, giving ~1 MB/s, and no YUY2 mode would be viable at 25 fps - the design
 would have to go through MJPEG and the P4's hardware JPEG decoder instead.
 
-> **Status: detection verified, streaming NOT verified.** The scope tested here never enumerates
-> reliably on the board, so no frame has been rendered through this path. The PPA YUV->RGB colour
-> conversion and whether the UVC frame buffers satisfy PPA's cache-line alignment are both
-> untested; on an alignment failure it logs `PPA YUV pass failed` with the pointer, and the fix is
-> a copy into an aligned scratch buffer.
+**Verified working** against an iMac webcam: `352x288 -> 374x306`, **5.3 ms** convert and
+**29.0 ms** end-to-end, no PPA errors and no underflows. The conversion is cheaper than the
+thermal path (5.3 ms vs 11.3 ms) because the PPA does the colour conversion in hardware.
+
+Two things had to be fixed before any frame appeared, and both are easy to misdiagnose:
+
+**1. `CONFIG_UVC_CHECK_PAYLOAD_HEADER_EOH=n`.** Some cameras do not set the End-of-Header bit in
+the UVC payload header, and the component rejects every such payload (`uvc-frame: EOH bit not
+set`), so no frame ever completes even though the stream opened and data is arriving. It is a
+Kconfig option, so this is not a patch to `managed_components` and survives a component upgrade.
+The P2 sets the bit correctly and is unaffected.
+
+**2. `out.buffer_size` must be cache-line aligned, not just the buffer address.** PPA validates
+the size too, and declaring the *used extent* fails whenever `w*h*2` is not a multiple of 64 -
+374x306 gives 228888, which is 24 over, and every pass failed with `ESP_ERR_INVALID_ARG` giving a
+**black screen**. The thermal path only ever worked because 416x312x2 = 259584 happens to divide
+by 64. `ppa_out_bytes()` rounds the extent up, which leaves the thermal sizes byte-identical.
+
+The driver names the cause exactly - `E ppa_core: out.buffer addr or out.buffer_size not aligned
+to cache line size` - so read the PPA tag's own errors before theorising about alignment of the
+input.
+
+**P2 vendor commands must be thermal-only.** `p2_camera_init()` ran after every stream open, so it
+fired InfiRay vendor control requests at the webcam, which correctly stalled every one
+(`USBH: Dev 1 EP 0 STALL`) - and its channel-availability probe retries for 15 s at 25 ms
+intervals, a control-transfer storm that drowns the stream it is meant to precede.
 
 ### That camera does not enumerate on this board
 
@@ -349,8 +370,11 @@ control transfers error at random stages and the device detaches, while the **P2
 same port** and this camera works on a PC. The untested variables are the OTG connector's modified
 wiring, the scope's ~1 m of thin cable, and the P4 OTG PHY's tolerance of the two combined.
 
-The most informative next test is **a different USB camera on the board**: if another one also
-fails, the port is the weak link; if it works, this specific scope is.
+**Answered by testing an iMac webcam on the same port: it enumerates once, cleanly, with zero HUB
+errors and streams fine.** So the port, the wiring and the host stack are all sound, and this
+scope is specifically the device that does not work. Whatever is marginal about it is between that
+camera and the P4's OTG PHY, and separating the remaining variables - the scope's ~1 m of thin
+cable versus the P4 PHY's tolerance - needs a scope on D+/D-, not more software.
 
 ## Flash layout (16MB)
 

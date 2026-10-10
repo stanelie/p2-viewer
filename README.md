@@ -319,15 +319,38 @@ Measured, and it appears to be physical rather than a software problem:
 - It is **not** power: `bMaxPower` requests 500 mA, but the camera runs cooler than the P2, its
   illumination LED stays steady and it never visibly drops out.
 
-The likely cause is high-speed signal integrity: the channel is the OTG connector wiring plus the
-scope's ~1 m of thin cable, where the P2 plugs straight in with no cable at all. A powered USB 2.0
-hub between board and camera would regenerate the signal and is the next thing to try
-(`CONFIG_USB_HOST_HUBS_SUPPORTED` is already enabled).
+What it actually does, measured with a second diagnostic USB host client (`P2_USB_PROBE`):
 
-**Raising the USB enumeration timings made it worse, not better.** With
-`DEBOUNCE_DELAY_MS=500 / RESET_HOLD_MS=50 / RESET_RECOVERY_MS=200 / SET_ADDR_RECOVERY_MS=50` the
-root port reset failed outright and enumeration never started at all; at the defaults it at least
-enumerates intermittently. Do not retry that.
+```
+probe: addr 12 speed=HIGH (480 Mbit/s) bMaxPacketSize0=64 cfg=1
+Device connected, addr=12
+probe: device gone                                  <- ~10ms later
+```
+
+It negotiates **high speed** and enumerates **completely** - device descriptor and configuration
+both readable - and then detaches within ~10 ms. The address climbs on every cycle. On other
+rounds it dies earlier, at `Dev 0 EP 0 Error` (address 0, i.e. the first 8-byte descriptor read).
+
+Eight hypotheses eliminated by measurement, so none of them get retried:
+
+| ruled out | how |
+|---|---|
+| power / brownout | 150 mA measured on an inline meter; LED steady, runs cooler than the P2 |
+| full-speed fallback hitting the known P4 FS enumeration bug | probe reports **HIGH** every time |
+| config descriptor too large | `wTotalLength` 702 bytes vs our 4096 limit |
+| IDF 5.5.5 NULL `enum_filter_cb` regression | the block is inside `#if ENABLE_ENUM_FILTER_CALLBACK`, and that option is unset here |
+| our `usb_host_device_free_all()` on `NO_CLIENTS` | instrumented - it never fires during the loop |
+| our `stream_open` destabilising it | with `P2_NO_OPEN_GENERIC` it still cycled 13 times in 40 s |
+| raising the USB enumeration timings | `DEBOUNCE 500 / HOLD 50 / RECOVERY 200 / SET_ADDR 50` made it **worse** - the root port reset then failed outright and enumeration never started |
+| a powered hub regenerating the signal | tested through a powered dock: no change |
+
+What remains is an electrical / PHY-level interaction specific to this device on this port: EP0
+control transfers error at random stages and the device detaches, while the **P2 Pro works on the
+same port** and this camera works on a PC. The untested variables are the OTG connector's modified
+wiring, the scope's ~1 m of thin cable, and the P4 OTG PHY's tolerance of the two combined.
+
+The most informative next test is **a different USB camera on the board**: if another one also
+fails, the port is the weak link; if it works, this specific scope is.
 
 ## Flash layout (16MB)
 

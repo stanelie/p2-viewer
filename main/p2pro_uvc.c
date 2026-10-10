@@ -620,6 +620,15 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * something is being investigated. BOOT_MARK stays on; it is ~12 lines and worth it. */
 #define P2_DIAG 0
 
+/* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
+ * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
+ * driver cannot claim the device. Off by default; it costs a task and a client slot. */
+#define P2_USB_PROBE 0
+/* Experiment, kept as a record: skipping stream_open entirely for a generic camera made no
+ * difference - the scope still cycled through 13 enumerations in 40s - which is how we know our
+ * streaming code is not what destabilises it. */
+#define P2_NO_OPEN_GENERIC 0
+
 
 /* Whether the camera runs its own periodic flat-field (every MAX_INTERVAL = 60s), which closes
  * the shutter and briefly freezes the image. Toggled by the AS1/AS0 button; AS0 suppresses it.
@@ -1778,12 +1787,85 @@ static void stream_event_callback(const uvc_host_stream_event_data_t *event, voi
     }
 }
 
+
+#if P2_USB_PROBE
+/* Diagnostic USB host client, independent of the UVC driver. Answers two questions the UVC layer
+ * cannot: what SPEED the device actually negotiated, and whether it ever fully enumerates at all.
+ * Relevant because the ESP32-P4 host is reported to fail FULL-speed enumeration with exactly the
+ * "HUB: Root port reset failed" we see, while high-speed devices work - and this camera is
+ * high-speed on a PC. If its chirp degrades over its ~1m cable the P4 would fall back to full
+ * speed and land in that failure mode. */
+static usb_host_client_handle_t s_probe_client;
+
+static const char *speed_str(usb_speed_t sp)
+{
+    switch (sp) {
+    case USB_SPEED_LOW:  return "LOW (1.5 Mbit/s)";
+    case USB_SPEED_FULL: return "FULL (12 Mbit/s)";
+    case USB_SPEED_HIGH: return "HIGH (480 Mbit/s)";
+    default:             return "unknown";
+    }
+}
+
+static void usb_probe_cb(const usb_host_client_event_msg_t *msg, void *arg)
+{
+    (void)arg;
+    if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        usb_device_handle_t dev = NULL;
+        if (usb_host_device_open(s_probe_client, msg->new_dev.address, &dev) != ESP_OK) {
+            ESP_LOGW(TAG, "probe: addr %d appeared but could not be opened",
+                     msg->new_dev.address);
+            return;
+        }
+        usb_device_info_t info;
+        const usb_device_desc_t *desc = NULL;
+        if (usb_host_device_info(dev, &info) == ESP_OK) {
+            ESP_LOGW(TAG, "probe: addr %d speed=%s bMaxPacketSize0=%d cfg=%d",
+                     info.dev_addr, speed_str(info.speed),
+                     info.bMaxPacketSize0, info.bConfigurationValue);
+        }
+        if (usb_host_get_device_descriptor(dev, &desc) == ESP_OK && desc) {
+            ESP_LOGW(TAG, "probe: addr %d %04x:%04x bcdUSB=%04x class=%d",
+                     msg->new_dev.address, desc->idVendor, desc->idProduct,
+                     desc->bcdUSB, desc->bDeviceClass);
+        }
+        usb_host_device_close(s_probe_client, dev);
+    } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        ESP_LOGW(TAG, "probe: device gone");
+    }
+}
+
+static void usb_probe_task(void *arg)
+{
+    (void)arg;
+    const usb_host_client_config_t cc = {
+        .is_synchronous = false,
+        .max_num_event_msg = 8,
+        .async = { .client_event_callback = usb_probe_cb, .callback_arg = NULL },
+    };
+    if (usb_host_client_register(&cc, &s_probe_client) != ESP_OK) {
+        ESP_LOGW(TAG, "probe: could not register diagnostic client");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGW(TAG, "probe: diagnostic USB client registered");
+    while (true) {
+        usb_host_client_handle_events(s_probe_client, portMAX_DELAY);
+    }
+}
+#endif
+
 static void usb_lib_task(void *arg)
 {
     while (1) {
         uint32_t event_flags;
         usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+        /* Instrumented: a device that enumerates and is then torn down repeatedly could be
+         * self-inflicted - free_all() here would destroy a device the UVC driver has not managed
+         * to claim yet. Log the flags so the ordering against the claim failure is visible. */
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            /* Instrumented once to check whether this was tearing devices down under the UVC
+             * driver: it never fired during the scope's enumeration loop, so it is not. */
             usb_host_device_free_all();
         }
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
@@ -2344,6 +2426,20 @@ static void streaming_task(void *arg)
         stream_config.vs_format.h_res = s_cam_w;
         stream_config.vs_format.v_res = s_cam_h;
 
+#if P2_NO_OPEN_GENERIC
+        /* Experiment: for a generic camera, do NOT open a stream - just let the device sit
+         * enumerated. Isolates "this device is unstable on our port" from "our stream_open is
+         * what destabilises it". The probe client keeps reporting whether it stays attached. */
+        if (s_cam_kind == CAM_GENERIC) {
+            static bool said = false;
+            if (!said) {
+                ESP_LOGW(TAG, "P2_NO_OPEN_GENERIC: leaving the camera enumerated, not opening");
+                said = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+#endif
         BOOT_MARK("uvc: calling stream_open");
         ESP_LOGI(TAG, "Opening %ux%u YUY2 @%.1ffps (%s)...", s_cam_w, s_cam_h, STREAM_FPS,
                  (s_cam_kind == CAM_THERMAL) ? "thermal" : "generic");
@@ -2525,6 +2621,9 @@ void app_main(void)
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
+#if P2_USB_PROBE
+    xTaskCreate(usb_probe_task, "usbprobe", 4096, NULL, USB_HOST_PRIORITY - 3, NULL);
+#endif
 
     BOOT_MARK("usb: host installed, installing uvc driver");
     ESP_LOGI(TAG, "Installing UVC host driver");

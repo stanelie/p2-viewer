@@ -674,7 +674,10 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
 #define P2_UTMI_W_FC01   1   /* write fc_01 (adj_vref_sq) */
 #define P2_UTMI_W_FC02   1   /* write fc_02 (adj_vsw_hs)  */
 #define P2_UTMI_RES_HS   0x4   /* 45 ohm, the default */
-#define P2_UTMI_VREF_SQ  0x8   /* MEASURED actual value; the header documents 0x2 but hardware reads 0x8 */
+#define P2_UTMI_VREF_SQ  0x8   /* measured hardware value (header wrongly documents 0x2).
+                                * 0xA measurably improves the borescope link - HUB errors 20-43 -> 2-7
+                                * and stream opens 0 -> 7-11 - but UNTESTED against the P2 Pro and the
+                                * webcam, so it is NOT the default. See the README. */
 #define P2_UTMI_VSW_HS   0x4   /* 400 mV, the measured hardware value */
 
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and

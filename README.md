@@ -510,6 +510,41 @@ run at `0xA` did produce `enum=3` and `streamopen=3`, the only stream opens ever
 camera**, but it was not reproducible and the camera went electrically absent shortly afterwards.
 Unconfirmed, and worth retrying on a known-good rig.
 
+### Squelch 0xA is a real improvement, but not a fix
+
+With the camera freshly power-cycled and `adj_vref_sq = 0xA` as the **only** change:
+
+| | default `0x8` | `0xA` |
+|---|---|---|
+| HUB errors | 20-43 | **2-7** |
+| enumerations | 3-10 | 11 |
+| **stream opens** | **0, always** | **7-11** |
+| frames | 0 | 0 |
+
+Stream opens had *never* happened on this camera before. So raising the squelch threshold genuinely
+fixes the link-level instability - the device stops being dropped mid-enumeration. The failure then
+moves downstream: the stream opens and isochronous data never completes a frame. Disabling the
+remaining payload check (`CONFIG_UVC_CHECK_PAYLOAD_HEADER_ERR=n`) does not change that.
+
+`0xA` is **not** the default, because it is untested against the P2 Pro and the webcam: higher
+squelch makes a device harder to see (`0x9` and above made the borescope invisible in other runs),
+so it could plausibly break the cameras that currently work. Test those before adopting it.
+
+**Measurement cost warning.** The borescope *wedges* after repeated failed attempts - it keeps its
+LED lit and keeps drawing current while presenting nothing on the bus - so every data point needs a
+physical replug, and run-to-run variance is large (identical firmware gives 2-10 enumerations, and
+one run gave `ESP_ERR_NOT_FOUND` and no stream at all). That variance eventually exceeded the
+effect sizes being measured, which is where this investigation stopped.
+
+### A bandwidth table earlier in this file was wrong
+
+The isoc figures I first derived for this camera were too low by 3x. `lsusb -v` prints
+`wMaxPacketSize 0x03fc  3x 1020 bytes`, and my parser took the byte count while discarding the
+`3x` - the transactions-per-microframe multiplier for high-bandwidth isochronous. The component
+gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 3060 bytes per
+microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
+within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
+
 ### Validity rule for any future sweep
 
 A run with **`HUB == 0` and `enum == 0` means nothing was attached** - discard it, do not score it

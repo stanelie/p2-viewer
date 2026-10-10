@@ -46,3 +46,6 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 # Pro sets it correctly and is unaffected either way. This is a Kconfig option rather than a patch
 # to managed_components, so it survives a component upgrade.
 CONFIG_UVC_CHECK_PAYLOAD_HEADER_EOH=n
+# The borescope's payloads are rejected with the ERR-bit check enabled (stream opens, no frame
+# ever completes). Same class of quirk as the EOH bit above.
+CONFIG_UVC_CHECK_PAYLOAD_HEADER_ERR=n

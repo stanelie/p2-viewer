@@ -545,6 +545,37 @@ gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 
 microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
 within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
 
+### Why no host-side configuration can fix it: isoc has no retries
+
+With squelch `0xA` the link-level problem is solved - enumeration, format negotiation and
+`stream_open` all succeed. Frames still never complete, and two separate attempts to reduce the
+isochronous demand changed nothing:
+
+| attempt | result |
+|---|---|
+| clamp the host-proposed `dwMaxPayloadTransferSize` to 1020 in `SET_CUR(PROBE)` | transmitted (`clamping 3060 -> 1020`) but the camera ignores it and still reports 3060 |
+| `MAX_MPS_IN` 4096 -> 1020, which is what actually picks the alt setting | worked - endpoint went from **3060 MPS** (3 transactions/microframe) to **944 MPS** (single) - and frames were still 0 |
+
+944 x 8000 = 7.55 MB/s against the 3.84 MB/s that 320x240 YUY2 at 25 fps needs, so **bandwidth was
+never the constraint**. The real asymmetry is that **control transfers are retried and isochronous
+transfers are not**. That is exactly why enumeration and probe/commit succeed on this link while
+video does not: a frame needs ~160 consecutive packets to arrive intact, and on a link with this
+error rate none ever does.
+
+No host-side setting can make an unretried transfer survive a lossy link. Both component patches
+were reverted; `managed_components` is back to stock.
+
+### For a portable build: a hub IC inside the enclosure
+
+If carrying a hub is the objection rather than the hub itself, the answer is to stop carrying one -
+a single USB 2.0 hub IC (FE1.1s and similar are a few mm square and cost very little) soldered
+inside the case, between the OTG connector and the camera socket, is permanent and invisible. It
+puts a properly terminated PHY at the camera's end of the cable, which is the thing that actually
+fixes this, and it needs no firmware change at all.
+
+The alternative is a borescope with a shorter or better-shielded cable; this camera's ~1 m of thin
+cable is the root cause, and it is not detachable.
+
 ### Validity rule for any future sweep
 
 A run with **`HUB == 0` and `enum == 0` means nothing was attached** - discard it, do not score it

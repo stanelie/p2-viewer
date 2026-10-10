@@ -418,14 +418,21 @@ camera the board sees *nothing at all* - no `HUB: Root port reset`, no device tr
 after boot. Enumeration never starts, so this is at connection-detect level, not a descriptor or
 protocol problem.
 
-Why the dock does not attach is **unknown**. It is NOT because VBUS is fed from the external boost
-rather than from the host cable - a hub sees 5 V on the pin and does not care what sources it. The
-measurement that would settle it is **VBUS at the OTG connector with the dock plugged in**: a dock
-draws real current for its own hub controller before any downstream device, and if the boost cannot
-source that, VBUS collapses and nothing can attach. That would fit the silence, and is consistent
-with the scope attaching fine on its own at a measured 150 mA.
+Why the dock does not attach is **unknown**, and two plausible-sounding explanations are already
+ruled out:
 
-Either way the test cannot say whether a hub would fix the signalling.
+- Not the VBUS *source*. A hub sees 5 V on the pin and does not care whether an external boost or
+  the host cable put it there.
+- Not VBUS *collapsing* under the dock's own load. The dock is powered from its PD input by a
+  USB-C supply, so its hub controller does not draw from the board at all.
+
+What is established is only that enumeration never starts, so it is at connection-detect level
+rather than anything protocol-shaped. No mechanism beyond that is worth writing down until
+something is measured.
+
+Either way this cannot say whether a hub would fix the signalling - a **plain bus-powered USB 2.0
+hub**, which needs no CC negotiation and no PD, is the cheaper way to get a signal repeater into
+the path.
 
 A plain **bus-powered USB 2.0 hub** (not a USB-C PD dock), taking power from the boosted VBUS pin,
 would be the remaining way to put a signal repeater in the path. Otherwise this needs a scope on

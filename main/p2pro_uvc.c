@@ -758,6 +758,24 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  *
  * Glyph set has no lowercase and no J, hence FMT1 rather than MJPEG. */
 #define P2_USB_OSD 0
+
+/* ---- microframe period check -----------------------------------------------------------------
+ * Babble means "the device was still transmitting at end of frame", and HFIR.frint is where the
+ * core believes end of frame IS. IDF sets it in usb_dwc_ll_hfir_set_frame_interval():
+ *
+ *     hfir.frint = (speed == USB_DWC_SPEED_FULL) ? 48000 : 6000;
+ *
+ * 6000 over a 125us microframe implies a 48 MHz PHY clock, while the same file sets phyif = 1
+ * (16-bit UTMI), which is normally 30 MHz. That source is copy-pasted across esp32s2/s3/p4 and
+ * S2/S3 are full-speed-only parts, where 48000 per 1 ms frame is correct - so the high-speed
+ * branch may be a constant that was never checked against P4 silicon.
+ *
+ * HFNUM.frnum increments once per microframe, so this needs no camera and no replug: count it
+ * against esp_timer. 8000/s is correct. Anything else is a frame-interval bug, and a SHORT
+ * interval would make the core flag babble on any device that fills its microframe - which is
+ * exactly the asymmetry we measured (P2 and webcam single-transaction: fine; borescope at
+ * 3x1020: dead). */
+#define P2_UFRAME_CHECK 0
 #define P2_TRACE_N    384
 
 /* Diagnostic: registers a second USB host client and logs each device's negotiated speed and
@@ -2059,6 +2077,44 @@ static void usb_osd_draw(uint16_t *buf, int bw, int bh)
 }
 #endif /* P2_USB_OSD */
 
+#if P2_UFRAME_CHECK
+/* Runs once the port is enabled and SOFs are flowing. frnum is 16 bits (wraps every 65536
+ * microframes = 8.192 s at spec rate), so a 500 ms window cannot alias. */
+static void uframe_check_task(void *arg)
+{
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        usb_dwc_hprt_reg_t h = { .val = USB_DWC_HS.hprt_reg.val };
+        if (!h.prtena) {
+            continue;   /* no SOFs while the port is down */
+        }
+        const uint32_t f0 = USB_DWC_HS.hfnum_reg.frnum;
+        const int64_t  t0 = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        const uint32_t f1 = USB_DWC_HS.hfnum_reg.frnum;
+        const int64_t  t1 = esp_timer_get_time();
+
+        const uint32_t ticks = (f1 - f0) & 0xFFFF;
+        const int64_t  us    = t1 - t0;
+        if (!ticks || us <= 0) {
+            ESP_LOGW(TAG, "uframe: no SOF ticks (port enabled but frnum static)");
+            continue;
+        }
+        /* period in nanoseconds, to avoid a float just for a log line */
+        const uint32_t period_ns = (uint32_t)((us * 1000) / ticks);
+        ESP_LOGW(TAG, "uframe: %u ticks in %lld us -> %u.%03u us each (spec 125.000), "
+                      "rate %u/s (spec 8000) | HFIR.frint=%u rld=%u phyif=%u spd=%u",
+                 (unsigned)ticks, us, (unsigned)(period_ns / 1000), (unsigned)(period_ns % 1000),
+                 (unsigned)((uint64_t)ticks * 1000000 / (uint64_t)us),
+                 (unsigned)USB_DWC_HS.hfir_reg.frint,
+                 (unsigned)USB_DWC_HS.hfir_reg.hfirrldctrl,
+                 (unsigned)USB_DWC_HS.gusbcfg_reg.phyif,
+                 (unsigned)h.prtspd);
+        vTaskDelay(pdMS_TO_TICKS(8000));
+    }
+}
+#endif
+
 /* ---------------- UVC callbacks ---------------- */
 
 typedef struct {
@@ -3205,6 +3261,9 @@ void app_main(void)
     }
 #endif
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, NULL, USB_HOST_PRIORITY, NULL, 0);
+#if P2_UFRAME_CHECK
+    xTaskCreatePinnedToCore(uframe_check_task, "uframechk", 3072, NULL, 2, NULL, 1);
+#endif
 #if P2_PORT_TRACE
     /* Core 1, below the USB stack: sampling must not delay the transfers it is observing. */
     xTaskCreatePinnedToCore(port_trace_task, "porttrace", 3072, NULL, 2, NULL, 1);

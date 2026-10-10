@@ -572,105 +572,83 @@ the SOI, and we have the payload error check disabled), so it turns up as a JPEG
 checking for the `FF D9` terminator separates link losses (`truncated`) from real decoder failures
 (`decode_err`), which is what made the diagnosis above possible.
 
-### SETTLED: the host configuration is identical; the difference is physical
+### RESOLVED: it was the camera's micro-USB plug half and its micro-USB -> USB-C adapter
 
-Measured with the controller's own channel registers read back live (`P2_USB_OSD` draws them on
-the panel, `P2_PORT_TRACE` logs them over serial), because the two USB sockets on this board are
-too close together to have the serial adapter and the camera's USB-A adapter attached at once:
+**The borescope works directly on the ESP32. No hub, no hub IC, no firmware change.**
 
-| path | HCCHAR.MPS | HCCHAR.EC (MULTCNT) | EP | result |
-|---|---|---|---|---|
-| plain USB 2.0 hub | 1020 | 3 | 1 | **25-30 fps, 0 truncated, 0 port disables** |
-| Anker dock / direct | 1020 | 3 | 1 | 0 frames |
-
-5/5 at stream start and 5/5 at the moment of failure. **The host programs the controller
-byte-for-byte identically in both cases** - same endpoint, same packet size, same
-transactions-per-microframe - so there is no host-side difference left to find. The only
-remaining variable is the physical path.
-
-And the failure is **not** a disconnect. The root port disables itself:
+This camera has an unusual dual plug: a USB-A shell whose cover flips aside to reveal a micro-USB
+connector. Every "direct" test in this investigation went through the **micro-USB** half plus a
+micro-USB -> USB-C adapter. Every working hub test used the **USB-A** half. The variable was never
+"direct vs through a hub" at all:
 
 ```
-DISCONNECT: hprt=00001001 connsts=1 ena=0 lnsts=0
-gintsts: disconn=0 throughout
+failing:  camera -[1 m cable]- flip-cover plug as MICRO-USB -[micro->C adapter]- ESP32
+working:  camera -[1 m cable]- flip-cover plug as USB-A     -[A->C adapter]-     ESP32
 ```
 
-`prtconnsts` stays 1 (device still electrically present) while `prtena` goes 0, and `DISCONNINT`
-never fires at all. Per IDF's own HAL documentation that combination is a **port error** - the
-babble class (USB 2.0 spec 11.8.1).
+Plugging the USB-A half into the same A->C adapter already used for the hub gives video immediately.
+The fault is in the micro-USB path - the flip-cover's micro-USB wiring, its connector, or that
+cheap micro->C adapter. It is not the P4's PHY, not the hub's presence, and not anything in software.
 
-Note what the hub is *not* doing: it is not absorbing these errors. Through the hub the counters
-read `TR 0 PDIS 0` over a sustained 25-30 fps stream, so **no babble occurs at all** on that path.
+**Why that path works on a phone but not here.** It is a marginal link, not a broken one, and the
+two hosts have different analogue margin. Evidence from our own logs: on the failing path the P4
+completed *every* control transfer - device descriptor, full config descriptor, UVC probe/commit,
+`SET_INTERFACE` - repeatedly and correctly. It only failed once continuous isochronous traffic
+started. A link that carries sparse traffic perfectly and dies under sustained load is marginal by
+definition. A phone's USB PHY is discrete silicon with impedance-matched routing, common-mode
+chokes and proper ESD parts; the P4's is integrated, on a dev board, at the end of an adapter
+stack. "Works on the phone" means clean *enough* for a better receiver, not clean.
 
-**Cable length is not the difference, and earlier wording here claiming otherwise was wrong.** The
-camera's ~1 m cable is not detachable: its plug goes either into the hub or into the ESP32, so the
-cable is present in *both* topologies and is a constant.
+Most likely mechanism, though unmeasured (no scope on this bus): USB-C carries two D+/D- pin pairs
+(A6/A7 and B6/B7), and cheap legacy->C adapters sometimes bridge the data lines to *both* so they
+work in either orientation without CC logic. The unused pair then hangs off the signal as a
+**stub**, and stub reflections add spurious edges at packet end - which is precisely what gets
+flagged as babble, and precisely why the failure is traffic-dependent.
 
-```
-direct:   camera -[fixed 1 m cable]- USB-A plug -[A->C adapter]- P4 PHY
-via hub:  camera -[fixed 1 m cable]- USB-A plug - hub PHY | hub PHY -[short]- P4 PHY
-```
+**Not isolated: the adapter vs the flip-cover contacts.** The micro-USB path contains both a
+dual-plug switching mechanism and a cheap adapter, and only the pair was tested. If it ever
+matters, trying the micro-USB half through a *different* micro->C adapter separates them: still
+failing means the camera's flip-cover contacts, working means that adapter.
 
-What changes is **which transceiver terminates the degraded segment**: the hub's PHY in one case,
-the P4's in the other. The hub's tolerates it; the P4's does not. The hub removes the P4's PHY from
-that segment entirely - it only ever drives the short upstream link.
+**What the instrumentation got right.** The port-error diagnosis held up: the core really was
+clearing `prtena` while `prtconnsts` stayed 1, with `DISCONNINT` never firing - a port error, not a
+disconnect. And the decisive measurement pointed the right way: `MPS=1020 EC=3 EP=1` on the working
+AND failing paths, 5/5 each, proving the host programmed the controller identically and the
+difference had to be physical. It was physical. I just had the wrong physical component, because I
+did not know the micro-USB adapter was in the chain.
 
-**One variable remains un-isolated: the USB-A -> USB-C adapter.** The direct path has a passive
-adapter in series right at the host end, an extra connector pair and impedance discontinuity. If
-the hub's upstream does not use that same adapter, the adapter is unique to the failing path and is
-untested. (Weak counter-evidence: the iMac webcam presumably went through it and worked - but that
-is a single-transaction endpoint at much lower demand, so it does not clear the adapter for
-high-bandwidth isoc.)
-
-### Can the ESP32 be made "dumb enough" to cope, or emulate the hub? No - and the reason is in silicon
-
-Both forms of the idea are blocked:
-
-**Ignore the port error and keep streaming** is impossible. `HPRT.prtena` is **W1C - writing 1
-disables it** (`usb_dwc_ll_hprt_port_dis`: `hprt.prtena = 1; //W1C to disable`). Software can only
-ever *clear* that bit; it is the core that sets it, and only on completion of a port reset. So once
-the core disables the port there is no way back except a reset, and a reset drops the device's
-address and forces re-enumeration. That is exactly the loop in the logs. No amount of leniency in
-our code can override it, because the leniency would have to live in the host controller.
-
-**Emulate the hub** is a category error on our side: a USB 2.0 hub's contribution here is a second
-PHY physically in the signal path, close to the camera. We have one PHY at one end of the cable.
-There is no protocol behaviour to imitate - the hub is doing an electrical job, not a logical one.
-
-And the hub is not "dumber" in any useful sense. It is a purpose-built retimer/repeater: simpler in
-function, but *better* at the one thing that matters - receiving and re-driving on a marginal link.
-The P4 is not failing because it is too strict; it is failing because its PHY sits at the far end of
-a bad cable.
-
-Full speed would be genuinely dumber, but the P4's FS controller pins are not routed on this board
-(`P2_FORCE_FULL_SPEED`, kept as a record).
-
-The Anker dock reproduces the direct-connection failure exactly (same negotiation, same port
-disable, 0 frames) - it is not a workaround and not a useful control. The **plain USB 2.0 hub** is
-the thing that works.
+**What it cost.** Six host-side hypotheses built and measured away (below), plus a long detour into
+hub behaviour. The lesson is cheap and worth keeping: **when a fault is physical, get an exact
+description of the cable chain before theorising about the controller.** "Connected directly" was
+hiding two connectors and an adapter.
 
 ### Hypotheses killed by measurement
 
-Every one of these was proposed, built, measured and discarded. Recorded so none is tried again:
+All mine, all discarded on evidence. Recorded so none is tried again:
 
 | hypothesis | how it died |
 |---|---|
-| packets per frame (lossy link) | 8/8 turn-around values, 162 attempts: `ok=0 truncated=0 decode_err=0`. Zero *truncated* means no partial data ever arrives - the frame callback never fires once, so nothing is being "lost" |
+| packets per frame (lossy link) | 8/8 turn-around values, 162 attempts: `ok=0 truncated=0 decode_err=0`. Zero *truncated* means no partial data ever arrives |
 | burst size / high-bandwidth isoc | forcing single-transaction 944 MPS failed identically to 3060 |
-| HS bus turn-around time | swept `fc_06.hs_tx2rx_dly_cnt_sel` 0-7 in firmware (one value per stream attempt); all zero |
-| squelch threshold `adj_vref_sq` | reduced the *symptom* count but the cause is a port error, not a disconnect; reverted to the 0x8 hardware default, and it was never safe anyway (untested against the P2) |
-| payload / endpoint mismatch | clamped the committed `dwMaxPayloadTransferSize` to 944; the camera **re-raised it to 3060 on 64 of 64 attempts** |
-| ESP-IDF cannot do high-bandwidth isoc (`MULTCNT` never written) | the working hub path reads **EC=3**, correctly programmed. (The grep that suggested otherwise searched the databook name `multcnt`; this struct calls the field `ec`.) |
+| HS bus turn-around time | swept `fc_06.hs_tx2rx_dly_cnt_sel` 0-7 in firmware, one value per stream attempt; all zero |
+| squelch threshold `adj_vref_sq` | reduced a symptom count, not the cause; reverted to the 0x8 hardware default |
+| payload / endpoint mismatch | clamped committed `dwMaxPayloadTransferSize` to 944; camera **re-raised it to 3060 on 64 of 64 attempts** |
+| ESP-IDF cannot do high-bandwidth isoc (`MULTCNT` unwritten) | the working path reads **EC=3**, correctly programmed. My grep searched the databook name `multcnt`; this struct calls the field `ec` |
 
-### For a portable build: a hub IC inside the enclosure
+Also abandoned unmeasured, once the real cause was found: `HFIR.frint` is hardcoded to 6000 for high
+speed in `usb_dwc_ll_hfir_set_frame_interval()`, implying a 48 MHz PHY clock, while the same
+function sets `phyif = 1` (16-bit UTMI, normally 30 MHz). That file is copy-pasted across
+esp32s2/s3/p4 and S2/S3 are full-speed-only parts. Possibly an IDF oddity, possibly correct for P4
+silicon; `P2_UFRAME_CHECK` will count `HFNUM.frnum` against `esp_timer` (8000/s is correct) if it
+ever matters. It is not our bug.
 
-Measured, not inferred: through a plain USB 2.0 hub this camera runs 25-30 fps with zero truncated
-frames and zero port disables. So put the hub inside. One USB 2.0 hub IC (FE1.1s class, a few mm
-square, cents) between the OTG connector and the camera socket gives the babble containment
-permanently, with nothing to carry and **no firmware change at all**.
+### Diagnostics kept, all default off
 
-The alternative is a borescope with a shorter or better-shielded cable; this one's ~1 m of thin
-non-detachable cable is the root cause.
+| flag | what it does |
+|---|---|
+| `P2_USB_OSD` | draws `FMT/MPS/EC/EP` and ok/truncated/port-disable counters on the panel, read straight from HCCHAR. The only way to instrument a configuration the serial adapter cannot physically coexist with |
+| `P2_PORT_TRACE` | ring-buffers HPRT/GINTSTS at ~100 us and dumps the transitions on a port event |
+| `P2_UFRAME_CHECK` | measures the real microframe period from `HFNUM.frnum` |
 
 ### Historical note: the isoc-no-retries reasoning
 

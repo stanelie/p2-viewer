@@ -372,9 +372,56 @@ wiring, the scope's ~1 m of thin cable, and the P4 OTG PHY's tolerance of the tw
 
 **Answered by testing an iMac webcam on the same port: it enumerates once, cleanly, with zero HUB
 errors and streams fine.** So the port, the wiring and the host stack are all sound, and this
-scope is specifically the device that does not work. Whatever is marginal about it is between that
-camera and the P4's OTG PHY, and separating the remaining variables - the scope's ~1 m of thin
-cable versus the P4 PHY's tolerance - needs a scope on D+/D-, not more software.
+scope is specifically the device that does not work.
+
+### What it actually does (enum stage trace)
+
+With `P2_USB_ENUM_TRACE` the enumerator names every stage, and the answer is not what the error
+messages suggest:
+
+```
+ENUM: GET_SHORT_DEV_DESC OK
+ENUM: CHECK_SHORT_DEV_DESC OK
+ENUM: SECOND_RESET OK
+ENUM: SECOND_RESET_COMPLETE OK
+ENUM: SET_ADDR OK          (dev_addr=1)
+ENUM: CHECK_ADDR OK
+ENUM: SET_ADDR_RECOVERY OK
+ENUM: GET_FULL_DEV_DESC OK
+HUB:  Device tree node (port 0, uid=1): device gone     <-- a DISCONNECT
+ENUM: CANCEL OK
+```
+
+**Every stage passes, and then the hub reports a disconnect** - 18 cycles in 22 s. So the
+`CHECK_SHORT_DEV_DESC FAILED` / `CHECK_FULL_CONFIG_DESC FAILED` messages are collateral: the device
+vanishes mid-sequence and whichever transfer is in flight errors. The enumerator is working
+correctly, and `ENUM_STAGE_SECOND_RESET` (the "old devices get confused" workaround) passes fine,
+so that is not it either.
+
+A host seeing a device vanish when the device is demonstrably fine points at **false high-speed
+disconnect detection**: HS disconnect is sensed electrically off the differential pair, and a
+marginal link makes the host conclude the device unplugged. That fits the asymmetry - the webcam's
+short lead works, the scope's ~1 m of thin cable does not, and a PC's PHY tolerates it.
+
+**No USB timing knob helps.** Tested one at a time (the earlier four-at-once test was bad
+experimental design and its conclusion was worthless), 25 s windows:
+
+| config | HUB errors | ENUM failures | enumerations | stream opened |
+|---|---|---|---|---|
+| baseline | 51 | 3 | 6 | no |
+| `RESET_RECOVERY_MS=100` | 59 | 1 | 0 | no |
+| `SET_ADDR_RECOVERY_MS=50` | 46 | 3 | 3 | no |
+| `DEBOUNCE_DELAY_MS=500` | 27 | 3 | 3 | no |
+
+**A powered USB-C dock does not help either, but inconclusively:** with the dock between board and
+camera the board sees *nothing at all* - no hub, no device, silence after boot. The dock never
+attaches, most likely because the OTG port's VBUS net was severed to feed the camera from an
+external boost, so a dock has no valid host to attach to. That test therefore cannot say whether a
+hub would fix the signalling.
+
+A plain **bus-powered USB 2.0 hub** (not a USB-C PD dock), taking power from the boosted VBUS pin,
+would be the remaining way to put a signal repeater in the path. Otherwise this needs a scope on
+D+/D-, not more software.
 
 ## Flash layout (16MB)
 

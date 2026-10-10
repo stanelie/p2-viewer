@@ -625,6 +625,11 @@ static esp_err_t p2_cmd_read(uint16_t cmd, uint32_t param, uint8_t *out, uint16_
  * descriptors as it enumerates - independent of the UVC layer, so it reports even when the UVC
  * driver cannot claim the device. Off by default; it costs a task and a client slot. */
 #define P2_USB_PROBE 0
+/* Diagnostic: raise the USB enumerator/hub log levels so each enumeration stage is named as it
+ * passes or fails. This is what showed that the borescope completes EVERY stage and is then
+ * reported "device gone" by the hub - a disconnect, not an enumeration fault. Off by default;
+ * it is very chatty. */
+#define P2_USB_ENUM_TRACE 0
 /* Experiment, kept as a record: skipping stream_open entirely for a generic camera made no
  * difference - the scope still cycled through 13 enumerations in 40s - which is how we know our
  * streaming code is not what destabilises it. */
@@ -2629,6 +2634,13 @@ void app_main(void)
     esp_log_level_set("uvc-stream", ESP_LOG_DEBUG);
 #endif
 
+#if P2_USB_ENUM_TRACE
+    /* The enumerator names each stage it fails at; raise its log level so the failing stage is
+     * visible rather than inferred from which descriptor read errored. */
+    esp_log_level_set("ENUM", ESP_LOG_DEBUG);
+    esp_log_level_set("HUB", ESP_LOG_DEBUG);
+    esp_log_level_set("USBH", ESP_LOG_DEBUG);
+#endif
     BOOT_MARK("usb: installing host");
     ESP_LOGI(TAG, "Installing USB Host (native HS OTG port)");
     const usb_host_config_t host_config = {

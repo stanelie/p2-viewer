@@ -65,12 +65,13 @@ CONFIG_CAMERA_OV5647=y
 # tried first rotated to 640x800 and could only fill 240x300, half the width.
 CONFIG_CAMERA_OV5647_MIPI_RAW10_1280x960_BINNING_45FPS=y
 
-# ---- PSRAM throughput for the CSI/ISP capture path ------------------------------------------
-# Waveshare's own camera examples run a 256 KB L2 with 128-byte lines; we were on 128 KB / 64 B.
-# The capture path is a streaming PSRAM writer and PPA's rotating read is strided, so both are
-# cache-line sensitive. NOTE: PPA validates out.buffer_size against the cache line, so
-# P2_CACHE_LINE in p2pro_uvc.c derives from CONFIG_CACHE_L2_CACHE_LINE_SIZE - do not hardcode 64.
-CONFIG_CACHE_L2_CACHE_256KB=y
-CONFIG_CACHE_L2_CACHE_LINE_128B=y
+# ---- L2 cache: left at the IDF default on purpose ------------------------------------------
+# 256 KB with 128-byte lines (Waveshare's own camera examples use it) was tried while chasing a
+# capture-rate theory that turned out to be wrong - the limit was the sensor mode, not PSRAM
+# throughput, so the larger cache bought nothing measurable. It is a GLOBAL change that moves
+# every driver's DMA-coherency alignment, and the USB cameras stopped working with it in, so it
+# is reverted rather than kept on the grounds of being "probably good".
+# NOTE: P2_CACHE_LINE in p2pro_uvc.c derives from CONFIG_CACHE_L2_CACHE_LINE_SIZE regardless, so
+# PPA's buffer_size alignment stays correct whatever this is set to.
 # Present from esp_video 0.9.0 on; Waveshare's own camera demo enables it.
 CONFIG_ESP_VIDEO_ENABLE_DATA_PREPROCESSING=y

@@ -159,6 +159,10 @@ static int       s_bi_tx_i;
 static int       s_bi_sw, s_bi_sh, s_bi_sx, s_bi_sy;
 static bool     s_bi_video_inited;
 static uint32_t s_bi_frames;
+static int64_t  s_bi_idle_since;   /* when CAM_NONE began; 0 = not idle */
+/* How long no USB camera must be present before the built-in one takes over. Long enough to
+ * cover enumeration and a stream renegotiation, short enough not to feel broken. */
+#define BUILTIN_IDLE_WAIT_US  3000000
 #endif
 
 static volatile cam_kind_t s_cam_kind = CAM_NONE;
@@ -2512,12 +2516,17 @@ static void builtin_cam_stop(void)
     ioctl(s_bi_fd, VIDIOC_REQBUFS, &req);
     close(s_bi_fd);
     s_bi_fd = -1;
-    /* The blit of the last frame has already completed (render_task holds the semaphore when it
-     * gets here), so these are safe to release. */
+    /* Wait for the last blit before freeing. This was previously commented as already-complete,
+     * which stopped being true the moment the blit was pipelined: render_task now issues
+     * draw_bitmap and does NOT hold the completion semaphore afterwards, so without this the SPI
+     * could still be reading s_bi_tx[i] as it is freed - a use-after-free that fires precisely
+     * when a USB camera arrives and the built-in preview is torn down. */
+    xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
     for (int i = 0; i < 2; i++) {
         free(s_bi_tx[i]);
         s_bi_tx[i] = NULL;
     }
+    xSemaphoreGive(s_trans_done_sem);
     ESP_LOGI(TAG, "builtin: stopped (%u frames shown)", (unsigned)s_bi_frames);
 }
 #endif /* P2_BUILTIN_CAM */
@@ -2758,6 +2767,19 @@ static void render_task(void *arg)
          * than its own task on purpose - this is the only task allowed to touch s_rgb_buf,
          * s_rgb_tx and the panel, and a second drawer would race the SPI completion semaphore. */
         if (s_cam_kind == CAM_NONE) {
+            /* Debounced. The built-in camera is a fallback and must never compete with the
+             * instrument: starting it eagerly meant it ran all through USB enumeration and after
+             * every brief disconnect, stealing PSRAM bandwidth and PPA time from the thermal
+             * path - which showed up as extra latency on the P2. A device that is about to
+             * enumerate clears CAM_NONE well inside this window. */
+            if (s_bi_fd < 0 && !s_bi_idle_since) {
+                s_bi_idle_since = esp_timer_get_time();
+            }
+            if (s_bi_fd < 0 &&
+                esp_timer_get_time() - s_bi_idle_since < BUILTIN_IDLE_WAIT_US) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
             if (builtin_cam_start()) {
                 if (!bi_shown) {
                     /* Wipe the USB view's side bar and letterbox margins once on entry. */
@@ -2931,10 +2953,13 @@ static void render_task(void *arg)
                 }
                 continue;
             }
-        } else if (bi_shown) {
-            /* A USB camera arrived - hand the panel and the PSRAM back. */
-            bi_shown = false;
-            builtin_cam_stop();
+        } else {
+            s_bi_idle_since = 0;   /* a USB camera is present: re-arm the debounce */
+            if (bi_shown || s_bi_fd >= 0) {
+                /* Hand the panel and the PSRAM back. */
+                bi_shown = false;
+                builtin_cam_stop();
+            }
         }
 #endif
         /* Timeout rather than block forever: with no camera there are no frames, and this is

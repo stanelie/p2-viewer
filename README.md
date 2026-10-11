@@ -619,6 +619,29 @@ before the blit, so the next frame's conversion overlaps the current blit. Stage
 480x320: `ppa_scale` 10.4 ms, `ppa_swap` 3.1 ms, `blit_wait` 14.5 ms - the 307,200-byte blit at
 80 MHz is the remaining ceiling, which is the right place to be bound.
 
+#### The built-in camera must never compete with the instrument
+
+Two regressions came out of the first version of this, both now fixed, both worth keeping in mind
+for anything else that shares the render task:
+
+**A use-after-free on teardown.** `builtin_cam_stop()` frees the two output buffers, and carried a
+comment asserting the last blit had already completed. That was true while the blit was
+synchronous; pipelining it made render_task issue `draw_bitmap` *without* holding the completion
+semaphore afterwards, so the SPI could still be reading `s_bi_tx[i]` as it was freed - firing
+exactly when a USB camera arrived and the preview was torn down. Presented as "worked, then froze
+after a while". The stop path now waits for the blit before freeing.
+
+**Eager start cost the thermal path latency.** The preview started the instant `s_cam_kind` was
+`CAM_NONE`, which includes all of boot before the P2 is detected and every brief disconnect or
+stream renegotiation - so it ran *concurrently* with the thermal stream, taking PSRAM bandwidth
+and PPA time. It now waits `BUILTIN_IDLE_WAIT_US` (3 s) of no USB camera, re-armed whenever one is
+present. A camera about to enumerate clears `CAM_NONE` well inside that window.
+
+**Known residual risk:** esp_video's `DQBUF` blocks with `portMAX_DELAY`, so while render_task
+waits for a built-in frame it cannot notice anything else - and render_task is also what services
+the USB frame queue. Normally that wait is ~23 ms. If the CSI ever stalls the display would hang;
+the proper fix is a helper task feeding render_task through a queue with a timeout.
+
 #### Also
 
 Exposure works (AGC drives the sensor) but only in the binning mode. Note the OV5647 driver

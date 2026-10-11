@@ -2662,6 +2662,7 @@ static void builtin_cam_stop(void)
 static volatile const char *s_render_stage = "init";
 static volatile uint32_t    s_render_laps;
 #define RSTAGE(x) do { s_render_stage = (x); } while (0)
+#define RLAP()    do { s_render_laps++; } while (0)
 
 static void render_stage_task(void *arg)
 {
@@ -2683,6 +2684,7 @@ static void render_stage_task(void *arg)
 }
 #else
 #define RSTAGE(x) do { } while (0)
+#define RLAP()    do { } while (0)
 #endif
 
 #if P2_WIFI_CAM
@@ -3258,7 +3260,7 @@ static void render_task(void *arg)
     int bi_n = 0;
 #endif
     while (true) {
-        s_render_laps++;
+        RLAP();
         RSTAGE("loop top");
 #if P2_BUILTIN_CAM
         /* No USB camera: fall back to the board's own OV5647. Driven from render_task rather

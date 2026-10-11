@@ -83,3 +83,12 @@ CONFIG_ESP_VIDEO_ENABLE_DATA_PREPROCESSING=y
 # from the component's own shipped sc2336_default.json rather than invented.
 CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE=y
 CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH="main/ov5647_ipa.json"
+
+# ---- WiFi via the onboard ESP32-C6 (esp-hosted) ----------------------------------------------
+# Station only: we join the camera's AP, we never host one.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+# WiFi and lwIP buffers go to PSRAM. Without this, bringing the radio up leaves internal RAM
+# fragmented - measured as 181 KB free but a largest contiguous block of only 32 KB - and the
+# LCD's 307,200-byte SPI blit then fails with ESP_ERR_NO_MEM, freezing the picture. The failure
+# is contiguity, not shortage, so raising a buffer count would not have helped.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

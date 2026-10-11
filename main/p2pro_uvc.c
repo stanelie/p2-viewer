@@ -29,7 +29,11 @@
 #include "driver/spi_master.h"
 #include "driver/ppa.h"
 #include "driver/jpeg_decode.h"   /* P4 hardware JPEG: the MJPEG generic path */
-#include "driver/i2c_master.h"
+#include "esp_wifi.h"        /* WiFi earpick camera; the radio lives on the onboard C6 */
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs_flash.h"   /* the WiFi stack needs NVS for calibration data */
+#include "lwip/sockets.h"
 /* Built-in OV5647 on the MIPI-CSI connector, via esp_video's V4L2 layer. */
 #include <fcntl.h>
 #include <unistd.h>
@@ -98,6 +102,33 @@ typedef enum {
  *
  * Shown only while no USB camera is attached. Everything is opened and closed around that, so
  * the buffers are not sitting on PSRAM that the MJPEG path wants. */
+/* ---- WiFi earpick camera -------------------------------------------------------------------
+ * An NK3 / "HNDEC_55-*" otoscope: an OPEN 2.4 GHz access point serving JPEG over UDP. It accepts
+ * exactly ONE client, so a phone sitting on the same AP starves us. Its protocol is NE7, chosen
+ * by gateway address (192.168.1.1) and NOT by the brand string, which claims NE3 and is wrong.
+ *
+ * Preferred over the built-in camera, and only looked for when no USB camera is attached.
+ *
+ * Phase 1 is scan-only on purpose: the P4 has no radio, so the first thing to establish is
+ * whether the onboard C6 answers at all. */
+/* Diagnostic: render_task sets s_render_stage as it moves through the loop, and a separate
+ * low-priority task logs it every 2 s. render_task has several UNBOUNDED waits - esp_video's
+ * DQBUF hardcodes portMAX_DELAY and the SPI completion semaphore has no timeout - so when it
+ * stops producing output the only question that matters is which one it is sitting in.
+ * Observed: all rendering stopped at 4.1 s, right as esp-hosted finished its SDIO init. */
+#define P2_RENDER_STAGE_TRACE 0
+
+#define P2_WIFI_CAM        1
+#define WIFI_CAM_PREFIX    "HNDEC"
+/* Protocol constants, from the NE7 spec in ~/Documents/nk3-scope/NK3_CAMERA_PROTOCOL.md. */
+#define WIFI_CAM_LOCAL_PORT  36123   /* one socket, all traffic; replies demuxed by source port */
+#define WIFI_CAM_DISC_PORT_A 58090   /* silent on this unit, probed anyway - other revisions may */
+#define WIFI_CAM_DISC_PORT_B 46526   /* this is the one that answers */
+#define WIFI_CAM_VIDEO_PORT  44506
+#define WIFI_CAM_IMU_PORT    52219
+#define WIFI_CAM_JPEG_MAX    (64 * 1024)  /* frames measured at 4.5-14 KB; ample */
+#define WIFI_CAM_STALL_MS    2000    /* no video for this long -> re-send the start packet */
+
 #define P2_BUILTIN_CAM 1
 /* TRIED AND REJECTED - kept so it is not tried again. YUV420 out of the ISP is 1.5 bytes/px
  * instead of RGB565's 2, so 25% fewer bytes per frame. It was accepted by the ISP and PPA and
@@ -1634,11 +1665,22 @@ static void draw_crosshair(void)
 /* ---------------- Display bring-up (raw esp_lcd, no LVGL) ---------------- */
 
 /* Runs in ISR context (SPI DMA completion) - keep it to counters only, no logging/printf. */
+/* Strips remaining in the frame currently on the bus; 0 means "single draw". */
+static volatile int s_blit_strips_left;
+static bool s_blit_force_strips;   /* a full-frame transfer has failed: do not keep retrying it */
+static int  s_blit_probe;
+
 static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     (void)io; (void)edata; (void)user_ctx;
     if (s_expect_status_bar_completion) {
         s_expect_status_bar_completion = false;
+        return false;
+    }
+    /* A frame may be sent as several strips (see blit_strips). Only the last one ends the frame:
+     * counting or signalling per strip would inflate the stats and hand the buffer back while
+     * later strips are still queued. */
+    if (s_blit_strips_left > 0 && --s_blit_strips_left > 0) {
         return false;
     }
     int64_t now = esp_timer_get_time();
@@ -1792,6 +1834,91 @@ static bool jpeg_decoder_ensure(int w, int h)
     ESP_LOGI(TAG, "jpeg: decoder up for %dx%d (in %u B, out %u B)",
              w, h, (unsigned)s_jpeg_in_cap, (unsigned)s_jpeg_out_cap);
     return true;
+}
+
+/* Send one frame as a series of row strips.
+ *
+ * Why this exists: esp_lcd never sets SPI_TRANS_DMA_USE_PSRAM, so when the source buffer is in
+ * PSRAM the SPI driver allocates an INTERNAL bounce buffer the size of the whole transfer
+ * (spi_master.c: need_malloc is true for an external pointer without that flag, with mem_cap
+ * MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL). A full-screen 480x320 blit therefore wanted 307,200 bytes
+ * of contiguous internal RAM on EVERY frame. That silently worked only while internal RAM was
+ * near-empty; bringing up esp-hosted for WiFi fragmented it to a 32 KB largest block and every
+ * blit then failed with ESP_ERR_NO_MEM - and because a failed draw produces no completion
+ * callback, render_task blocked on the semaphore forever.
+ *
+ * Splitting the frame caps that bounce at BLIT_STRIP_BYTES regardless of panel size, which also
+ * removes the latent fragility from the thermal and USB paths.
+ *
+ * The caller must already hold s_trans_done_sem; the completion callback releases it once, after
+ * the last strip. */
+#define BLIT_STRIP_BYTES 16384
+
+static esp_err_t blit_strips(int x0, int y0, int x1, int y1, const uint16_t *buf)
+{
+    const int w = x1 - x0;
+    const int h = y1 - y0;
+    if (w <= 0 || h <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Try the whole frame in one transfer first. When internal RAM has a large enough
+     * contiguous block that is strictly better - measured 32.0 fps / 23.7 ms for a single
+     * 480x320 draw against 20.7 fps / 49.5 ms for 16 strips, the difference being 16 bounce
+     * mallocs and 16 SPI setups rather than one. Stripping is the fallback, not the default. */
+    if (!s_blit_force_strips) {
+        s_blit_strips_left = 1;
+        esp_err_t one = esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x1, y1, buf);
+        if (one == ESP_OK) {
+            return ESP_OK;
+        }
+        if (one != ESP_ERR_NO_MEM) {
+            s_blit_strips_left = 0;
+            xSemaphoreGive(s_trans_done_sem);
+            return one;
+        }
+        /* Sticky. Retrying the big allocation every frame is worse than just stripping: the
+         * failed 307 KB heap walk cost more than it saved, measured as 16 fps for retry-every-
+         * frame against 20.7 fps for stripping unconditionally. Re-probed occasionally in case
+         * whatever fragmented the heap goes away. */
+        s_blit_force_strips = true;
+        ESP_LOGW(TAG, "blit: full-frame transfer needs %d bytes of contiguous internal RAM "
+                      "(largest is %u) - switching to strips",
+                 w * h * 2, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    } else if (++s_blit_probe >= 600) {   /* ~every 20 s at 30 fps */
+        s_blit_probe = 0;
+        s_blit_force_strips = false;
+    }
+
+    const size_t row_bytes = (size_t)w * sizeof(uint16_t);
+    int rows = (int)(BLIT_STRIP_BYTES / row_bytes);
+    if (rows < 1) {
+        rows = 1;
+    }
+    if (rows > h) {
+        rows = h;
+    }
+    const int strips = (h + rows - 1) / rows;
+
+    /* Set before the first draw: a completion can fire while we are still queueing. */
+    s_blit_strips_left = strips;
+    esp_err_t ret = ESP_OK;
+    for (int i = 0; i < strips; i++) {
+        const int sy = y0 + i * rows;
+        const int sh = (sy + rows > y1) ? (y1 - sy) : rows;
+        esp_err_t e = esp_lcd_panel_draw_bitmap(s_panel, x0, sy, x1, sy + sh,
+                                                buf + (size_t)(sy - y0) * w);
+        if (e != ESP_OK) {
+            /* Nothing more will complete, so account for the strips that will never report. */
+            ret = e;
+            s_blit_strips_left -= (strips - i);
+            if (s_blit_strips_left <= 0) {
+                s_blit_strips_left = 0;
+                xSemaphoreGive(s_trans_done_sem);
+            }
+            break;
+        }
+    }
+    return ret;
 }
 
 static int ppa_quantized_out(int in_dim, int desired_out)
@@ -2531,6 +2658,375 @@ static void builtin_cam_stop(void)
 }
 #endif /* P2_BUILTIN_CAM */
 
+#if P2_RENDER_STAGE_TRACE
+static volatile const char *s_render_stage = "init";
+static volatile uint32_t    s_render_laps;
+#define RSTAGE(x) do { s_render_stage = (x); } while (0)
+
+static void render_stage_task(void *arg)
+{
+    uint32_t last = 0;
+    const char *last_stage = NULL;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        const uint32_t laps = s_render_laps;
+        const char *st = (const char *)s_render_stage;
+        if (laps == last && st == last_stage) {
+            ESP_LOGE(TAG, "render STUCK in \"%s\" (laps=%u, unchanged 2s)",
+                     st, (unsigned)laps);
+        } else {
+            ESP_LOGI(TAG, "render ok: +%u laps, now \"%s\"", (unsigned)(laps - last), st);
+        }
+        last = laps;
+        last_stage = st;
+    }
+}
+#else
+#define RSTAGE(x) do { } while (0)
+#endif
+
+#if P2_WIFI_CAM
+static bool s_wifi_inited;
+/* Two slots so the task can assemble the next frame while render_task decodes the current one. */
+static uint8_t *s_wifi_jpeg[2];
+static size_t   s_wifi_jpeg_len[2];
+static QueueHandle_t s_wifi_frame_q;      /* carries the ready slot index, depth 1 */
+static volatile bool s_wifi_active;       /* a frame has arrived recently */
+static uint32_t s_wifi_frames, s_wifi_dropped;
+/* On-panel geometry, recomputed when the decoded frame size changes. The spec warns not to
+ * hardcode 432x432: the NE3 variant of this camera family is 640x360, so the dimensions are read
+ * from the JPEG header instead. */
+static int s_wc_sw, s_wc_sh, s_wc_w, s_wc_h, s_wc_x, s_wc_y;
+
+/* Bring the radio up once. esp_wifi_remote forwards every call to the C6 over esp-hosted, so a
+ * failure here is most likely the C6 not running the hosted slave firmware rather than anything
+ * wrong with these calls. */
+static bool wifi_cam_init(void)
+{
+    if (s_wifi_inited) {
+        return true;
+    }
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi: nvs_flash_init: %s", esp_err_to_name(err));
+        return false;
+    }
+    if ((err = esp_netif_init()) != ESP_OK) {
+        ESP_LOGE(TAG, "wifi: esp_netif_init: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "wifi: event loop: %s", esp_err_to_name(err));
+        return false;
+    }
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    if ((err = esp_wifi_init(&cfg)) != ESP_OK) {
+        ESP_LOGE(TAG, "wifi: esp_wifi_init: %s - is the C6 running esp-hosted slave firmware?",
+                 esp_err_to_name(err));
+        return false;
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    if ((err = esp_wifi_start()) != ESP_OK) {
+        ESP_LOGE(TAG, "wifi: esp_wifi_start: %s", esp_err_to_name(err));
+        return false;
+    }
+    s_wifi_inited = true;
+    ESP_LOGI(TAG, "wifi: radio up via the onboard C6");
+    return true;
+}
+
+/* Scan and report every AP. Returns true if one matches WIFI_CAM_PREFIX, copying its SSID out. */
+static bool wifi_cam_scan(char *ssid_out, size_t ssid_len)
+{
+    wifi_scan_config_t scan = { .show_hidden = false };
+    esp_err_t err = esp_wifi_scan_start(&scan, true);   /* blocking */
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi: scan failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) {
+        ESP_LOGI(TAG, "wifi: no APs in range");
+        return false;
+    }
+    wifi_ap_record_t *recs = calloc(n, sizeof(wifi_ap_record_t));
+    if (!recs) {
+        return false;
+    }
+    uint16_t got = n;
+    esp_wifi_scan_get_ap_records(&got, recs);
+    bool found = false;
+    for (int i = 0; i < got; i++) {
+        const char *ss = (const char *)recs[i].ssid;
+        const bool match = (strncmp(ss, WIFI_CAM_PREFIX, strlen(WIFI_CAM_PREFIX)) == 0);
+        ESP_LOGI(TAG, "wifi:   %-32s ch%-3d rssi %-5d auth %d%s",
+                 ss, recs[i].primary, recs[i].rssi, (int)recs[i].authmode,
+                 match ? "   <== earpick camera" : "");
+        if (match && !found) {
+            found = true;
+            if (ssid_out) {
+                strlcpy(ssid_out, ss, ssid_len);
+            }
+        }
+    }
+    free(recs);
+    return found;
+}
+
+/* Join the camera's open AP and wait for DHCP. Returns the assigned gateway, which for NE7 is
+ * the camera itself - the spec says to select the protocol by gateway address, not by the brand
+ * string, which misreports NE3. */
+static bool wifi_cam_connect(const char *ssid, esp_ip4_addr_t *gw_out)
+{
+    wifi_config_t wc = { 0 };
+    strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* the camera AP has no password */
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi: connect to \"%s\" failed: %s", ssid, esp_err_to_name(err));
+        return false;
+    }
+
+    /* Poll for an address rather than wiring up an event handler: this runs in its own task and
+     * has nothing else to do until the lease arrives. */
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip = { 0 };
+    for (int i = 0; i < 100; i++) {           /* up to ~10 s */
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+            ESP_LOGI(TAG, "wifi: joined \"%s\"  ip " IPSTR "  gw " IPSTR,
+                     ssid, IP2STR(&ip.ip), IP2STR(&ip.gw));
+            if (gw_out) {
+                *gw_out = ip.gw;
+            }
+            return true;
+        }
+    }
+    ESP_LOGW(TAG, "wifi: no DHCP lease from \"%s\"", ssid);
+    return false;
+}
+
+/* The NE7 video/IMU session. Owns one UDP socket; returns when the stream dies so the caller can
+ * rescan and start over. */
+static void wifi_cam_session(esp_ip4_addr_t gw)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "wifi: socket failed");
+        return;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in local = {
+        .sin_family = AF_INET,
+        .sin_port = htons(WIFI_CAM_LOCAL_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) {
+        ESP_LOGE(TAG, "wifi: bind :%d failed", WIFI_CAM_LOCAL_PORT);
+        close(fd);
+        return;
+    }
+
+    /* Discovery: a 4-byte probe to both documented ports. The reply's SOURCE address is the
+     * camera, which is more trustworthy than hardcoding 192.168.1.1. */
+    struct sockaddr_in cam = { .sin_family = AF_INET, .sin_addr.s_addr = gw.addr };
+    const uint8_t probe[4] = { 0x66, 0x39, 0x01, 0x01 };
+    struct sockaddr_in bcast = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = (gw.addr & htonl(0xFFFFFF00)) | htonl(0xFF),
+    };
+    for (int port = 0; port < 2; port++) {
+        bcast.sin_port = htons(port ? WIFI_CAM_DISC_PORT_B : WIFI_CAM_DISC_PORT_A);
+        sendto(fd, probe, sizeof(probe), 0, (struct sockaddr *)&bcast, sizeof(bcast));
+    }
+
+    const uint8_t start_imu[3]   = { 0x86, 0x06, 0x01 };
+    const uint8_t start_video[2] = { 0x20, 0x36 };
+    cam.sin_port = htons(WIFI_CAM_IMU_PORT);
+    sendto(fd, start_imu, sizeof(start_imu), 0, (struct sockaddr *)&cam, sizeof(cam));
+    cam.sin_port = htons(WIFI_CAM_VIDEO_PORT);
+    sendto(fd, start_video, sizeof(start_video), 0, (struct sockaddr *)&cam, sizeof(cam));
+    ESP_LOGI(TAG, "wifi: handshake sent to " IPSTR, IP2STR(&gw));
+
+    /* Reassembly. Chunks must arrive in order: we append at a running offset and drop the frame
+     * on any gap. That is far simpler than holding per-chunk buffers, and dropping incomplete
+     * frames is what the spec prescribes anyway - s_wifi_dropped makes the cost visible, so if
+     * reordering turns out to matter on this link the counter will say so. */
+    uint8_t *asm_buf = heap_caps_malloc(WIFI_CAM_JPEG_MAX, MALLOC_CAP_SPIRAM);
+    if (!asm_buf) {
+        ESP_LOGE(TAG, "wifi: assembly buffer alloc failed");
+        close(fd);
+        return;
+    }
+    int      cur_frame = -1;
+    uint32_t asm_len = 0;
+    uint8_t  next_chunk = 1;
+    bool     frame_bad = false;
+    int      slot = 0;
+
+    int64_t last_video_us = esp_timer_get_time();
+    int64_t last_imu_tx_us = 0;
+    uint8_t pkt[1600];
+
+    while (true) {
+        struct sockaddr_in from;
+        socklen_t flen = sizeof(from);
+        int n = recvfrom(fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &flen);
+        const int64_t now = esp_timer_get_time();
+
+        /* Keepalive. The camera stops sending if it decides nobody is listening. */
+        if (now - last_video_us > WIFI_CAM_STALL_MS * 1000) {
+            cam.sin_port = htons(WIFI_CAM_VIDEO_PORT);
+            sendto(fd, start_video, sizeof(start_video), 0, (struct sockaddr *)&cam, sizeof(cam));
+            last_video_us = now;
+            s_wifi_active = false;
+            ESP_LOGW(TAG, "wifi: video stalled, re-sent start");
+            if (!s_wifi_frames) {
+                /* Never got a single frame: most likely another client (a phone) holds the
+                 * camera, which accepts exactly one. Give up so the caller can rescan. */
+                static int giveup = 0;
+                if (++giveup >= 5) {
+                    ESP_LOGE(TAG, "wifi: no frames at all - is a phone connected to the camera?");
+                    break;
+                }
+            }
+        }
+        if (now - last_imu_tx_us > 1000000) {
+            cam.sin_port = htons(WIFI_CAM_IMU_PORT);
+            sendto(fd, start_imu, sizeof(start_imu), 0, (struct sockaddr *)&cam, sizeof(cam));
+            last_imu_tx_us = now;
+        }
+        if (n < 4) {
+            continue;
+        }
+        if (ntohs(from.sin_port) != WIFI_CAM_VIDEO_PORT) {
+            continue;   /* IMU and discovery replies are not used yet */
+        }
+
+        const uint8_t fnum = pkt[0], flags = pkt[1], cnum = pkt[2];
+        const bool last = (flags & 1) != 0;
+        uint8_t *payload = pkt + 4;
+        int plen = n - 4;
+        if (last && plen >= 5) {
+            plen -= 5;   /* a trailer, not image data */
+        }
+
+        if (fnum != cur_frame) {
+            cur_frame = fnum;
+            asm_len = 0;
+            next_chunk = 1;
+            frame_bad = false;
+        }
+        if (cnum != next_chunk) {
+            frame_bad = true;   /* gap or reorder: this frame is unusable */
+        }
+        if (!frame_bad && plen > 0 && asm_len + plen + 2 <= WIFI_CAM_JPEG_MAX) {
+            memcpy(asm_buf + asm_len, payload, plen);
+            asm_len += plen;
+            next_chunk++;
+        }
+
+        if (!last) {
+            continue;
+        }
+        last_video_us = now;
+        if (frame_bad || asm_len < 4 || asm_buf[0] != 0xFF || asm_buf[1] != 0xD8) {
+            s_wifi_dropped++;
+            continue;
+        }
+        /* THE EOI TRAP: this camera omits FFD9 entirely. Without appending it the hardware
+         * decoder has no end marker. file(1) and lenient decoders will accept the frame anyway,
+         * so a "valid JPEG" is not evidence of correctness here. */
+        asm_buf[asm_len++] = 0xFF;
+        asm_buf[asm_len++] = 0xD9;
+
+        if (s_wifi_jpeg[slot] && uxQueueMessagesWaiting(s_wifi_frame_q) == 0) {
+            memcpy(s_wifi_jpeg[slot], asm_buf, asm_len);
+            s_wifi_jpeg_len[slot] = asm_len;
+            xQueueOverwrite(s_wifi_frame_q, &slot);
+            slot ^= 1;
+            s_wifi_frames++;
+            s_wifi_active = true;
+        } else {
+            s_wifi_dropped++;   /* render_task has not consumed the previous one yet */
+        }
+    }
+
+    free(asm_buf);
+    close(fd);
+    s_wifi_active = false;
+    ESP_LOGW(TAG, "wifi: session ended (%u frames, %u dropped)",
+             (unsigned)s_wifi_frames, (unsigned)s_wifi_dropped);
+}
+
+static void wifi_cam_task(void *arg)
+{
+    /* Do NOT bring the radio up until it is actually wanted. esp-hosted's SDIO init fragments
+     * internal RAM, which forces the LCD blit into strips (see blit_strips) and costs real
+     * framerate: the built-in camera measured 32.0 fps / 23.7 ms with the radio down against
+     * 20.7 fps / 49.5 ms with it up. A USB camera is the instrument and must not pay that, so
+     * the radio stays off entirely while one is attached - which also matches the spec for this
+     * feature: the WiFi camera is only for when nothing is on USB. */
+    int idle_ticks = 0;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        idle_ticks = (s_cam_kind == CAM_NONE) ? idle_ticks + 1 : 0;
+        if (idle_ticks >= 10) {   /* ~5 s with nothing on USB */
+            break;
+        }
+    }
+    if (!wifi_cam_init()) {
+        ESP_LOGW(TAG, "wifi: unavailable, not retrying");
+        vTaskDelete(NULL);
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        s_wifi_jpeg[i] = heap_caps_malloc(WIFI_CAM_JPEG_MAX, MALLOC_CAP_SPIRAM);
+    }
+    s_wifi_frame_q = xQueueCreate(1, sizeof(int));
+    if (!s_wifi_jpeg[0] || !s_wifi_jpeg[1] || !s_wifi_frame_q) {
+        ESP_LOGE(TAG, "wifi: buffer alloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (true) {
+        /* Only look while no USB camera is attached - that is the instrument and it wins. */
+        if (s_cam_kind != CAM_NONE) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        char ssid[33] = { 0 };
+        if (!wifi_cam_scan(ssid, sizeof(ssid))) {
+            vTaskDelay(pdMS_TO_TICKS(8000));
+            continue;
+        }
+        ESP_LOGW(TAG, "wifi: earpick camera present: \"%s\", connecting", ssid);
+        esp_ip4_addr_t gw = { 0 };
+        if (wifi_cam_connect(ssid, &gw) && gw.addr != 0) {
+            wifi_cam_session(gw);
+        }
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+#endif /* P2_WIFI_CAM */
+
 /* ---------------- UVC callbacks ---------------- */
 
 /* Frames are queued by the UVC driver task and consumed by render_task, so a disconnect can
@@ -2762,10 +3258,121 @@ static void render_task(void *arg)
     int bi_n = 0;
 #endif
     while (true) {
+        s_render_laps++;
+        RSTAGE("loop top");
 #if P2_BUILTIN_CAM
         /* No USB camera: fall back to the board's own OV5647. Driven from render_task rather
          * than its own task on purpose - this is the only task allowed to touch s_rgb_buf,
          * s_rgb_tx and the panel, and a second drawer would race the SPI completion semaphore. */
+        if (s_cam_kind == CAM_NONE && s_wifi_active) {
+            /* WiFi earpick camera: preferred over the built-in one. Only reachable with no USB
+             * camera attached, and the built-in preview is torn down first so the two never
+             * compete for PSRAM bandwidth and PPA time. */
+            if (bi_shown || s_bi_fd >= 0) {
+                bi_shown = false;
+                builtin_cam_stop();
+            }
+            int slot = 0;
+            RSTAGE("wifi frame wait");
+            if (xQueueReceive(s_wifi_frame_q, &slot, pdMS_TO_TICKS(100)) != pdPASS) {
+                continue;
+            }
+            const uint8_t *jb = s_wifi_jpeg[slot];
+            const size_t   jl = s_wifi_jpeg_len[slot];
+
+            jpeg_decode_picture_info_t pi = { 0 };
+            if (jpeg_decoder_get_info(jb, jl, &pi) != ESP_OK || !pi.width || !pi.height) {
+                s_wifi_dropped++;
+                continue;
+            }
+            if ((int)pi.width != s_wc_sw || (int)pi.height != s_wc_sh) {
+                s_wc_sw = pi.width;
+                s_wc_sh = pi.height;
+                fit_preserving_aspect(s_wc_sw, s_wc_sh, s_disp_w, s_disp_h, &s_wc_w, &s_wc_h);
+                s_wc_x = (s_disp_w - s_wc_w) / 2;
+                s_wc_y = (s_disp_h - s_wc_h) / 2;
+                ESP_LOGI(TAG, "wifi: %dx%d JPEG -> %dx%d at (%d,%d)",
+                         s_wc_sw, s_wc_sh, s_wc_w, s_wc_h, s_wc_x, s_wc_y);
+                /* New geometry: wipe the panel so nothing of the previous source survives. */
+                xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
+                memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
+                s_pending_arrival_us = esp_timer_get_time();
+                esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+                last_kind = CAM_NONE;
+                continue;
+            }
+            if (!jpeg_decoder_ensure(s_wc_sw, s_wc_sh) || jl > s_jpeg_in_cap) {
+                s_wifi_dropped++;
+                continue;
+            }
+            const int64_t t0 = esp_timer_get_time();
+            memcpy(s_jpeg_in, jb, jl);
+            uint32_t out_len = 0;
+            const jpeg_decode_cfg_t dcfg = {
+                .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+                .rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
+                .conv_std      = JPEG_YUV_RGB_CONV_STD_BT601,
+            };
+            if (jpeg_decoder_process(s_jpeg_dec, &dcfg, s_jpeg_in, jl,
+                                     s_jpeg_out, s_jpeg_out_cap, &out_len) != ESP_OK) {
+                s_wifi_dropped++;
+                continue;
+            }
+            xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
+            const ppa_srm_oper_config_t wscale = {
+                .in = {
+                    .buffer = s_jpeg_out,
+                    .pic_w = s_wc_sw, .pic_h = s_wc_sh,
+                    .block_w = s_wc_sw, .block_h = s_wc_sh,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .out = {
+                    .buffer = s_rgb_buf,
+                    .buffer_size = ppa_out_bytes(s_wc_w, s_wc_h),
+                    .pic_w = s_wc_w, .pic_h = s_wc_h,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+                .scale_x = (float)s_wc_w / s_wc_sw,
+                .scale_y = (float)s_wc_h / s_wc_sh,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            ppa_do_scale_rotate_mirror(s_ppa_client, &wscale);
+            const ppa_srm_oper_config_t wswap = {
+                .in = {
+                    .buffer = s_rgb_buf,
+                    .pic_w = s_wc_w, .pic_h = s_wc_h,
+                    .block_w = s_wc_w, .block_h = s_wc_h,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .out = {
+                    .buffer = s_rgb_tx,
+                    .buffer_size = ppa_out_bytes(s_wc_w, s_wc_h),
+                    .pic_w = s_wc_w, .pic_h = s_wc_h,
+                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                },
+                .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+                .scale_x = 1.0f, .scale_y = 1.0f,
+                .byte_swap = true,
+                .mode = PPA_TRANS_MODE_BLOCKING,
+            };
+            ppa_do_scale_rotate_mirror(s_ppa_client, &wswap);
+
+            s_pending_arrival_us = t0;
+            esp_lcd_panel_draw_bitmap(s_panel, s_wc_x, s_wc_y,
+                                      s_wc_x + s_wc_w, s_wc_y + s_wc_h, s_rgb_tx);
+            int64_t wnow = esp_timer_get_time();
+            if (wnow - s_last_report_us >= 2000000) {
+                ESP_LOGI(TAG, "wifi displayed=%d avg_e2e=%" PRId64 "us frames=%u dropped=%u",
+                         s_frames_rendered,
+                         s_frames_rendered ? s_e2e_time_sum_us / s_frames_rendered : 0,
+                         (unsigned)s_wifi_frames, (unsigned)s_wifi_dropped);
+                s_frames_rendered = 0;
+                s_e2e_time_sum_us = 0;
+                s_last_report_us = wnow;
+            }
+            continue;
+        }
         if (s_cam_kind == CAM_NONE) {
             /* Debounced. The built-in camera is a fallback and must never compete with the
              * instrument: starting it eagerly meant it ran all through USB enumeration and after
@@ -2796,6 +3403,7 @@ static void render_task(void *arg)
                     .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP,
                 };
                 const int64_t t_dq0 = esp_timer_get_time();
+                RSTAGE("builtin DQBUF");
                 if (ioctl(s_bi_fd, VIDIOC_DQBUF, &buf) != 0) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     continue;
@@ -2896,13 +3504,31 @@ static void render_task(void *arg)
                 /* Wait for the PREVIOUS blit only now - the conversion above has already
                  * overlapped it. This is the whole point of the second tx buffer. */
                 const int64_t t_wait0 = esp_timer_get_time();
+                RSTAGE("builtin blit wait");
                 xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
                 bi_wait_sum += esp_timer_get_time() - t_wait0;
 
                 s_pending_arrival_us = t0;
-                esp_lcd_panel_draw_bitmap(s_panel, s_bi_x, s_bi_y,
-                                          s_bi_x + s_bi_w, s_bi_y + s_bi_h,
-                                          s_bi_tx[s_bi_tx_i]);
+                /* The return value matters: on failure NO completion callback fires, so the
+                 * semaphore is never given and the next iteration blocks forever. That is
+                 * exactly how this froze when WiFi came up - measured as
+                 * "render STUCK in builtin blit wait". Hand the token back ourselves. */
+                esp_err_t de = blit_strips(s_bi_x, s_bi_y, s_bi_x + s_bi_w, s_bi_y + s_bi_h,
+                                           s_bi_tx[s_bi_tx_i]);
+                if (de != ESP_OK) {
+                    static int warned = 0;
+                    if (warned < 3) {
+                        warned++;
+                        ESP_LOGE(TAG, "builtin: draw_bitmap failed: %s | INTERNAL free %u "
+                                      "largest %u | DMA free %u largest %u | blit %d bytes",
+                                 esp_err_to_name(de),
+                                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                                 s_bi_w * s_bi_h * 2);
+                    }
+                }
                 s_bi_tx_i ^= 1;
                 s_bi_frames++;
                 int64_t now = esp_timer_get_time();
@@ -2965,6 +3591,7 @@ static void render_task(void *arg)
         /* Timeout rather than block forever: with no camera there are no frames, and this is
          * the only task allowed to draw, so without waking up periodically the "no camera"
          * state could never reach the screen. */
+        RSTAGE("usb frame wait");
         if (xQueueReceive(s_frame_queue, &qf, pdMS_TO_TICKS(500)) != pdPASS) {
             /* Enumerated but no frames: a brief gap is just the FFC shutter (~0.5-1s), so only
              * treat a long silence as a stalled stream worth renegotiating. */
@@ -4185,6 +4812,12 @@ void app_main(void)
     xTaskCreatePinnedToCore(render_task, "render", 6144, NULL, USB_HOST_PRIORITY - 1, NULL, 1);
 
     /* Everything the streaming/render path touches now exists; let the streaming task proceed. */
+#if P2_RENDER_STAGE_TRACE
+    xTaskCreate(render_stage_task, "rstage", 3072, NULL, 1, NULL);
+#endif
+#if P2_WIFI_CAM
+    xTaskCreate(wifi_cam_task, "wificam", 4096, NULL, 3, NULL);
+#endif
     BOOT_MARK("app_main done, releasing streaming task");
     xSemaphoreGive(s_buffers_ready);
 }

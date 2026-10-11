@@ -545,6 +545,62 @@ gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 
 microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
 within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
 
+### WiFi earpick camera (NK3 / HNDEC, NE7) - in progress
+
+An NK3 "earpick" otoscope: an OPEN 2.4 GHz access point serving JPEG over UDP, protocol spec in
+`~/Documents/nk3-scope/NK3_CAMERA_PROTOCOL.md`. Preferred over the built-in camera, used only when
+no USB camera is attached.
+
+**Working so far:** the radio comes up on the onboard ESP32-C6 via `esp_wifi_remote` + `esp_hosted`
+(the P4 has no radio of its own), the AP is found by SSID prefix, and the join succeeds -
+`ip 192.168.1.100 gw 192.168.1.1`, where the **gateway is what identifies NE7**; the brand string
+reports NE3 and is wrong. Handshake (`66 39 01 01` discovery, then `86 06 01` and `20 36`) is sent.
+Video reassembly, the 5-byte trailer, the missing `FF D9`, and hardware JPEG decode are
+implemented but **not yet verified** - the camera's battery went flat before a frame arrived.
+
+The app partition grew 1MB -> 3MB for the WiFi stack, which moves `ffc` and `storage`: a stored
+flat-field table is discarded once on update.
+
+### The LCD blit was doing a 307 KB internal malloc on every frame
+
+Bringing WiFi up exposed a latent bug in **every** display path, including the thermal one.
+
+`esp_lcd` never sets `SPI_TRANS_DMA_USE_PSRAM`. The SPI driver therefore treats a PSRAM source
+buffer as needing a bounce (`spi_master.c`: `need_malloc` is true for an external pointer without
+that flag, allocated `MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL`), so a full-screen 480x320 blit asked for
+**307,200 bytes of contiguous internal RAM every frame**. That worked purely because internal RAM
+was near-empty. esp-hosted's SDIO init fragments it to a **32 KB** largest block, after which every
+blit returned `ESP_ERR_NO_MEM`.
+
+And a failed draw produces **no completion callback**, so render_task blocked on the semaphore
+forever - diagnosed with a stage trace plus a watcher task:
+
+```
+render STUCK in "builtin blit wait" (laps=63, unchanged 2s)
+builtin: draw_bitmap failed: ESP_ERR_NO_MEM | INTERNAL free 181983 largest 32768
+```
+
+Fixes: the draw return value is checked and the semaphore handed back on failure (no more hang),
+and `blit_strips()` splits a frame into `BLIT_STRIP_BYTES` strips so the bounce is bounded
+regardless of panel size. Measured:
+
+| regime | fps | e2e |
+|---|---|---|
+| single full-frame draw | **30-32** | 23.7 ms |
+| 16 strips | 20.7 | 49.5 ms |
+| retry the full draw every frame, then strip | 16 | 64 ms |
+
+So stripping is the **fallback, not the default**, and the fallback is **sticky** - retrying the
+307 KB allocation every frame cost more than it saved. It re-probes every ~600 frames in case the
+heap recovers.
+
+`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` was tried and changed nothing: the fragmentation comes
+from esp-hosted's SDIO init, not from WiFi/lwIP buffers. The failure is contiguity, not shortage.
+
+**WiFi init is deferred** until no USB camera has been present for ~5 s, so with the P2 attached
+the radio never starts, internal RAM is never fragmented, and the instrument keeps its full
+framerate.
+
 ### Built-in OV5647: shown when no USB camera is attached
 
 The board carries an OV5647 on its MIPI-CSI connector, and it answers at SCCB address **0x36 on

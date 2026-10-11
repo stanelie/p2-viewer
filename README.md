@@ -642,6 +642,45 @@ waits for a built-in frame it cannot notice anything else - and render_task is a
 the USB frame queue. Normally that wait is ~23 ms. If the CSI ever stalls the display would hang;
 the proper fix is a helper task feeding render_task through a queue with a timeout.
 
+#### Auto white balance needs a JSON section AND a patched component
+
+Two separate things had to be fixed, and neither is obvious:
+
+**1. The algorithm is inert without configuration.** `CONFIG_ESP_IPA_AWB_ALGORITHM` defaults to
+`y`, but AWB does nothing unless the sensor's IPA JSON has an `"awb"` section - and the
+component's `ov5647_default.json` ships `adn`/`aen`/`ian`/`acc` only. That is exactly why exposure
+worked and white balance did not. `main/ov5647_ipa.json` is that default plus an AWB block,
+selected with `CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE`.
+
+**The `range` sub-object is not optional**, even though the shipped `sc2336_default.json` omits
+it. esp_video computes the white patch as
+`luminance.max = green_max * (1 + rg_max + bg_max)`, and the AWB control defaults to all zeros, so
+without `range` the white patch collapses, no pixel can ever qualify as a white point, and the
+gains settle somewhere arbitrary - observed on hardware as a fixed purple cast that never
+corrects. Values come from the esp_ipa README's worked example. `green_luma_env` / `_init` /
+`_step_ratio` are deliberately omitted: they name a variable the OV5647's `ian` section does not
+define (it has `luma.ae` only).
+
+**2. An upstream bug that only bites chip rev >= 3.0.** `isp_start_awb()` and
+`isp_reconfigure_awb()` declare `esp_isp_awb_config_t awb_config;` **uninitialised**, and
+`isp_init_awb_param()` fills only `.window` - never `.subwindow`. `esp_driver_isp` validates the
+subwindow against the window *only* on rev >= 3.0, so on our rev v3.2 the check runs against stack
+garbage, AWB fails to start and takes `STREAMON` down with it:
+
+```
+ISP_AWB: s_esp_isp_awb_config_hardware(90): subwindow exceeds window range
+isp_video: isp_start_awb(622): failed to new AWB
+builtin: STREAMON failed
+```
+
+Still present in 0.9.1. Because `managed_components/` is gitignored and gets recreated, the fix is
+**not** a silent hand-edit: run `./tools/patch_managed_components.sh` after a fresh clone or
+whenever dependencies are re-fetched. It is idempotent and explains itself.
+
+Current state: colour is much better, but adaptation is slow. `min_red_gain_step` /
+`min_blue_gain_step` (0.034) gate how readily gains move; Waveshare ship a hand-tuned
+`ov5647_custom.json` in their `12_esp32-p4-eye` example if it ever needs to be better.
+
 #### Also
 
 Exposure works (AGC drives the sensor) but only in the binning mode. Note the OV5647 driver

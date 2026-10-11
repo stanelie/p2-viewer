@@ -75,3 +75,11 @@ CONFIG_CAMERA_OV5647_MIPI_RAW10_1280x960_BINNING_45FPS=y
 # PPA's buffer_size alignment stays correct whatever this is set to.
 # Present from esp_video 0.9.0 on; Waveshare's own camera demo enables it.
 CONFIG_ESP_VIDEO_ENABLE_DATA_PREPROCESSING=y
+# ---- Auto white balance for the built-in OV5647 ----------------------------------------------
+# The AWB algorithm is compiled in (CONFIG_ESP_IPA_AWB_ALGORITHM defaults y) but is INERT without
+# an "awb" section in the sensor's IPA JSON - and the component's ov5647_default.json has none
+# (it ships adn/aen/ian/acc only), which is why exposure worked and white balance did not.
+# main/ov5647_ipa.json is that default file plus the AWB block, with the three parameters taken
+# from the component's own shipped sc2336_default.json rather than invented.
+CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE=y
+CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH="main/ov5647_ipa.json"

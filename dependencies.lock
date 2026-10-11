@@ -30,7 +30,7 @@ dependencies:
     - esp32p4
     version: 1.0.0
   espressif/esp_h264:
-    component_hash: 3d60078419ceac61cd87579664ae6a5a9b9a42d6f2edf4e23d753af8d2a67da9
+    component_hash: fa5daaebc8a304f0b79bc57e51aab43e0a03eabc2ba3865bff4063c56b5d4564
     dependencies:
     - name: idf
       require: private
@@ -38,11 +38,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    targets:
-    - esp32s3
-    - esp32s31
-    - esp32p4
-    version: 1.4.1
+    version: 1.0.4
   espressif/esp_ipa:
     component_hash: 854ba797f5cd5a49b739e2126287683605ed68f474a3a931b32d56dee2353d59
     dependencies:
@@ -114,7 +110,7 @@ dependencies:
       type: service
     version: 0.0.9
   espressif/esp_video:
-    component_hash: d427abfc498c9e4173e2a1f7424bb19dc109e9d6e0096c4dad75cfdc444195cb
+    component_hash: 9731bd1c7b54cf54829800f049d058fc0907493867b0373bcd2d23852a305b14
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -127,7 +123,7 @@ dependencies:
     - name: espressif/esp_h264
       registry_url: https://components.espressif.com
       require: private
-      version: '>=1.0.3'
+      version: 1.0.4
     - name: espressif/esp_ipa
       registry_url: https://components.espressif.com
       require: private
@@ -140,7 +136,7 @@ dependencies:
       type: service
     targets:
     - esp32p4
-    version: 0.9.0
+    version: 0.9.1
   espressif/usb:
     component_hash: 99eee72ea224d9117d4c342442717a1f20bf8112e2ab5d7d7038b827874f4c92
     dependencies:
@@ -193,6 +189,6 @@ direct_dependencies:
 - espressif/usb
 - espressif/usb_host_uvc
 - idf
-manifest_hash: 7cc0b31acb120610bded94aba3068a44fa249c4c87053153ca9563ae8b719064
+manifest_hash: 52a79d9a1d05d047b021dd2eeec2e4a1230f490f3d0d5f645ef976a69853d5f5
 target: esp32p4
 version: 2.0.0

@@ -13,4 +13,4 @@ dependencies:
   # Built-in OV5647 on the board's MIPI-CSI connector. 0.8.x is the branch for IDF < 6.0
   # (Waveshare's own 09_video_lcd_display example pins the same range).
   esp_video:
-    version: "==0.9.0"
+    version: "==0.9.1"

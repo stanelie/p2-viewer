@@ -1,0 +1,223 @@
+    : 0x03 (2048 Byte)
+I (80) hex_psram: BitMode      : 0x01 (X16 Mode)
+I (86) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)
+I (91) hex_psram: DriveStrength: 0x00 (1/1)
+I (96) MSPI Timing: Enter psram timing tuning
+I (256) esp_psram: Found 32MB PSRAM device
+I (256) esp_psram: Speed: 200MHz
+I (257) hex_psram: psram CS IO is dedicated
+I (258) cpu_start: Multicore app
+I (273) cpu_start: GPIO 38 and 37 are used as console UART I/O pins
+I (274) cpu_start: Pro cpu start user code
+I (274) cpu_start: cpu freq: 400000000 Hz
+I (279) app_init: Application information:
+I (283) app_init: Project name:     p2pro_uvc
+I (288) app_init: App version:      v1.1.0-3-g7c60543-dirty
+I (295) app_init: Compile time:     Oct 11 2026 10:36:20
+I (301) app_init: ELF file SHA256:  ea26b739c...
+I (306) app_init: ESP-IDF:          v5.5.5
+I (311) efuse_init: Min chip rev:     v3.1
+I (316) efuse_init: Max chip rev:     v3.99 
+I (321) efuse_init: Chip rev:         v3.2
+I (325) heap_init: Initializing. RAM available for dynamic allocation:
+I (333) heap_init: At 4FF3D6A0 len 0007D920 (502 KiB): RETENT_RAM
+I (339) heap_init: At 4FFBAFC0 len 00004BF0 (18 KiB): RAM
+I (346) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM
+I (352) heap_init: At 30100248 len 00001DB8 (7 KiB): SPM
+I (358) esp_psram: Adding pool of 32768K of PSRAM memory to heap allocator
+I (366) spi_flash: detected chip: generic
+I (370) spi_flash: flash io: dio
+I (374) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (381) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (389) main_task: Started on CPU0
+I (409) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (409) main_task: Calling app_main()
+W (409) p2pro_uvc: boot    52 ms | usb: installing host
+I (419) p2pro_uvc: Installing USB Host (native HS OTG port)
+W (449) p2pro_uvc: boot    86 ms | usb: host installed, installing uvc driver
+I (449) p2pro_uvc: Installing UVC host driver
+I (449) p2pro_uvc: Waiting for P2 Pro to enumerate...
+W (449) p2pro_uvc: boot    93 ms | app_main entered
+W (459) p2pro_uvc: boot   100 ms | lcd: spi bus + panel_io ready
+I (459) st7796: version: 1.5.0
+I (469) st7796_general: LCD panel create success, version: 1.5.0
+W (609) p2pro_uvc: boot   246 ms | lcd: panel_reset done
+W (709) p2pro_uvc: boot   346 ms | lcd: panel_init done
+W (739) p2pro_uvc: boot   381 ms | lcd: full-screen black fill drained
+I (739) p2pro_uvc: Display initialized (logical 480x320, rotation=90 mirror_h=1 mirror_v=0, 80MHz SPI)
+I (749) p2pro_uvc: Geometry: image 416x312 at (0,0) [PPA-quantized], status bar 320 rows at y=312
+I (759) p2pro_uvc: Side bar: 64x320 at (416,0); unused strip 416x8 under the image
+I (759) p2pro_uvc: Frame buffer 416x312 (image 312 rows + 0 rows under it)
+W (769) p2pro_uvc: boot   413 ms | display_init returned
+W (779) p2pro_uvc: boot   419 ms | buffers + PPA client ready
+I (789) p2pro_uvc: power: PWRON cfg 0x00 -> 0x00 (irq 1s, hw off 4s backstop)
+W (809) p2pro_uvc: boot   447 ms | app_main done, releasing streaming task
+I (809) main_task: Returned from app_main()
+I (3809) ov5647: Detected Camera sensor PID=0x5647
+D (3869) ISP: version: 0.9.0
+D (3869) ISP: driver:  MIPI-CSI
+D (3869) ISP: card:    MIPI-CSI
+D (3869) ISP: bus:     esp32p4:MIPI-CSI
+D (3869) ISP: capabilities:
+D (3869) ISP: 	VIDEO_CAPTURE
+D (3879) ISP: 	STREAMING
+D (3879) ISP: device capabilities:
+D (3879) ISP: 	VIDEO_CAPTURE
+D (3889) ISP: 	STREAMING
+D (3889) ISP: V4L2_CID_GAIN is not supported
+D (3889) ISP: V4L2_CID_EXPOSURE_ABSOLUTE is not supported
+D (3899) ISP: V4L2_CID_CAMERA_STATS is not supported
+D (3899) ISP: V4L2_CID_CAMERA_GROUP is not supported
+D (3909) ISP: V4L2_CID_CAMERA_AE_LEVEL is not supported
+D (3909) ISP: version: 0.9.0
+D (3919) ISP: driver:  ISP
+D (3919) ISP: card:    ISP
+D (3919) ISP: bus:     esp32p4:ISP
+D (3919) ISP: capabilities:
+D (3929) ISP: 	STREAMING
+D (3929) ISP: device capabilities:
+D (3929) ISP: 	STREAMING
+I (3999) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (3999) ISP_AWB: s_esp_isp_awb_config_hardware(90): subwindow exceeds window range
+E (3999) ISP_AWB: esp_isp_new_awb_controller(162): configure awb hardware failed
+E (4009) isp_video: isp_start_awb(622): failed to new AWB
+E (4019) isp_video: isp_start_pipeline(1175): failed to start AWB
+E (4029) isp_video: esp_video_isp_start_by_csi(1994): failed to start ISP pipeline
+E (4029) csi_video: csi_video_start(394): failed to start ISP
+E (4039) esp_video: video->ops->start=102
+E (4039) p2pro_uvc: builtin: STREAMON failed
+I (4619) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (4619) intr_alloc: No free interrupt inputs for ISP interrupt (flags 0x80E)
+E (4619) ISP: no intr source
+E (4629) ISP: esp_isp_new_processor(97): fail to register ISR
+E (4629) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (4639) csi_video: csi_video_start(394): failed to start ISP
+E (4649) esp_video: video->ops->start=105
+E (4649) p2pro_uvc: builtin: STREAMON failed
+I (5219) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (5219) ISP: esp_isp_new_processor(92): no available isp processor
+E (5219) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (5229) csi_video: csi_video_start(394): failed to start ISP
+E (5239) esp_video: video->ops->start=105
+E (5239) p2pro_uvc: builtin: STREAMON failed
+I (5809) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (5809) ISP: esp_isp_new_processor(92): no available isp processor
+E (5809) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (5819) csi_video: csi_video_start(394): failed to start ISP
+E (5829) esp_video: video->ops->start=105
+E (5829) p2pro_uvc: builtin: STREAMON failed
+I (6399) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (6399) ISP: esp_isp_new_processor(92): no available isp processor
+E (6399) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (6409) csi_video: csi_video_start(394): failed to start ISP
+E (6419) esp_video: video->ops->start=105
+E (6419) p2pro_uvc: builtin: STREAMON failed
+I (6989) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (6989) ISP: esp_isp_new_processor(92): no available isp processor
+E (6989) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (6999) csi_video: csi_video_start(394): failed to start ISP
+E (7009) esp_video: video->ops->start=105
+E (7009) p2pro_uvc: builtin: STREAMON failed
+I (7579) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (7579) ISP: esp_isp_new_processor(92): no available isp processor
+E (7579) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (7589) csi_video: csi_video_start(394): failed to start ISP
+E (7599) esp_video: video->ops->start=105
+E (7599) p2pro_uvc: builtin: STREAMON failed
+I (8169) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (8169) ISP: esp_isp_new_processor(92): no available isp processor
+E (8169) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (8179) csi_video: csi_video_start(394): failed to start ISP
+E (8189) esp_video: video->ops->start=105
+E (8189) p2pro_uvc: builtin: STREAMON failed
+I (8759) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (8759) ISP: esp_isp_new_processor(92): no available isp processor
+E (8759) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (8769) csi_video: csi_video_start(394): failed to start ISP
+E (8779) esp_video: video->ops->start=105
+E (8779) p2pro_uvc: builtin: STREAMON failed
+I (9349) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (9349) ISP: esp_isp_new_processor(92): no available isp processor
+E (9349) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (9359) csi_video: csi_video_start(394): failed to start ISP
+E (9369) esp_video: video->ops->start=105
+E (9369) p2pro_uvc: builtin: STREAMON failed
+I (9939) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (9939) ISP: esp_isp_new_processor(92): no available isp processor
+E (9939) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (9949) csi_video: csi_video_start(394): failed to start ISP
+E (9959) esp_video: video->ops->start=105
+E (9959) p2pro_uvc: builtin: STREAMON failed
+I (10529) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (10529) ISP: esp_isp_new_processor(92): no available isp processor
+E (10529) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (10539) csi_video: csi_video_start(394): failed to start ISP
+E (10549) esp_video: video->ops->start=105
+E (10549) p2pro_uvc: builtin: STREAMON failed
+I (11119) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (11119) ISP: esp_isp_new_processor(92): no available isp processor
+E (11119) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (11129) csi_video: csi_video_start(394): failed to start ISP
+E (11139) esp_video: video->ops->start=105
+E (11139) p2pro_uvc: builtin: STREAMON failed
+I (11709) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (11709) ISP: esp_isp_new_processor(92): no available isp processor
+E (11709) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (11719) csi_video: csi_video_start(394): failed to start ISP
+E (11729) esp_video: video->ops->start=105
+E (11729) p2pro_uvc: builtin: STREAMON failed
+I (12299) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (12299) ISP: esp_isp_new_processor(92): no available isp processor
+E (12299) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (12309) csi_video: csi_video_start(394): failed to start ISP
+E (12319) esp_video: video->ops->start=105
+E (12319) p2pro_uvc: builtin: STREAMON failed
+I (12889) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (12889) ISP: esp_isp_new_processor(92): no available isp processor
+E (12889) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (12899) csi_video: csi_video_start(394): failed to start ISP
+E (12909) esp_video: video->ops->start=105
+E (12909) p2pro_uvc: builtin: STREAMON failed
+I (13479) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (13479) ISP: esp_isp_new_processor(92): no available isp processor
+E (13479) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (13489) csi_video: csi_video_start(394): failed to start ISP
+E (13499) esp_video: video->ops->start=105
+E (13499) p2pro_uvc: builtin: STREAMON failed
+I (14069) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (14069) ISP: esp_isp_new_processor(92): no available isp processor
+E (14069) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (14079) csi_video: csi_video_start(394): failed to start ISP
+E (14089) esp_video: video->ops->start=105
+E (14089) p2pro_uvc: builtin: STREAMON failed
+I (14659) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (14659) ISP: esp_isp_new_processor(92): no available isp processor
+E (14659) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (14669) csi_video: csi_video_start(394): failed to start ISP
+E (14679) esp_video: video->ops->start=105
+E (14679) p2pro_uvc: builtin: STREAMON failed
+I (15249) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (15249) ISP: esp_isp_new_processor(92): no available isp processor
+E (15249) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (15259) csi_video: csi_video_start(394): failed to start ISP
+E (15269) esp_video: video->ops->start=105
+E (15269) p2pro_uvc: builtin: STREAMON failed
+I (15839) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (15839) ISP: esp_isp_new_processor(92): no available isp processor
+E (15839) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (15849) csi_video: csi_video_start(394): failed to start ISP
+E (15859) esp_video: video->ops->start=105
+E (15859) p2pro_uvc: builtin: STREAMON failed
+I (16429) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (16429) ISP: esp_isp_new_processor(92): no available isp processor
+E (16429) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (16439) csi_video: csi_video_start(394): failed to start ISP
+E (16449) esp_video: video->ops->start=105
+E (16449) p2pro_uvc: builtin: STREAMON failed
+I (17019) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)
+E (17019) ISP: esp_isp_new_processor(92): no available isp processor
+E (17019) isp_video: esp_video_isp_start_by_csi(1950): failed to new ISP
+E (17029) csi_video: csi_video_start(394): failed to start ISP
+E (17039) esp_video: video->ops->start=105
+E (17039) p2pro_uvc: builtin: STREAMON failed
+I (17609) p2pro_uvc: builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)

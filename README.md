@@ -545,6 +545,97 @@ gets it right: `max_packet_size *= (USB_EP_DESC_GET_MULT(ep_desc) + 1)`, giving 
 microframe, i.e. **~24.5 MB/s, not 8.16 MB/s**. So 640x480 YUY2 at 25 fps (15.4 MB/s) was always
 within budget, and "320x240 is the only mode that fits" was a parsing bug, not a finding.
 
+### Built-in OV5647: shown when no USB camera is attached
+
+The board carries an OV5647 on its MIPI-CSI connector, and it answers at SCCB address **0x36 on
+the same I2C bus** already used for the FT6336 touch and the AXP2101 - our own bus scan has been
+logging it all along. So `esp_video` is handed the existing bus handle with `init_sccb = false`,
+and `reset_pin` / `pwdn_pin` are -1: there is no GPIO to drive. It is a raw Bayer sensor, so the
+P4's ISP demosaics and we ask V4L2 for RGB565 - the same format the generic USB path already hands
+to PPA, so the back half of that pipeline is reused.
+
+**Measured: 1280x960 binning, cropped to 640x960, rotated and scaled to 480x320 - full panel at
+32.0 fps.** `esp_video 0.9.0`, which also pulls `esp_cam_sensor 1.0.0` and `esp_ipa 0.3.0`.
+
+#### The sensor mode is everything
+
+This is the single most important finding, and it is nothing to do with the host:
+
+| mode | pixels | nominal | **actual** |
+|---|---|---|---|
+| RAW8 800x1280 | 1.02 Mpx | "50 fps" | **16.1 fps** - 32% of nominal |
+| RAW8 800x640 | 0.51 Mpx | "50 fps" | 35.8 fps - 72% |
+| **RAW10 1280x960 binning** | 1.23 Mpx | "45 fps" | **44.0 fps - 98%** |
+
+The binning mode is *more* pixels and runs **2.7x faster** than 800x1280. Measured with a rate
+test that dequeues and requeues frames with no PPA and no blit, so the camera path is isolated
+from rendering. Nothing host-side moved the 800x1280 figure - it sat at exactly 62.186 ms per
+frame through every attempt - because its sensor timing, not our pipeline, is the limit.
+
+**Things tried against that 16 fps and measured to do nothing:** a 256 KB L2 cache with 128-byte
+lines (the vendor's own setting, kept anyway); `esp_video` 0.8.0 -> 0.9.0;
+`ESP_VIDEO_ENABLE_DATA_PREPROCESSING`; and YUV420 instead of RGB565 - accepted by both ISP and
+PPA, 25% fewer bytes per frame, **identical** framerate, which is what proved the limit was not
+bandwidth. A "~17 Mpx/s ISP ceiling" model derived from the two slow modes was simply wrong; the
+binning mode does 54 Mpx/s.
+
+#### Geometry: crop to the panel's aspect before rotating
+
+The sensor is mounted 90 degrees off the panel, so the frame is rotated for display. Cropping
+640x960 out of the 1280x960 frame gives the panel's 3:2 aspect *before* rotation, so the result
+fills 480x320 exactly at 8/16 scale - on PPA's 1/16 grid, no quantization loss - and halves PPA's
+read to 614,400 pixels. The cost is field of view: sensor x becomes screen y, so taking half the
+columns costs half the vertical view. The full frame would keep all of it but fill only 240x320.
+
+Orientation is **sensor H-flip + `ROTATION_ANGLE_90`**, and getting there needed three corrections:
+
+- **PPA's `mirror_x`/`mirror_y` do nothing here** - tried in both passes and both axes, no visible
+  effect, although the driver demonstrably programs the registers. That is why `R90` alone left
+  the horizontal wrong and `R270` alone left the vertical wrong.
+- **`VIDIOC_S_CTRL` is not implemented** by esp_video, only `VIDIOC_S_EXT_CTRLS`. The first flip
+  attempt was silently refused, and only a warning log caught it.
+- **The control named `V4L2_CID_HFLIP` flips this sensor VERTICALLY.** The OV5647 driver's register
+  tables comment 0x3820 as horizontal and 0x3821 as vertical, transposed from the datasheet. So
+  the upright pairing is a *vertical* source flip with a 90 degree rotation.
+
+#### Two buffers, not three
+
+`DQBUF` returns the **oldest** queued buffer, so the queue depth *is* the display lag. With 3
+buffers and the camera faster than the renderer (44 fps in, 32 out) the queue stayed full and
+frames were one to two capture periods old - and since those rates do not divide evenly the age
+drifted, which looked like old frames interspersed with new ones at a regular interval. Two
+buffers cap the camera at one frame ahead.
+
+3 was correct while the camera was the *slow* side at 16 fps, where it removed a ~16 ms stall;
+the binning mode reversed which side waits. The better fix - drain to the newest frame - is
+impossible here: esp_video's `DQBUF` hardcodes `portMAX_DELAY` and ignores `O_NONBLOCK`, so a
+drain loop blocks forever and renders nothing.
+
+#### Pipeline
+
+The SPI blit and the PPA conversion used to run in series because the completion semaphore was
+taken before the conversion. With two alternating output buffers the semaphore moves to just
+before the blit, so the next frame's conversion overlaps the current blit. Stage timings at
+480x320: `ppa_scale` 10.4 ms, `ppa_swap` 3.1 ms, `blit_wait` 14.5 ms - the 307,200-byte blit at
+80 MHz is the remaining ceiling, which is the right place to be bound.
+
+#### Also
+
+Exposure works (AGC drives the sensor) but only in the binning mode. Note the OV5647 driver
+implements no *getter* for exposure or gain, so a readback is always -1 even while AE is actively
+writing them - do not read that as AE being inert.
+
+`esp_video`'s ISP pipeline controller calls `esp_log_level_set(TAG, ESP_LOG_DEBUG)` **on itself**
+in shipped code, gated on `LOG_LOCAL_LEVEL` which our `CONFIG_LOG_MAXIMUM_LEVEL=DEBUG` satisfies.
+It then logs AE/AWB statistics from interrupt context every frame: ~10k lines in 40 s, which at
+115200 baud starved the ISRs into repeated `Interrupt wdt timeout` panics and SW_CPU_RESET loops.
+Fixed at runtime with `esp_log_level_set("ISP", ESP_LOG_WARN)` rather than by patching the
+component.
+
+PPA validates `out.buffer_size` against the **cache line**, so `P2_CACHE_LINE` now derives from
+`CONFIG_CACHE_L2_CACHE_LINE_SIZE` instead of hardcoding 64 - changing the cache config would
+otherwise have silently reproduced an earlier black-screen bug.
+
 ### Camera hot-swap (no reset needed)
 
 Swapping between the P2 Pro and a generic camera used to need a reset. That was not a missing

@@ -29,6 +29,15 @@
 #include "driver/spi_master.h"
 #include "driver/ppa.h"
 #include "driver/jpeg_decode.h"   /* P4 hardware JPEG: the MJPEG generic path */
+#include "driver/i2c_master.h"
+/* Built-in OV5647 on the MIPI-CSI connector, via esp_video's V4L2 layer. */
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include "sys/mman.h"   /* esp_video ships its own mmap shim */
+#include "esp_video_init.h"
+#include "esp_video_device.h"
+#include "linux/videodev2.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -66,8 +75,91 @@ esp_err_t uvc_host_usb_ctrl(uvc_host_stream_hdl_t stream_hdl, uint8_t bmRequestT
 typedef enum {
     CAM_NONE = 0,
     CAM_THERMAL,     /* 256x384: full thermal interface */
-    CAM_GENERIC,     /* any other YUY2 camera: just show the image */
+    CAM_GENERIC,     /* any other USB camera: just show the image */
 } cam_kind_t;
+
+/* ---- built-in OV5647 ------------------------------------------------------------------------
+ * The board carries an OV5647 on its MIPI-CSI connector, and it answers at SCCB address 0x36 on
+ * the SAME I2C bus we already own for the FT6336 touch and the AXP2101 (SDA 7 / SCL 8) - our own
+ * bus scan has been logging it as "0x36" all along. So esp_video is handed our existing bus
+ * handle with init_sccb = false, and reset_pin / pwdn_pin are -1: there is no GPIO to drive.
+ *
+ * It is a raw Bayer sensor, so the P4's ISP does the demosaic and we ask V4L2 for RGB565 - the
+ * same pixel format the generic USB path already hands to PPA, so the second half of that
+ * pipeline is reused verbatim.
+ *
+ * The sensor is mounted 90 degrees off the panel, so the frame is rotated before display - which
+ * makes the sensor's PORTRAIT mode the one that suits a LANDSCAPE panel. 800x1280 (RAW8, 50 fps)
+ * rotates to 1280x800 and fits 480x320 at 6/16 in both axes, exactly on PPA's 1/16 grid, giving
+ * 480x300: the full panel width with 10 black rows top and bottom.
+ *
+ * 800x640 was tried first and rotated to 640x800, which could only fill 240x300 - half the width,
+ * with wide bars either side. That is unavoidable for a landscape sensor mode here, not a bug.
+ *
+ * Shown only while no USB camera is attached. Everything is opened and closed around that, so
+ * the buffers are not sitting on PSRAM that the MJPEG path wants. */
+#define P2_BUILTIN_CAM 1
+/* TRIED AND REJECTED - kept so it is not tried again. YUV420 out of the ISP is 1.5 bytes/px
+ * instead of RGB565's 2, so 25% fewer bytes per frame. It was accepted by the ISP and PPA and
+ * changed the framerate by exactly nothing:
+ *
+ *   800x640  RGB565   512,000 px   35.8 fps   18.3 Mpx/s
+ *   800x1280 RGB565 1,024,000 px   16.1 fps   16.5 Mpx/s
+ *   800x1280 YUV420 1,024,000 px   16.1 fps   16.5 Mpx/s   <- 25% fewer bytes, same fps
+ *
+ * The limit is the ISP's PIXEL rate, ~17 Mpx/s, not its byte rate - which is why cutting bytes
+ * did nothing and why only a smaller sensor mode can raise the framerate. Left at 0: it costs
+ * chroma resolution, its planar layout against PPA's expectation was never verified, and it buys
+ * nothing. */
+#define P2_BUILTIN_YUV420 0
+
+/* Diagnostic: dequeue and requeue frames with NO PPA and NO blit, and report the rate. That
+ * isolates what the CSI+ISP path can actually deliver from what our rendering costs - the
+ * difference tells us whether to attack the camera pipeline or our own. Set to 0 for normal use. */
+#define P2_BI_RATE_TEST 0
+
+/* Per-stage timings (ppa_scale / ppa_swap / blit_wait). Off: they were how the pipeline was
+ * characterised, they are cheap, and they are noisy once it is settled. */
+#define P2_BI_STAGE_TIMING 0
+/* Logged the sensor's exposure and gain every 2 s while chasing "exposure is stuck". Off, and
+ * of limited use: AE turned out to work once the binning mode was in (the 800x1280 mode either
+ * does not drive exposure or converged too slowly at 16 fps to notice), and the OV5647 driver
+ * implements no GETTER for these controls, so the readback is always -1 even while AGC is
+ * actively writing them. */
+#define P2_BI_AE_TRACE 0
+
+#define BUILTIN_CAM_W  1280
+#define BUILTIN_CAM_H  960
+/* 2, deliberately. DQBUF returns the OLDEST queued buffer, so the queue depth IS the display
+ * lag: with 3 buffers and a camera running faster than we render (44 fps in, ~32 fps out) the
+ * queue stayed full and we showed frames one to two capture periods old - and because the rates
+ * do not divide evenly that age oscillated, which looked like old frames interspersed with new
+ * ones at a regular interval. Two buffers bound the camera to at most one frame ahead, so the
+ * lag is both small and steady. esp_video gives no way to drain to the newest frame: its DQBUF
+ * hardcodes portMAX_DELAY and ignores O_NONBLOCK.
+ *
+ * (3 was right when the camera was the SLOW side, at 800x1280/16 fps, where it removed a ~16 ms
+ * stall. The binning mode reversed which side waits.) */
+#define BUILTIN_BUFS   2
+
+#if P2_BUILTIN_CAM
+static i2c_master_bus_handle_t s_i2c_bus;   /* shared with touch, PMIC and the camera's SCCB */
+static int      s_bi_fd = -1;
+static void    *s_bi_buf[BUILTIN_BUFS];
+static size_t   s_bi_len[BUILTIN_BUFS];
+static int      s_bi_w, s_bi_h, s_bi_x, s_bi_y;   /* on-panel geometry */
+/* Two output buffers, alternating. Taking the SPI completion semaphore BEFORE the PPA work (as
+ * the USB paths do, sharing one s_rgb_tx) serialises the blit and the conversion: measured
+ * 28.8 ms of blit - 480x300x2 bytes at 80 MHz - plus 16.5 ms of PPA = the 45 ms e2e seen. With
+ * two buffers the semaphore moves to just before the blit, so the next frame's PPA overlaps the
+ * current blit and the period becomes max(blit, convert) instead of their sum. */
+static uint16_t *s_bi_tx[2];
+static int       s_bi_tx_i;
+/* Source sub-rectangle PPA reads, so the picture fills the panel without stretching. */
+static int       s_bi_sw, s_bi_sh, s_bi_sx, s_bi_sy;
+static bool     s_bi_video_inited;
+static uint32_t s_bi_frames;
+#endif
 
 static volatile cam_kind_t s_cam_kind = CAM_NONE;
 static volatile uint16_t s_cam_w = STREAM_H_RES;   /* format actually requested */
@@ -1621,9 +1713,19 @@ static void fit_preserving_aspect(int in_w, int in_h, int max_w, int max_h,
  * back only what it needs: the thermal path's 416x312x2 = 259584 is already a multiple of 64 and
  * is unchanged, while 374x306x2 = 228888 (24 over) becomes 228928. The buffers are allocated to
  * the largest rounded-up case, so the extra bytes are always inside the allocation. */
+/* PPA validates out.buffer_size against the CACHE LINE, not just the address, so this has to
+ * track the cache configuration rather than assume 64. Hardcoding it is what produced a black
+ * screen once already; deriving it from Kconfig means changing CONFIG_CACHE_L2_CACHE_LINE_*
+ * cannot silently break PPA again. */
+#ifdef CONFIG_CACHE_L2_CACHE_LINE_SIZE
+#define P2_CACHE_LINE CONFIG_CACHE_L2_CACHE_LINE_SIZE
+#else
+#define P2_CACHE_LINE 64
+#endif
+
 static inline size_t ppa_out_bytes(int w, int h)
 {
-    return ((size_t)w * h * sizeof(uint16_t) + 63u) & ~(size_t)63u;
+    return ((size_t)w * h * sizeof(uint16_t) + (P2_CACHE_LINE - 1)) & ~(size_t)(P2_CACHE_LINE - 1);
 }
 
 /* Bring up the hardware JPEG decoder and its two DMA buffers for a w*h MJPEG stream.
@@ -1895,6 +1997,9 @@ static esp_err_t touch_init(void)
         .flags.enable_internal_pullup = true,
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_bus_conf, &i2c_bus), TAG, "i2c bus");
+#if P2_BUILTIN_CAM
+    s_i2c_bus = i2c_bus;   /* the OV5647's SCCB lives on this same bus, at 0x36 */
+#endif
 
     /* The AXP2101 PMIC shares this bus (scanned: 0x18, 0x34 PMIC, 0x36, 0x38 touch). */
     const i2c_device_config_t pmic_cfg = {
@@ -2195,6 +2300,228 @@ static void uframe_check_task(void *arg)
 }
 #endif
 
+#if P2_BUILTIN_CAM
+/* Bring up CSI + ISP + sensor and start streaming RGB565. Everything here is undone by
+ * builtin_cam_stop(), so the ~2 MB of frame buffers only exist while the picture is on screen. */
+static bool builtin_cam_start(void)
+{
+    if (s_bi_fd >= 0) {
+        return true;
+    }
+    if (!s_i2c_bus) {
+        return false;
+    }
+
+    if (!s_bi_video_inited) {
+        /* esp_video_init registers the video devices and must run exactly once. */
+        esp_video_init_csi_config_t csi[] = {{
+            .sccb_config = { .init_sccb = false, .i2c_handle = s_i2c_bus, .freq = 100000 },
+            .reset_pin = -1,
+            .pwdn_pin  = -1,
+        }};
+        const esp_video_init_config_t cfg = { .csi = csi };
+        esp_err_t err = esp_video_init(&cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "builtin: esp_video_init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        s_bi_video_inited = true;
+        /* esp_video's ISP pipeline controller does esp_log_level_set(TAG, ESP_LOG_DEBUG) on
+         * itself (esp_video_isp_pipeline.c, gated on LOG_LOCAL_LEVEL which our
+         * CONFIG_LOG_MAXIMUM_LEVEL=DEBUG satisfies). It then logs AE/AWB statistics from
+         * interrupt context every frame: ~10k lines in 40s, which at 115200 baud blocks ISRs
+         * long enough to trip the interrupt watchdog - measured as repeated
+         * "Interrupt wdt timeout on CPU1" panics and SW_CPU_RESET loops. Put it back. */
+        esp_log_level_set("ISP", ESP_LOG_WARN);
+        esp_log_level_set("esp_ipa", ESP_LOG_WARN);
+    }
+
+    /* Blocking. esp_video's DQBUF hardcodes portMAX_DELAY and ignores O_NONBLOCK entirely
+     * (esp_video_ioctl.c: "uint32_t ticks = portMAX_DELAY"), so there is no way to poll for
+     * "is a newer frame waiting" and drain to the freshest one - an attempt to do that simply
+     * blocked in the drain loop forever and rendered nothing. Staleness is bounded by the buffer
+     * count instead; see BUILTIN_BUFS. */
+    int fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "builtin: open %s failed", ESP_VIDEO_MIPI_CSI_DEVICE_NAME);
+        return false;
+    }
+
+    struct v4l2_format fmt = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .fmt.pix = {
+            .width       = BUILTIN_CAM_W,
+            .height      = BUILTIN_CAM_H,
+#if P2_BUILTIN_YUV420
+            /* The ISP's own format check accepts YUV420 only with a known encoding and
+             * quantization, so state them rather than relying on 0 meaning DEFAULT. */
+            .pixelformat = V4L2_PIX_FMT_YUV420,
+            .ycbcr_enc   = V4L2_YCBCR_ENC_601,
+            .quantization = V4L2_QUANTIZATION_LIM_RANGE,
+#else
+            .pixelformat = V4L2_PIX_FMT_RGB565,   /* the ISP demosaics the sensor's Bayer */
+#endif
+        },
+    };
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
+        ESP_LOGE(TAG, "builtin: S_FMT %dx%d failed", BUILTIN_CAM_W, BUILTIN_CAM_H);
+        close(fd);
+        return false;
+    }
+
+    struct v4l2_requestbuffers req = {
+        .count  = BUILTIN_BUFS,
+        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "builtin: REQBUFS failed");
+        close(fd);
+        return false;
+    }
+
+    for (int i = 0; i < BUILTIN_BUFS; i++) {
+        struct v4l2_buffer buf = {
+            .index  = i,
+            .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "builtin: QUERYBUF %d failed", i);
+            close(fd);
+            return false;
+        }
+        s_bi_buf[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                           fd, buf.m.offset);
+        s_bi_len[i] = buf.length;
+        /* esp_video's mmap shim documents NULL on failure, not MAP_FAILED - it does not even
+         * define MAP_FAILED. */
+        if (s_bi_buf[i] == NULL) {
+            ESP_LOGE(TAG, "builtin: mmap %d (%u B) failed", i, (unsigned)buf.length);
+            close(fd);
+            return false;
+        }
+        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "builtin: QBUF %d failed", i);
+            close(fd);
+            return false;
+        }
+    }
+
+    /* Mirror in the SENSOR, not in PPA. PPA's mirror_x/mirror_y had no visible effect in either
+     * pass (the driver does program the registers, so this is not an obvious software gap), and
+     * the OV5647 can do it for free: its driver exposes ESP_CAM_SENSOR_HMIRROR, which esp_video
+     * maps to V4L2_CID_HFLIP.
+     *
+     * The catch is that the sensor mirrors BEFORE our rotation, so the rotation has to change to
+     * compensate. With a source W x H and Ms(x,y) = (W-1-x, y):
+     *
+     *     wanted:   Mh . R90  = (H-1-y, W-1-x)   <- an anti-transpose; no pure rotation does this
+     *     R90 . Ms            = (y, x)           <- a plain transpose, NOT what we want
+     *     R270 . Ms           = (H-1-y, W-1-x)   <- exactly the target
+     *
+     * Hence HFLIP here and ROTATION_ANGLE_270 below, rather than 90. */
+    /* VIDIOC_S_EXT_CTRLS, not VIDIOC_S_CTRL: esp_video implements only the extended-controls
+     * ioctl (see the case list in esp_video_ioctl.c), which is why the plain one was refused.
+     *
+     * Despite the name, this flips the OV5647 VERTICALLY - see the rotation comment below. The
+     * pair (this flip, ROTATION_ANGLE_90) is what produces an upright picture. */
+    struct v4l2_ext_control hflip_ctrl = { .id = V4L2_CID_HFLIP, .value = 1 };
+    struct v4l2_ext_controls hflip = { .count = 1, .controls = &hflip_ctrl };
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &hflip) != 0) {
+        ESP_LOGW(TAG, "builtin: V4L2_CID_HFLIP not accepted - image will be mirrored");
+    } else {
+        ESP_LOGI(TAG, "builtin: sensor flip enabled (V4L2_CID_HFLIP; acts vertically here)");
+    }
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "builtin: STREAMON failed");
+        close(fd);
+        return false;
+    }
+
+    /* The sensor is mounted rotated relative to the panel: the picture is only upright after a
+     * 90 degree COUNTER-CLOCKWISE rotation followed by a horizontal mirror (confirmed by eye on
+     * hardware). PPA does both in the scale pass - its rotation_angle is documented as
+     * counter-clockwise, and mirror_x/mirror_y act on the TARGET block, i.e. after the rotation,
+     * which is the order we need.
+     *
+     * Rotating swaps the axes, so the aspect fit is done on the ROTATED size: 640x800 into
+     * 480x320 gives 240x300, not the 400x320 an unrotated 800x640 would give. */
+    /* Crop the sensor frame to the panel's aspect BEFORE the rotation, so the result fills the
+     * screen exactly instead of letterboxing. Rotating swaps the axes, so for a 3:2 panel the
+     * pre-rotation crop needs height/width = 3/2, i.e. 640x960 out of 1280x960.
+     *
+     * 960x640 after rotation fits 480x320 at exactly 8/16 in both axes - on PPA's 1/16 grid, no
+     * quantization loss - and it halves PPA's read: 614,400 pixels instead of 1,228,800.
+     *
+     * The cost is field of view: sensor x becomes screen y, so taking half the sensor's columns
+     * costs half the VERTICAL view. Full frame would keep all of it but only fill 240x320 of the
+     * 480x320 panel. Offsets kept even so chroma siting is unaffected. */
+    s_bi_sh = BUILTIN_CAM_H;
+    s_bi_sw = (int)((int64_t)BUILTIN_CAM_H * s_disp_h / s_disp_w) & ~1;   /* 960*320/480 = 640 */
+    if (s_bi_sw > BUILTIN_CAM_W) {
+        s_bi_sw = BUILTIN_CAM_W;   /* sensor is already narrower than the panel's aspect wants */
+    }
+    s_bi_sx = ((BUILTIN_CAM_W - s_bi_sw) / 2) & ~1;
+    s_bi_sy = 0;
+    fit_preserving_aspect(s_bi_sh, s_bi_sw, s_disp_w, s_disp_h, &s_bi_w, &s_bi_h);
+    s_bi_x = (s_disp_w - s_bi_w) / 2;
+    s_bi_y = (s_disp_h - s_bi_h) / 2;
+
+    for (int i = 0; i < 2; i++) {
+        if (!s_bi_tx[i]) {
+            s_bi_tx[i] = heap_caps_aligned_alloc(P2_CACHE_LINE, ppa_out_bytes(s_disp_w, s_disp_h),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+            if (!s_bi_tx[i]) {
+                ESP_LOGE(TAG, "builtin: tx buffer %d alloc failed", i);
+                close(fd);
+                return false;
+            }
+        }
+    }
+    s_bi_tx_i = 0;
+    s_bi_fd = fd;
+    s_bi_frames = 0;
+    ESP_LOGI(TAG, "builtin: OV5647 %s %dx%d crop %dx%d+%d+%d -> %dx%d at (%d,%d)",
+             P2_BUILTIN_YUV420 ? "YUV420" : "RGB565",
+             BUILTIN_CAM_W, BUILTIN_CAM_H, s_bi_sw, s_bi_sh, s_bi_sx, s_bi_sy,
+             s_bi_w, s_bi_h, s_bi_x, s_bi_y);
+    return true;
+}
+
+static void builtin_cam_stop(void)
+{
+    if (s_bi_fd < 0) {
+        return;
+    }
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(s_bi_fd, VIDIOC_STREAMOFF, &type);
+    for (int i = 0; i < BUILTIN_BUFS; i++) {
+        if (s_bi_buf[i]) {
+            munmap(s_bi_buf[i], s_bi_len[i]);
+        }
+        s_bi_buf[i] = NULL;
+        s_bi_len[i] = 0;
+    }
+    /* Releasing the buffers is the point - a USB camera's MJPEG path wants this PSRAM back. */
+    struct v4l2_requestbuffers req = {
+        .count = 0, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP,
+    };
+    ioctl(s_bi_fd, VIDIOC_REQBUFS, &req);
+    close(s_bi_fd);
+    s_bi_fd = -1;
+    /* The blit of the last frame has already completed (render_task holds the semaphore when it
+     * gets here), so these are safe to release. */
+    for (int i = 0; i < 2; i++) {
+        free(s_bi_tx[i]);
+        s_bi_tx[i] = NULL;
+    }
+    ESP_LOGI(TAG, "builtin: stopped (%u frames shown)", (unsigned)s_bi_frames);
+}
+#endif /* P2_BUILTIN_CAM */
+
 /* ---------------- UVC callbacks ---------------- */
 
 /* Frames are queued by the UVC driver task and consumed by render_task, so a disconnect can
@@ -2420,7 +2747,196 @@ static void render_task(void *arg)
 
     cam_kind_t last_kind = CAM_NONE;
     queued_frame_t qf;
+#if P2_BUILTIN_CAM
+    bool bi_shown = false;
+    int64_t bi_sem_sum = 0, bi_ppa1_sum = 0, bi_ppa2_sum = 0, bi_wait_sum = 0, bi_dq_sum = 0;
+    int bi_n = 0;
+#endif
     while (true) {
+#if P2_BUILTIN_CAM
+        /* No USB camera: fall back to the board's own OV5647. Driven from render_task rather
+         * than its own task on purpose - this is the only task allowed to touch s_rgb_buf,
+         * s_rgb_tx and the panel, and a second drawer would race the SPI completion semaphore. */
+        if (s_cam_kind == CAM_NONE) {
+            if (builtin_cam_start()) {
+                if (!bi_shown) {
+                    /* Wipe the USB view's side bar and letterbox margins once on entry. */
+                    bi_shown = true;
+                    last_kind = CAM_NONE;
+                    disconnect_shown = false;
+                    xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
+                    memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
+                    s_pending_arrival_us = esp_timer_get_time();
+                    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+                    continue;
+                }
+                struct v4l2_buffer buf = {
+                    .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP,
+                };
+                const int64_t t_dq0 = esp_timer_get_time();
+                if (ioctl(s_bi_fd, VIDIOC_DQBUF, &buf) != 0) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
+                bi_dq_sum += esp_timer_get_time() - t_dq0;
+#if P2_BI_RATE_TEST
+                /* Camera-only rate: straight back on the queue, nothing rendered. */
+                ioctl(s_bi_fd, VIDIOC_QBUF, &buf);
+                bi_n++;
+                {
+                    int64_t rnow = esp_timer_get_time();
+                    if (rnow - s_last_report_us >= 2000000) {
+                        ESP_LOGW(TAG, "RATE TEST (no render): %d frames in %" PRId64 "ms -> %d fps"
+                                      "  avg dqbuf=%" PRId64 "us",
+                                 bi_n, (rnow - s_last_report_us) / 1000,
+                                 (int)((int64_t)bi_n * 1000000 / (rnow - s_last_report_us)),
+                                 bi_dq_sum / bi_n);
+                        bi_n = 0; bi_dq_sum = 0;
+                        s_last_report_us = rnow;
+                    }
+                }
+                continue;
+#endif
+                const int64_t t0 = esp_timer_get_time();
+                const int64_t t_sem = t0;   /* PPA now runs before the wait, see below */
+
+                const ppa_srm_oper_config_t scale = {
+                    .in = {
+                        .buffer = s_bi_buf[buf.index],
+                        .pic_w = BUILTIN_CAM_W, .pic_h = BUILTIN_CAM_H,
+                        .block_w = s_bi_sw, .block_h = s_bi_sh,
+                        .block_offset_x = s_bi_sx, .block_offset_y = s_bi_sy,
+#if P2_BUILTIN_YUV420
+                        .srm_cm = PPA_SRM_COLOR_MODE_YUV420,
+                        .yuv_range = PPA_COLOR_RANGE_LIMIT,
+                        .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
+#else
+                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+#endif
+                    },
+                    .out = {
+                        .buffer = s_rgb_buf,
+                        .buffer_size = ppa_out_bytes(s_bi_w, s_bi_h),
+                        .pic_w = s_bi_w, .pic_h = s_bi_h,
+                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                    },
+                    /* Scale is applied before the rotation, so x maps to the source's x: the
+                     * output's WIDTH comes from the source's height and vice versa.
+                     *
+                     * 90, with the sensor flip before it. Derivation, with source W x H and
+                     * the rotation counter-clockwise (which both earlier symptoms confirmed -
+                     * R90 alone left the horizontal wrong, R270 alone left the vertical wrong):
+                     *
+                     *     wanted:            Mh . R90 = (H-1-y, W-1-x)   <- an anti-transpose
+                     *     R90 . Mv_source             = (H-1-y, W-1-x)   <- this
+                     *
+                     * Mv_source, not Mh_source, because the control esp_video calls
+                     * V4L2_CID_HFLIP flips this sensor VERTICALLY: the OV5647 driver's register
+                     * tables comment 0x3820 as horizontal and 0x3821 as vertical, transposed
+                     * from the datasheet. Measured, not assumed - with ROTATION_ANGLE_270 the
+                     * result was a plain transpose, i.e. exactly 180 degrees off.
+                     *
+                     * PPA's own mirror_x/mirror_y were tried in both passes and both axes and
+                     * had no visible effect at all, which is why the mirror lives in the sensor. */
+                    .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,
+                    .scale_x = (float)s_bi_h / s_bi_sw,
+                    .scale_y = (float)s_bi_w / s_bi_sh,
+                    .mode = PPA_TRANS_MODE_BLOCKING,
+                };
+                ppa_do_scale_rotate_mirror(s_ppa_client, &scale);
+                const int64_t t_ppa1 = esp_timer_get_time();
+
+                /* Second pass for the ST7796's byte order, exactly as the USB preview does:
+                 * PPA's byte_swap affects how it READS, so it cannot fold into the scale. */
+                const ppa_srm_oper_config_t swap = {
+                    .in = {
+                        .buffer = s_rgb_buf,
+                        .pic_w = s_bi_w, .pic_h = s_bi_h,
+                        .block_w = s_bi_w, .block_h = s_bi_h,
+                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                    },
+                    .out = {
+                        .buffer = s_bi_tx[s_bi_tx_i],
+                        .buffer_size = ppa_out_bytes(s_bi_w, s_bi_h),
+                        .pic_w = s_bi_w, .pic_h = s_bi_h,
+                        .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+                    },
+                    .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+                    .scale_x = 1.0f, .scale_y = 1.0f,
+                    .byte_swap = true,
+                    .mode = PPA_TRANS_MODE_BLOCKING,
+                };
+                ppa_do_scale_rotate_mirror(s_ppa_client, &swap);
+                const int64_t t_ppa2 = esp_timer_get_time();
+
+                ioctl(s_bi_fd, VIDIOC_QBUF, &buf);
+
+                /* Wait for the PREVIOUS blit only now - the conversion above has already
+                 * overlapped it. This is the whole point of the second tx buffer. */
+                const int64_t t_wait0 = esp_timer_get_time();
+                xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
+                bi_wait_sum += esp_timer_get_time() - t_wait0;
+
+                s_pending_arrival_us = t0;
+                esp_lcd_panel_draw_bitmap(s_panel, s_bi_x, s_bi_y,
+                                          s_bi_x + s_bi_w, s_bi_y + s_bi_h,
+                                          s_bi_tx[s_bi_tx_i]);
+                s_bi_tx_i ^= 1;
+                s_bi_frames++;
+                int64_t now = esp_timer_get_time();
+                bi_sem_sum  += t_sem  - t0;   /* now always 0; kept so the format is stable */
+                bi_ppa1_sum += t_ppa1 - t_sem;
+                bi_ppa2_sum += t_ppa2 - t_ppa1;
+                bi_n++;
+                if (now - s_last_report_us >= 2000000) {
+                    ESP_LOGI(TAG, "builtin displayed=%d avg_e2e=%" PRId64 "us (%dx%d -> %dx%d)",
+                             s_frames_rendered,
+                             s_frames_rendered ? s_e2e_time_sum_us / s_frames_rendered : 0,
+                             BUILTIN_CAM_W, BUILTIN_CAM_H, s_bi_w, s_bi_h);
+#if P2_BI_STAGE_TIMING
+                    if (bi_n) {
+                        ESP_LOGI(TAG, "builtin stages: ppa_scale=%" PRId64 "us ppa_swap=%" PRId64
+                                      "us blit_wait=%" PRId64 "us (n=%d)",
+                                 bi_ppa1_sum / bi_n, bi_ppa2_sum / bi_n, bi_wait_sum / bi_n, bi_n);
+                    }
+#endif
+#if P2_BI_AE_TRACE
+                    /* Is AGC actually writing the sensor? All the IPA algorithms (AGC for gain
+                     * and exposure, ATC for the target level) default to enabled and the ISP was
+                     * demonstrably computing luma statistics, so the open question is whether the
+                     * result reaches the sensor. Constant values under changing light means it
+                     * does not; moving values mean AE works and the target is simply wrong. */
+                    {
+                        /* One control per call: a single unsupported id fails the whole
+                         * request, which is what hid this the first time. And it is
+                         * V4L2_CID_EXPOSURE, not _ABSOLUTE - esp_video 0.9.0 maps
+                         * EXPOSURE_ABSOLUTE to ESP_CAM_SENSOR_EXPOSURE_US, which the OV5647
+                         * driver does not implement; EXPOSURE_VAL is the one it has. */
+                        int exp = -1, gain = -1;
+                        struct v4l2_ext_control ce = { .id = V4L2_CID_EXPOSURE };
+                        struct v4l2_ext_controls ge = { .count = 1, .controls = &ce };
+                        if (ioctl(s_bi_fd, VIDIOC_G_EXT_CTRLS, &ge) == 0) { exp = ce.value; }
+                        struct v4l2_ext_control cg = { .id = V4L2_CID_GAIN };
+                        struct v4l2_ext_controls gg = { .count = 1, .controls = &cg };
+                        if (ioctl(s_bi_fd, VIDIOC_G_EXT_CTRLS, &gg) == 0) { gain = cg.value; }
+                        ESP_LOGI(TAG, "builtin AE: exposure=%d gain=%d (-1 = not readable)",
+                                 exp, gain);
+                    }
+#endif
+                    bi_sem_sum = bi_ppa1_sum = bi_ppa2_sum = bi_wait_sum = 0;
+                    bi_n = 0;
+                    s_frames_rendered = 0;
+                    s_e2e_time_sum_us = 0;
+                    s_last_report_us = now;
+                }
+                continue;
+            }
+        } else if (bi_shown) {
+            /* A USB camera arrived - hand the panel and the PSRAM back. */
+            bi_shown = false;
+            builtin_cam_stop();
+        }
+#endif
         /* Timeout rather than block forever: with no camera there are no frames, and this is
          * the only task allowed to draw, so without waking up periodically the "no camera"
          * state could never reach the screen. */
@@ -3583,7 +4099,7 @@ void app_main(void)
 
     /* PPA requires its input/output buffers aligned to the cache line size (64B covers both
      * L1 and L2 on P4); plain heap_caps_malloc doesn't guarantee that. */
-    s_small_rgb = heap_caps_aligned_alloc(64, RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    s_small_rgb = heap_caps_aligned_alloc(P2_CACHE_LINE, RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     assert(s_small_rgb);
 
     /* Sized for the LARGER of the thermal image and a full-screen generic preview: a webcam's
@@ -3595,13 +4111,13 @@ void app_main(void)
      * the USED extent fails whenever w*h*2 is not a multiple of 64 - 374x306 gives 228888, which
      * is 24 over. The thermal path only passed because 416x312x2 = 259584 happens to divide by 64.
      * The field means the size OF THE BUFFER, so publish the real allocation and round it up. */
-    s_fb_bytes = (fb_px * sizeof(uint16_t) + 63u) & ~(size_t)63u;  /* covers both paths */
-    s_rgb_buf = heap_caps_aligned_alloc(64, s_fb_bytes,
+    s_fb_bytes = (fb_px * sizeof(uint16_t) + (P2_CACHE_LINE - 1)) & ~(size_t)(P2_CACHE_LINE - 1);  /* covers both paths */
+    s_rgb_buf = heap_caps_aligned_alloc(P2_CACHE_LINE, s_fb_bytes,
                                          MALLOC_CAP_SPIRAM);
-    s_rgb_tx = heap_caps_aligned_alloc(64, s_fb_bytes,
+    s_rgb_tx = heap_caps_aligned_alloc(P2_CACHE_LINE, s_fb_bytes,
                                         MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
     if (!s_rgb_tx) {
-        s_rgb_tx = heap_caps_aligned_alloc(64, s_fb_bytes, MALLOC_CAP_DMA);
+        s_rgb_tx = heap_caps_aligned_alloc(P2_CACHE_LINE, s_fb_bytes, MALLOC_CAP_DMA);
     }
     assert(s_rgb_buf && s_rgb_tx);
 

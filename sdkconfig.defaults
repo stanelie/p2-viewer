@@ -49,3 +49,28 @@ CONFIG_UVC_CHECK_PAYLOAD_HEADER_EOH=n
 # The borescope's payloads are rejected with the ERR-bit check enabled (stream opens, no frame
 # ever completes). Same class of quirk as the EOH bit above.
 CONFIG_UVC_CHECK_PAYLOAD_HEADER_ERR=n
+
+# ---- Built-in OV5647 on the board's MIPI-CSI connector -------------------------------------
+# Shown when no USB camera is attached. The CSI video device pulls in the ISP, which is what
+# demosaics the sensor's Bayer output and lets us ask for RGB565 straight out - the same pixel
+# format the generic USB path already feeds to PPA.
+CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+CONFIG_CAMERA_OV5647=y
+# RAW8 800x1280 rather than Waveshare's RAW10 1280x960. The sensor is mounted 90 degrees off the
+# panel, so the picture is rotated before display and the sensor's PORTRAIT mode is the one that
+# matches a landscape panel: rotated it is 1280x800, which fits 480x320 at a 6/16 scale in both
+# axes - exactly on PPA's 1/16 grid - giving 480x300, i.e. the full panel width. The 800x640 mode
+# tried first rotated to 640x800 and could only fill 240x300, half the width.
+CONFIG_CAMERA_OV5647_MIPI_RAW10_1280x960_BINNING_45FPS=y
+
+# ---- PSRAM throughput for the CSI/ISP capture path ------------------------------------------
+# Waveshare's own camera examples run a 256 KB L2 with 128-byte lines; we were on 128 KB / 64 B.
+# The capture path is a streaming PSRAM writer and PPA's rotating read is strided, so both are
+# cache-line sensitive. NOTE: PPA validates out.buffer_size against the cache line, so
+# P2_CACHE_LINE in p2pro_uvc.c derives from CONFIG_CACHE_L2_CACHE_LINE_SIZE - do not hardcode 64.
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+# Present from esp_video 0.9.0 on; Waveshare's own camera demo enables it.
+CONFIG_ESP_VIDEO_ENABLE_DATA_PREPROCESSING=y

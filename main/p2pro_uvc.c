@@ -128,6 +128,12 @@ typedef enum {
 #define WIFI_CAM_IMU_PORT    52219
 #define WIFI_CAM_JPEG_MAX    (64 * 1024)  /* frames measured at 4.5-14 KB; ample */
 #define WIFI_CAM_STALL_MS    2000    /* no video for this long -> re-send the start packet */
+/* Bytes to discard from the final chunk. The spec calls this a trailer but tags it [source] -
+ * read from the upstream implementation, not verified on this unit - and "purpose unknown
+ * (plausibly a checksum)". Stripping 5 made the hardware decoder reject ~70% of frames with
+ * "the number of data units obtained after decoding is different from ... the image resolution",
+ * i.e. the scan data was SHORT, which is exactly what cutting real bytes would cause. */
+#define WIFI_CAM_TRAILER     0
 
 #define P2_BUILTIN_CAM 1
 /* TRIED AND REJECTED - kept so it is not tried again. YUV420 out of the ISP is 1.5 bytes/px
@@ -2695,6 +2701,12 @@ static size_t   s_wifi_jpeg_len[2];
 static QueueHandle_t s_wifi_frame_q;      /* carries the ready slot index, depth 1 */
 static volatile bool s_wifi_active;       /* a frame has arrived recently */
 static uint32_t s_wifi_frames, s_wifi_dropped;
+/* Split so a drop names its own cause: one lumped counter cannot distinguish a lossy link from
+ * a renderer that is too slow, and those need opposite fixes. */
+static uint32_t s_wd_reasm;    /* chunk gap / no SOI - the link lost a datagram */
+static uint32_t s_wd_busy;     /* render_task had not taken the previous frame */
+static uint32_t s_wd_info;     /* jpeg_decoder_get_info rejected the bitstream */
+static uint32_t s_wd_decode;   /* the hardware decoder rejected it */
 /* On-panel geometry, recomputed when the decoded frame size changes. The spec warns not to
  * hardcode 432x432: the NE3 variant of this camera family is 640x360, so the dimensions are read
  * from the JPEG header instead. */
@@ -2924,8 +2936,8 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
         const bool last = (flags & 1) != 0;
         uint8_t *payload = pkt + 4;
         int plen = n - 4;
-        if (last && plen >= 5) {
-            plen -= 5;   /* a trailer, not image data */
+        if (last && plen >= WIFI_CAM_TRAILER) {
+            plen -= WIFI_CAM_TRAILER;
         }
 
         if (fnum != cur_frame) {
@@ -2948,7 +2960,7 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
         }
         last_video_us = now;
         if (frame_bad || asm_len < 4 || asm_buf[0] != 0xFF || asm_buf[1] != 0xD8) {
-            s_wifi_dropped++;
+            s_wifi_dropped++; s_wd_reasm++;
             continue;
         }
         /* THE EOI TRAP: this camera omits FFD9 entirely. Without appending it the hardware
@@ -2965,7 +2977,7 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
             s_wifi_frames++;
             s_wifi_active = true;
         } else {
-            s_wifi_dropped++;   /* render_task has not consumed the previous one yet */
+            s_wifi_dropped++; s_wd_busy++;   /* render_task has not consumed the previous one */
         }
     }
 
@@ -3284,7 +3296,7 @@ static void render_task(void *arg)
 
             jpeg_decode_picture_info_t pi = { 0 };
             if (jpeg_decoder_get_info(jb, jl, &pi) != ESP_OK || !pi.width || !pi.height) {
-                s_wifi_dropped++;
+                s_wifi_dropped++; s_wd_info++;
                 continue;
             }
             if ((int)pi.width != s_wc_sw || (int)pi.height != s_wc_sh) {
@@ -3299,12 +3311,12 @@ static void render_task(void *arg)
                 xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
                 memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
                 s_pending_arrival_us = esp_timer_get_time();
-                esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+                blit_strips(0, 0, s_disp_w, s_disp_h, s_rgb_tx);
                 last_kind = CAM_NONE;
                 continue;
             }
             if (!jpeg_decoder_ensure(s_wc_sw, s_wc_sh) || jl > s_jpeg_in_cap) {
-                s_wifi_dropped++;
+                s_wifi_dropped++; s_wd_decode++;
                 continue;
             }
             const int64_t t0 = esp_timer_get_time();
@@ -3317,7 +3329,7 @@ static void render_task(void *arg)
             };
             if (jpeg_decoder_process(s_jpeg_dec, &dcfg, s_jpeg_in, jl,
                                      s_jpeg_out, s_jpeg_out_cap, &out_len) != ESP_OK) {
-                s_wifi_dropped++;
+                s_wifi_dropped++; s_wd_decode++;
                 continue;
             }
             xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
@@ -3361,14 +3373,16 @@ static void render_task(void *arg)
             ppa_do_scale_rotate_mirror(s_ppa_client, &wswap);
 
             s_pending_arrival_us = t0;
-            esp_lcd_panel_draw_bitmap(s_panel, s_wc_x, s_wc_y,
+            blit_strips(s_wc_x, s_wc_y,
                                       s_wc_x + s_wc_w, s_wc_y + s_wc_h, s_rgb_tx);
             int64_t wnow = esp_timer_get_time();
             if (wnow - s_last_report_us >= 2000000) {
-                ESP_LOGI(TAG, "wifi displayed=%d avg_e2e=%" PRId64 "us frames=%u dropped=%u",
+                ESP_LOGI(TAG, "wifi displayed=%d avg_e2e=%" PRId64 "us | frames=%u "
+                              "drops: reasm=%u busy=%u info=%u decode=%u",
                          s_frames_rendered,
                          s_frames_rendered ? s_e2e_time_sum_us / s_frames_rendered : 0,
-                         (unsigned)s_wifi_frames, (unsigned)s_wifi_dropped);
+                         (unsigned)s_wifi_frames, (unsigned)s_wd_reasm, (unsigned)s_wd_busy,
+                         (unsigned)s_wd_info, (unsigned)s_wd_decode);
                 s_frames_rendered = 0;
                 s_e2e_time_sum_us = 0;
                 s_last_report_us = wnow;
@@ -3398,7 +3412,7 @@ static void render_task(void *arg)
                     xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
                     memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
                     s_pending_arrival_us = esp_timer_get_time();
-                    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+                    blit_strips(0, 0, s_disp_w, s_disp_h, s_rgb_tx);
                     continue;
                 }
                 struct v4l2_buffer buf = {
@@ -3609,7 +3623,7 @@ static void render_task(void *arg)
                                                        * one the ISR swallows (SPI queue is FIFO) */
                 memset(s_rgb_tx, 0, (size_t)s_img_w * s_fb_h * sizeof(uint16_t));
                 s_pending_arrival_us = esp_timer_get_time();
-                esp_lcd_panel_draw_bitmap(s_panel, s_img_off_x, s_img_off_y,
+                blit_strips(s_img_off_x, s_img_off_y,
                                            s_img_off_x + s_img_w, s_img_off_y + s_fb_h, s_rgb_tx);
                 disconnect_shown = true;
             }
@@ -3657,7 +3671,7 @@ static void render_task(void *arg)
             }
             memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
             s_pending_arrival_us = esp_timer_get_time();
-            esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+            blit_strips(0, 0, s_disp_w, s_disp_h, s_rgb_tx);
             s_osd_dirty = true;            /* thermal mode has to repaint its side bar */
             if (s_stream) {
                 uvc_host_frame_return(s_stream, qf.frame);
@@ -3817,7 +3831,7 @@ static void render_task(void *arg)
             }
 
             s_pending_arrival_us = qf.arrival_us;
-            esp_lcd_panel_draw_bitmap(s_panel, s_gen_x, s_gen_y,
+            blit_strips(s_gen_x, s_gen_y,
                                        s_gen_x + s_gen_w, s_gen_y + s_gen_h, s_rgb_tx);
 
             int64_t gnow = esp_timer_get_time();
@@ -3877,7 +3891,7 @@ static void render_task(void *arg)
                 draw_status_bar("NO\nTEMP");
                 memset(s_rgb_tx, 0, (size_t)s_img_w * s_fb_h * sizeof(uint16_t));
                 s_pending_arrival_us = esp_timer_get_time();
-                esp_lcd_panel_draw_bitmap(s_panel, s_img_off_x, s_img_off_y,
+                blit_strips(s_img_off_x, s_img_off_y,
                                            s_img_off_x + s_img_w, s_img_off_y + s_fb_h, s_rgb_tx);
                 no_temp_shown = true;
             }
@@ -4178,7 +4192,7 @@ static void render_task(void *arg)
         }
 
         s_pending_arrival_us = qf.arrival_us; /* read by on_color_trans_done once this transfer completes */
-        esp_lcd_panel_draw_bitmap(s_panel, s_img_off_x, s_img_off_y,
+        blit_strips(s_img_off_x, s_img_off_y,
                                    s_img_off_x + s_img_w, s_img_off_y + s_fb_h, s_rgb_tx);
 
         int64_t now = esp_timer_get_time();

@@ -551,12 +551,40 @@ An NK3 "earpick" otoscope: an OPEN 2.4 GHz access point serving JPEG over UDP, p
 `~/Documents/nk3-scope/NK3_CAMERA_PROTOCOL.md`. Preferred over the built-in camera, used only when
 no USB camera is attached.
 
-**Working so far:** the radio comes up on the onboard ESP32-C6 via `esp_wifi_remote` + `esp_hosted`
-(the P4 has no radio of its own), the AP is found by SSID prefix, and the join succeeds -
-`ip 192.168.1.100 gw 192.168.1.1`, where the **gateway is what identifies NE7**; the brand string
-reports NE3 and is wrong. Handshake (`66 39 01 01` discovery, then `86 06 01` and `20 36`) is sent.
-Video reassembly, the 5-byte trailer, the missing `FF D9`, and hardware JPEG decode are
-implemented but **not yet verified** - the camera's battery went flat before a frame arrived.
+**Working: 13 fps at 28.7 ms end to end, zero frames dropped at any stage.** The radio comes up on
+the onboard ESP32-C6 via `esp_wifi_remote` + `esp_hosted` (the P4 has no radio of its own), the AP
+is found by SSID prefix, and the join gives `ip 192.168.1.100 gw 192.168.1.1` - the **gateway is
+what identifies NE7**, since the brand string reports NE3 and is wrong. Frames are reassembled from
+the 4-byte chunk headers, `FF D9` is appended because the camera omits it, and the P4's hardware
+JPEG decoder feeds the existing PPA path.
+
+```
+wifi displayed=26  avg_e2e=28715us | frames=639  drops: reasm=0 busy=0 info=0 decode=0
+```
+
+#### There is NO 5-byte trailer on this unit
+
+The spec describes discarding the last 5 bytes of the final chunk - "a trailer, not image data",
+"purpose unknown (plausibly a checksum)" - but tags it **[source]**, read from the upstream
+implementation rather than verified on this hardware. On this unit those 5 bytes are **real scan
+data**. Stripping them truncated every frame and the hardware decoder rejected ~70% with:
+
+```
+jpeg.decoder: the number of data units obtained after decoding a frame of image is different
+from the number of data units calculated based on the image resolution configured by the software
+```
+
+~30% still decoded, because JPEG can complete when the shortfall happens to land in padding - so a
+partially working stream was the misleading symptom. `WIFI_CAM_TRAILER` is 0.
+
+**What found it:** splitting one `dropped` counter into four - `reasm` / `busy` / `info` / `decode`.
+One run then read `reasm=0 busy=0 info=0 decode=N`, which cleared the link, the hand-off and the
+JPEG header simultaneously and pointed at the decoder, whose own log named the cause. A single
+lumped counter cannot distinguish a lossy link from a slow renderer, and those need opposite fixes.
+
+**Not implemented:** IMU-driven auto-rotation. The spec's `angle` field is disputed upstream (it
+disagrees with the accelerometer axes in the one sample available) and PPA rotates only in 90
+degree steps, so arbitrary-angle rotation is not available to us anyway.
 
 The app partition grew 1MB -> 3MB for the WiFi stack, which moves `ffc` and `storage`: a stored
 flat-field table is discarded once on update.

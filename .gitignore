@@ -16,3 +16,6 @@ build/
 .idea/
 *.swp
 .DS_Store
+
+# Vendor reference repos cloned for comparison; not part of this project.
+ws35/

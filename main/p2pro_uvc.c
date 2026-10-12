@@ -219,6 +219,26 @@ typedef enum {
  * two serialisation stalls were found; off now that they are gone. */
 #define P2_WIFI_LATENCY_TRACE 0
 
+/* Probe an undocumented command once, 10 s into a session, and log what the stream does.
+ *
+ * The vendor APK's NE3 sibling (T0/f.smali) carries a LARGER 0x20 0x3X family - 35, 36, 37, 38 -
+ * plus 30 66 and 30 67. On NE7 the app only ever sends 36 (start) and 37 (stop), so 35 and 38
+ * have never been tried on this camera. They may be nothing; they may be the mode control the
+ * app does not expose.
+ *
+ * Safe to try because the stall keepalive re-sends 20 36 after 2 s of silence, so a probe that
+ * kills the stream recovers by itself rather than needing a power cycle. 0 disables. */
+/* TRIED AND DEAD - do not re-probe. All four undocumented opcodes from the NE3 sibling were sent
+ * to a live NE7 stream, 5 s apart, with the JPEG dimensions logged throughout:
+ *
+ *   20 35 (frames=61)   20 38 (frames=120)   30 66 (frames=181)   30 67 (frames=247)
+ *
+ * Result for every one: 432x432 unchanged, ~13 fps unchanged, no drops, no stall. The camera
+ * ignores them and keeps streaming. Combined with the vendor app having only four commands and
+ * no mode control at all, 432x432 at ~13 fps is this hardware's ceiling. */
+#define P2_WIFI_PROBE_CMD  0
+#define P2_WIFI_PROBE_SEQ  0
+
 #define P2_BUILTIN_CAM 1
 /* TRIED AND REJECTED - kept so it is not tried again. YUV420 out of the ISP is 1.5 bytes/px
  * instead of RGB565's 2, so 25% fewer bytes per frame. It was accepted by the ISP and PPA and
@@ -3032,7 +3052,9 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
     /* Discovery: a 4-byte probe to both documented ports. The reply's SOURCE address is the
      * camera, which is more trustworthy than hardcoding 192.168.1.1. */
     struct sockaddr_in cam = { .sin_family = AF_INET, .sin_addr.s_addr = gw.addr };
-    const uint8_t probe[4] = { 0x66, 0x39, 0x01, 0x01 };
+    /* 0x30 is what the vendor app transmits (T0/d.smali). 0x39 - previously recorded in the
+     * spec - also works, so the camera is lenient on this byte, but match the vendor. */
+    const uint8_t probe[4] = { 0x66, 0x30, 0x01, 0x01 };
     struct sockaddr_in bcast = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = (gw.addr & htonl(0xFFFFFF00)) | htonl(0xFF),
@@ -3068,6 +3090,9 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
 
     int64_t last_video_us = esp_timer_get_time();
     int64_t first_chunk_us = last_video_us, prev_done_us = last_video_us;
+    bool probe_sent = false;
+    int probe_i = 0;
+    int64_t last_probe_us = 0;
     int64_t last_imu_tx_us = 0;
     uint8_t pkt[1600];
 
@@ -3094,6 +3119,31 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
                 }
             }
         }
+#if P2_WIFI_PROBE_SEQ
+        /* The untried opcodes from the NE3 sibling, 5 s apart once streaming is established. */
+        static const uint8_t seq[][2] = {
+            { 0x20, 0x35 }, { 0x20, 0x38 }, { 0x30, 0x66 }, { 0x30, 0x67 },
+        };
+        if (probe_i < (int)(sizeof(seq) / sizeof(seq[0])) &&
+            s_wifi_frames > 60 && now - last_probe_us > 5000000) {
+            last_probe_us = now;
+            cam.sin_port = htons(WIFI_CAM_VIDEO_PORT);
+            sendto(fd, seq[probe_i], 2, 0, (struct sockaddr *)&cam, sizeof(cam));
+            ESP_LOGW(TAG, "PROBE %d: sent %02X %02X to :%d (frames=%u, %dx%d)",
+                     probe_i, seq[probe_i][0], seq[probe_i][1], WIFI_CAM_VIDEO_PORT,
+                     (unsigned)s_wifi_frames, s_wc_sw, s_wc_sh);
+            probe_i++;
+        }
+#elif P2_WIFI_PROBE_CMD
+        if (!probe_sent && s_wifi_frames > 100) {
+            probe_sent = true;
+            const uint8_t pc[2] = { 0x20, (uint8_t)P2_WIFI_PROBE_CMD };
+            cam.sin_port = htons(WIFI_CAM_VIDEO_PORT);
+            sendto(fd, pc, sizeof(pc), 0, (struct sockaddr *)&cam, sizeof(cam));
+            ESP_LOGW(TAG, "PROBE: sent 20 %02X after %u frames",
+                     (unsigned)P2_WIFI_PROBE_CMD, (unsigned)s_wifi_frames);
+        }
+#endif
         if (now - last_imu_tx_us > 1000000) {
             cam.sin_port = htons(WIFI_CAM_IMU_PORT);
             sendto(fd, start_imu, sizeof(start_imu), 0, (struct sockaddr *)&cam, sizeof(cam));
@@ -3221,6 +3271,12 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
             s_wifi_dropped++; s_wd_busy++;   /* render_task has not consumed the previous one */
         }
     }
+
+    /* Release the camera for the next client: it accepts exactly one, so leaving the stream
+     * running makes a phone wait for a timeout. The vendor app sends this too (T0/d.smali). */
+    const uint8_t stop_video[2] = { 0x20, 0x37 };
+    cam.sin_port = htons(WIFI_CAM_VIDEO_PORT);
+    sendto(fd, stop_video, sizeof(stop_video), 0, (struct sockaddr *)&cam, sizeof(cam));
 
     free(asm_buf);
     close(fd);
@@ -3596,6 +3652,10 @@ static void render_task(void *arg)
             s_wc_tx_i ^= 1;
             int64_t wnow = esp_timer_get_time();
             if (wnow - s_last_report_us >= 2000000) {
+#if P2_WIFI_LATENCY_TRACE
+                ESP_LOGI(TAG, "wifi jpeg %dx%d  last frame %u bytes",
+                         s_wc_sw, s_wc_sh, (unsigned)s_wifi_jpeg_len[s_wc_tx_i ^ 1]);
+#endif
                 ESP_LOGI(TAG, "wifi displayed=%d avg_e2e=%" PRId64 "us | frames=%u "
                               "drops: reasm=%u busy=%u info=%u decode=%u",
                          s_frames_rendered,

@@ -624,7 +624,25 @@ Decompiled `com.xiaozhen.beauty.hnd`. It has **no native library**; the whole pr
 
 Searching that class for `resolution`, `width`, `height`, `fps`, `quality`, `bitrate` or `mode`
 returns nothing. **The vendor app cannot change the video mode either**, so 432x432 at ~13 fps is
-the hardware's limit. Four corrections were fed back into
+the hardware's limit.
+
+The APK also carries the NE3 sibling (`T0/f.smali`, port 7080) whose `0x20 0x3X` family is larger,
+so the four opcodes NE7 never uses were probed against a live stream 5 s apart, with the decoded
+dimensions logged throughout:
+
+| probe | frames in | result |
+|---|---|---|
+| `20 35` | 61 | 432x432, ~13 fps, no drops, no stall |
+| `20 38` | 120 | unchanged |
+| `30 66` | 181 | unchanged |
+| `30 67` | 247 | unchanged |
+
+All ignored, stream undisturbed. So the ceiling is confirmed from both directions - the app has no
+mode control, and the opcodes it does not use do nothing. **Do not re-probe this.**
+
+Two findings from the APK were worth adopting: the discovery byte is now the vendor's `0x30`
+(`0x39` also works - the camera is lenient on it), and `20 37` is sent on session teardown to
+release the camera, since it accepts only one client and otherwise a phone waits for a timeout. Four corrections were fed back into
 `~/Documents/nk3-scope/NK3_CAMERA_PROTOCOL.md`, including that port 58090 does not exist and that
 the app does not write `cam_brightness`/`calibrated` as that document had assumed.
 

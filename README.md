@@ -582,6 +582,52 @@ One run then read `reasm=0 busy=0 info=0 decode=N`, which cleared the link, the 
 JPEG header simultaneously and pointed at the decoder, whose own log named the cause. A single
 lumped counter cannot distinguish a lossy link from a slow renderer, and those need opposite fixes.
 
+#### Latency: 37-43 ms of ours, and two stalls removed
+
+Measured per stage, which is the only way the two serialisations showed up:
+
+| stage | before | after |
+|---|---|---|
+| reassembly (first chunk -> last) | 1-9 ms | 5-11 ms |
+| hand-off queue wait | 0.3 - **49 ms** | **0.2 ms** |
+| memcpy + JPEG decode | 2.8 ms | 2.8 ms |
+| rotate + mask + byte swap | 7.5 ms | 7.5 ms |
+| **wait for previous blit** | **~21 ms** | **0.006 ms** |
+| SPI blit | 21 ms | 21 ms |
+| **total, ours** | **60-113 ms** | **37-43 ms** |
+
+The ~21 ms stall was the same single-buffer serialisation already fixed on the built-in path:
+with one output buffer the rotate pass cannot start until the previous blit finishes. Two
+alternating buffers remove it, and removing it collapsed the queue wait too, because render_task
+now comes back for the next frame before one has finished assembling.
+
+What remains is near-irreducible: 21 ms is SPI wire time for 176,418 bytes at 80 MHz (120 MHz is
+recorded elsewhere in this file as causing boot hangs), and the 5-11 ms of reassembly is the
+camera spreading one frame over 4-10 datagrams. Against an eyeballed ~300 ms total, **~250 ms is
+upstream** - the camera's own exposure, encode and WiFi stack, plus the 78 ms frame interval.
+
+**A caution on measuring this:** the first instrumentation attempt timestamped before the
+semaphore take, so a 21 ms stall was being attributed to "rotate" (reported as 31 ms). The stall
+was real but mislocated, and splitting `wait` out from `rotate` is what made it obvious.
+
+#### There is no faster video mode - established from the vendor APK
+
+Decompiled `com.xiaozhen.beauty.hnd`. It has **no native library**; the whole protocol is Java in
+`T0/d.smali`, so nothing is hidden. It sends exactly four payloads:
+
+| payload | port | purpose |
+|---|---|---|
+| `66 30 01 01` | 46526 broadcast, x2 | discovery (note `0x30`, not the `0x39` the spec had) |
+| `86 06 01` | 52219 | start IMU |
+| `20 36` | 44506 | start video |
+| `20 37` | 44506 | **stop video** - the app logs "send stop rev img cmd." |
+
+Searching that class for `resolution`, `width`, `height`, `fps`, `quality`, `bitrate` or `mode`
+returns nothing. **The vendor app cannot change the video mode either**, so 432x432 at ~13 fps is
+the hardware's limit. Four corrections were fed back into
+`~/Documents/nk3-scope/NK3_CAMERA_PROTOCOL.md`, including that port 58090 does not exist and that
+the app does not write `cam_brightness`/`calibrated` as that document had assumed.
+
 #### Auto-rotation: the accelerometer reading is the correct one
 
 The camera reports orientation on the IMU channel (port 52219, 24 bytes) and the spec flags which

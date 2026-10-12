@@ -152,10 +152,72 @@ typedef enum {
 #define WIFI_ROT_ANGLE  1
 #define WIFI_ROT_ACCEL  2
 #define P2_WIFI_ROTATE  WIFI_ROT_ACCEL
-/* Low-pass on the applied angle: raw roll jitters and a twitching image is worse than a static
- * one. Also a deadband, so small hand tremor does not keep re-rendering a rotation. */
-#define WIFI_ROT_LPF_NUM   15      /* new sample weight /100 */
-#define WIFI_ROT_DEADBAND  2.0f    /* degrees */
+
+/* WHICH AXIS PAIR carries image roll is not derivable from the spec - it depends on how the
+ * sensor die sits relative to the pixel array. Measured on this unit: x stays small (-251, -130,
+ * -305) while y and z both swing widely, so x is near the axis being twisted about and carries
+ * no roll. atan2(x, y) therefore sat at ~0 or ~180 and flipped in one jump, which is exactly the
+ * reported symptom: nothing, then a sudden large rotation, symmetric on the way back.
+ * All three pairs are computed and logged; this selects the one applied. */
+#define WIFI_AXES_XY  0
+#define WIFI_AXES_YZ  1
+#define WIFI_AXES_XZ  2
+#define P2_WIFI_ROT_AXES  WIFI_AXES_YZ
+
+/* NO SMOOTHING, deliberately. A low pass and a deadband were implemented and removed: with the
+ * correct axis pair the raw signal is steady enough, and stanelie's call is that the response
+ * should be as direct as possible - lag on an instrument you are aiming by hand is worse than
+ * a little jitter. 100 = pass the raw angle straight through.
+ *
+ * The gimbal guard is off for the same reason. It only matters when the lens points near the
+ * twist axis, where roll is mathematically undefined and will swing; set it to 1 if that ever
+ * becomes annoying in use. */
+#define WIFI_ROT_LPF_NUM   100     /* new sample weight /100 */
+#define WIFI_ROT_DEADBAND  0.0f    /* degrees */
+#define WIFI_ROT_GIMBAL_GUARD 0
+
+/* Gain 1. The job is to CANCEL the rotation already present in the raw frame, not to add to it:
+ * the scene is fixed and the sensor turns, so the frame arrives pre-rotated and the display needs
+ * exactly the opposite rotation. Anything other than 1 makes the scene move with the twist.
+ *
+ * Observed while establishing this, with gain 1 in both cases:
+ *   applied = -angle  ->  "works correctly, but opposite direction"
+ *   applied = +angle  ->  "twice as slow as it should"
+ * A sign flip cannot change a magnitude, so those two are only consistent if what is seen is
+ * (raw + applied) - which is the proof that the raw frame rotates and that the fix is
+ * cancellation at unity gain, not a multiplier. Gain 2 then measured 360 degrees of image for
+ * 180 of camera, exactly as that model predicts.
+ *
+ * The angle itself is sound: y +2086 -> -14902 with z -15618 -> -2278 is a ~90 degree move in the
+ * y-z plane and the angle moved 172 -> -99, i.e. 89 degrees, with |y,z| steady at ~1.05 g. */
+#define WIFI_ROT_GAIN  1.0f
+
+/* Fixed mounting correction, added to the measured twist: the sensor sits 90 degrees off the
+ * display, so the scene needs a constant 90 degrees CCW on top of the roll cancellation.
+ *
+ * Sign derived from the renderer rather than guessed: with rad = +90 the inverse map sends
+ * output-right to source-above, i.e. top content lands on the right, which is 90 CW. CCW
+ * therefore needs rad = -90, and since rad = -(angle + offset), the offset is +90.
+ *
+ * Not multiplied by the gain - the gain scales the measured twist, this is a constant. */
+/* 95, not 90: the extra 5 degrees CCW is a mounting trim, levelled by eye on this unit. The
+ * sensor die is not square to the probe body, so the nominal 90 leaves the image slightly off
+ * level. Expect this figure to differ on another camera. */
+#define WIFI_ROT_OFFSET_DEG  95.0f
+
+/* Circular mask, diameter = the output width. Rotating a square source inside a square target
+ * sweeps black wedges through the corners; masking to the inscribed circle hides that and looks
+ * like the otoscope view it is.
+ *
+ * It costs nothing - it SAVES work. The span is computed per row as sqrt(r^2 - dy^2), so the
+ * inner loop samples only inside the circle and the rest is a black fill: one sqrt per row
+ * against ~88,000 avoided source reads, and the skipped pixels are the expensive part (a strided
+ * PSRAM read each). pi/4 of the area is kept, so roughly 21% of the sampling disappears. */
+#define P2_WIFI_CIRCLE_MASK  1
+
+/* Per-stage latency breakdown (reassembly / queue / decode / rotate / blit-wait / blit). How the
+ * two serialisation stalls were found; off now that they are gone. */
+#define P2_WIFI_LATENCY_TRACE 0
 
 #define P2_BUILTIN_CAM 1
 /* TRIED AND REJECTED - kept so it is not tried again. YUV420 out of the ISP is 1.5 bytes/px
@@ -1963,7 +2025,10 @@ static esp_err_t blit_strips(int x0, int y0, int x1, int y1, const uint16_t *buf
 static void wifi_rotate_blit(const uint16_t *src, int sw, int sh,
                              uint16_t *dst, int dw, int dh, float deg)
 {
-    const float rad = -deg * 0.01745329252f;   /* applied as -angle, per the spec */
+    /* Negated: this cancels the rotation the raw frame already carries. (The spec's own
+     * "apply as -angle" is about ITS `angle` field, not a roll we derive ourselves from
+     * atan2(y, z) - the two share no sign convention, and assuming they did cost a round trip.) */
+    const float rad = -(deg * WIFI_ROT_GAIN + WIFI_ROT_OFFSET_DEG) * 0.01745329252f;
     const float cs = cosf(rad), sn = sinf(rad);
     const float scale = (float)sw / (float)dw;  /* source pixels per output pixel */
 
@@ -1973,12 +2038,34 @@ static void wifi_rotate_blit(const uint16_t *src, int sw, int sh,
     const int32_t dxdu = (int32_t)(cs * scale * 65536.0f);
     const int32_t dydu = (int32_t)(-sn * scale * 65536.0f);
 
+#if P2_WIFI_CIRCLE_MASK
+    const float r = (dw < dh ? dw : dh) * 0.5f;
+    const float r2 = r * r;
+#endif
     for (int v = 0; v < dh; v++) {
         const float dv = (float)v - cv;
-        int32_t x = (int32_t)((cx + (-cu * cs + dv * sn) * scale) * 65536.0f);
-        int32_t y = (int32_t)((cy + ( cu * sn + dv * cs) * scale) * 65536.0f);
         uint16_t *row = dst + (size_t)v * dw;
-        for (int u = 0; u < dw; u++) {
+
+        int u0 = 0, u1 = dw - 1;
+#if P2_WIFI_CIRCLE_MASK
+        /* Span of the inscribed circle on this row. Outside it nothing is sampled at all. */
+        const float dy2 = dv * dv;
+        if (dy2 >= r2) {
+            memset(row, 0, (size_t)dw * sizeof(uint16_t));
+            continue;
+        }
+        const float hw = sqrtf(r2 - dy2);
+        u0 = (int)(cu - hw);
+        u1 = (int)(cu + hw);
+        if (u0 < 0) { u0 = 0; }
+        if (u1 > dw - 1) { u1 = dw - 1; }
+        if (u0 > 0) { memset(row, 0, (size_t)u0 * sizeof(uint16_t)); }
+        if (u1 < dw - 1) { memset(row + u1 + 1, 0, (size_t)(dw - 1 - u1) * sizeof(uint16_t)); }
+#endif
+        /* Start the incremental walk at u0, not 0, since the leading pixels were skipped. */
+        int32_t x = (int32_t)((cx + (((float)u0 - cu) * cs + dv * sn) * scale) * 65536.0f);
+        int32_t y = (int32_t)((cy + (-((float)u0 - cu) * sn + dv * cs) * scale) * 65536.0f);
+        for (int u = u0; u <= u1; u++) {
             const int sx = x >> 16, sy = y >> 16;
             if ((unsigned)sx < (unsigned)sw && (unsigned)sy < (unsigned)sh) {
                 const uint16_t px = src[(size_t)sy * sw + sx];
@@ -2776,14 +2863,27 @@ static uint32_t s_wd_decode;   /* the hardware decoder rejected it */
 /* Orientation. s_wifi_rot_deg is what the renderer applies; the two candidates are kept
  * separately so a log line can show which one actually tracks reality. */
 static volatile float s_wifi_rot_deg;
-static volatile float s_imu_angle_deg, s_imu_accel_deg;
+static volatile float s_imu_angle_deg;
+static volatile float s_rot_xy, s_rot_yz, s_rot_xz;   /* all three candidates, for comparison */
 static volatile int16_t s_imu_x, s_imu_y, s_imu_z;
 static uint32_t s_imu_pkts;
+static int64_t  s_wifi_asm_us;    /* first chunk -> last chunk of one frame */
+static int64_t  s_wifi_gap_us;    /* interval between completed frames */
+static int64_t  s_wifi_q_us;      /* frame complete -> render_task picks it up */
+static int64_t  s_wifi_jpeg_t[2]; /* when each slot was filled */
+static int64_t  s_wifi_wait_us;   /* stall waiting for the previous blit */
+static int64_t  s_wifi_dec_us;
 static int64_t  s_wifi_rot_us;   /* memcpy + JPEG decode + the rotate pass, measured together */
 /* On-panel geometry, recomputed when the decoded frame size changes. The spec warns not to
  * hardcode 432x432: the NE3 variant of this camera family is 640x360, so the dimensions are read
  * from the JPEG header instead. */
 static int s_wc_sw, s_wc_sh, s_wc_w, s_wc_h, s_wc_x, s_wc_y;
+/* Two output buffers, as the built-in path uses. With one, the rotate pass cannot start until
+ * the previous frame's blit has finished - measured at ~21 ms of pure stall per frame, on a
+ * budget where our whole contribution was 60-110 ms. Alternating lets this frame's rotate
+ * overlap the previous frame's transfer. */
+static uint16_t *s_wc_tx[2];
+static int       s_wc_tx_i;
 
 /* Bring the radio up once. esp_wifi_remote forwards every call to the C6 over esp-hosted, so a
  * failure here is most likely the C6 not running the hosted slave firmware rather than anything
@@ -2967,6 +3067,7 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
     int      slot = 0;
 
     int64_t last_video_us = esp_timer_get_time();
+    int64_t first_chunk_us = last_video_us, prev_done_us = last_video_us;
     int64_t last_imu_tx_us = 0;
     uint8_t pkt[1600];
 
@@ -3008,18 +3109,31 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
             s_imu_x = (int16_t)(((uint16_t)pkt[0] << 8) | pkt[1]);
             s_imu_y = (int16_t)(((uint16_t)pkt[2] << 8) | pkt[3]);
             s_imu_z = (int16_t)(((uint16_t)pkt[4] << 8) | pkt[5]);
-            s_imu_accel_deg = atan2f((float)s_imu_x, (float)s_imu_y) * 57.2957795f;
+            const float r2d = 57.2957795f;
+            s_rot_xy = atan2f((float)s_imu_x, (float)s_imu_y) * r2d;
+            s_rot_yz = atan2f((float)s_imu_y, (float)s_imu_z) * r2d;
+            s_rot_xz = atan2f((float)s_imu_x, (float)s_imu_z) * r2d;
             s_imu_pkts++;
 
 #if P2_WIFI_ROTATE != WIFI_ROT_OFF
-            float want = (P2_WIFI_ROTATE == WIFI_ROT_ANGLE) ? s_imu_angle_deg
-                                                            : s_imu_accel_deg;
-            /* Gimbal guard: with the lens pointing straight up or down, roll about the view
-             * axis is undefined and atan2 swings wildly. Hold the last stable angle. */
-            const int32_t mag_xy = (int32_t)s_imu_x * s_imu_x + (int32_t)s_imu_y * s_imu_y;
-            if (P2_WIFI_ROTATE == WIFI_ROT_ACCEL && mag_xy < (2000 * 2000)) {
+            float want;
+            if (P2_WIFI_ROTATE == WIFI_ROT_ANGLE) {
+                want = s_imu_angle_deg;
+            } else if (P2_WIFI_ROT_AXES == WIFI_AXES_YZ) {
+                want = s_rot_yz;
+            } else if (P2_WIFI_ROT_AXES == WIFI_AXES_XZ) {
+                want = s_rot_xz;
+            } else {
+                want = s_rot_xy;
+            }
+#if WIFI_ROT_GIMBAL_GUARD
+            /* With the lens near-vertical, roll about the view axis is undefined and atan2
+             * swings wildly. Hold the last stable angle. */
+            const int32_t mag = (int32_t)s_imu_y * s_imu_y + (int32_t)s_imu_z * s_imu_z;
+            if (P2_WIFI_ROTATE == WIFI_ROT_ACCEL && mag < (2000 * 2000)) {
                 want = s_wifi_rot_deg;
             }
+#endif
             /* Shortest-way-round low pass, so 359 -> 1 does not spin the long way. */
             float d = want - s_wifi_rot_deg;
             while (d > 180.0f)  { d -= 360.0f; }
@@ -3030,8 +3144,28 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
 #endif
             continue;
         }
+        if (ntohs(from.sin_port) == WIFI_CAM_DISC_PORT_B && n > 16) {
+            /* The discovery descriptor, logged once. The spec lists "resolution change" under
+             * known unknowns, so this is the only place the camera could advertise a mode or
+             * frame rate we might ask for - worth seeing in full rather than assuming. */
+            static bool shown = false;
+            if (!shown) {
+                shown = true;
+                pkt[(n < (int)sizeof(pkt)) ? n : (int)sizeof(pkt) - 1] = 0;
+                ESP_LOGW(TAG, "wifi descriptor (%d bytes):", n);
+                /* Tab-indented with \n newlines; split so the log does not truncate it. */
+                char *line = (char *)pkt, *nl;
+                while (line && *line) {
+                    nl = strchr(line, '\n');
+                    if (nl) { *nl = 0; }
+                    if (*line) { ESP_LOGW(TAG, "  %s", line); }
+                    line = nl ? nl + 1 : NULL;
+                }
+            }
+            continue;
+        }
         if (ntohs(from.sin_port) != WIFI_CAM_VIDEO_PORT) {
-            continue;   /* discovery replies */
+            continue;   /* anything else */
         }
 
         const uint8_t fnum = pkt[0], flags = pkt[1], cnum = pkt[2];
@@ -3047,6 +3181,7 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
             asm_len = 0;
             next_chunk = 1;
             frame_bad = false;
+            first_chunk_us = now;   /* for the reassembly window */
         }
         if (cnum != next_chunk) {
             frame_bad = true;   /* gap or reorder: this frame is unusable */
@@ -3074,6 +3209,10 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
         if (s_wifi_jpeg[slot] && uxQueueMessagesWaiting(s_wifi_frame_q) == 0) {
             memcpy(s_wifi_jpeg[slot], asm_buf, asm_len);
             s_wifi_jpeg_len[slot] = asm_len;
+            s_wifi_jpeg_t[slot] = now;
+            s_wifi_asm_us = now - first_chunk_us;
+            s_wifi_gap_us = now - prev_done_us;
+            prev_done_us = now;
             xQueueOverwrite(s_wifi_frame_q, &slot);
             slot ^= 1;
             s_wifi_frames++;
@@ -3114,8 +3253,12 @@ static void wifi_cam_task(void *arg)
     for (int i = 0; i < 2; i++) {
         s_wifi_jpeg[i] = heap_caps_malloc(WIFI_CAM_JPEG_MAX, MALLOC_CAP_SPIRAM);
     }
+    for (int i = 0; i < 2; i++) {
+        s_wc_tx[i] = heap_caps_aligned_alloc(P2_CACHE_LINE, ppa_out_bytes(s_disp_w, s_disp_h),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    }
     s_wifi_frame_q = xQueueCreate(1, sizeof(int));
-    if (!s_wifi_jpeg[0] || !s_wifi_jpeg[1] || !s_wifi_frame_q) {
+    if (!s_wifi_jpeg[0] || !s_wifi_jpeg[1] || !s_wc_tx[0] || !s_wc_tx[1] || !s_wifi_frame_q) {
         ESP_LOGE(TAG, "wifi: buffer alloc failed");
         vTaskDelete(NULL);
         return;
@@ -3393,6 +3536,7 @@ static void render_task(void *arg)
             if (xQueueReceive(s_wifi_frame_q, &slot, pdMS_TO_TICKS(100)) != pdPASS) {
                 continue;
             }
+            s_wifi_q_us = esp_timer_get_time() - s_wifi_jpeg_t[slot];
             const uint8_t *jb = s_wifi_jpeg[slot];
             const size_t   jl = s_wifi_jpeg_len[slot];
 
@@ -3434,16 +3578,22 @@ static void render_task(void *arg)
                 s_wifi_dropped++; s_wd_decode++;
                 continue;
             }
-            xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
-            /* One CPU pass does rotation, scaling and the byte swap, replacing the two PPA
-             * transfers this path used before - PPA cannot rotate by an arbitrary angle. */
+            const int64_t t_dec = esp_timer_get_time();
+            /* One CPU pass does rotation, scaling, the circular mask and the byte swap, replacing
+             * the two PPA transfers this path used before - PPA cannot rotate by an arbitrary
+             * angle. Runs BEFORE the wait, into the buffer the display is not reading. */
             wifi_rotate_blit((const uint16_t *)s_jpeg_out, s_wc_sw, s_wc_sh,
-                             s_rgb_tx, s_wc_w, s_wc_h, s_wifi_rot_deg);
-            s_wifi_rot_us = esp_timer_get_time() - t0;
+                             s_wc_tx[s_wc_tx_i], s_wc_w, s_wc_h, s_wifi_rot_deg);
+            const int64_t t_rot = esp_timer_get_time();
+            xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
+            s_wifi_wait_us = esp_timer_get_time() - t_rot;
+            s_wifi_dec_us = t_dec - t0;        /* memcpy + JPEG decode */
+            s_wifi_rot_us = t_rot - t_dec;     /* the rotate/mask pass, now measured alone */
 
             s_pending_arrival_us = t0;
             blit_strips(s_wc_x, s_wc_y,
-                                      s_wc_x + s_wc_w, s_wc_y + s_wc_h, s_rgb_tx);
+                        s_wc_x + s_wc_w, s_wc_y + s_wc_h, s_wc_tx[s_wc_tx_i]);
+            s_wc_tx_i ^= 1;
             int64_t wnow = esp_timer_get_time();
             if (wnow - s_last_report_us >= 2000000) {
                 ESP_LOGI(TAG, "wifi displayed=%d avg_e2e=%" PRId64 "us | frames=%u "
@@ -3452,11 +3602,25 @@ static void render_task(void *arg)
                          s_frames_rendered ? s_e2e_time_sum_us / s_frames_rendered : 0,
                          (unsigned)s_wifi_frames, (unsigned)s_wd_reasm, (unsigned)s_wd_busy,
                          (unsigned)s_wd_info, (unsigned)s_wd_decode);
-                ESP_LOGI(TAG, "wifi decode+rotate=%" PRId64 "us", s_wifi_rot_us);
-                ESP_LOGI(TAG, "wifi imu: pkts=%u  ANGLE=%.0f  ACCEL=%.0f  applied=%.0f  "
-                              "xyz=%d,%d,%d",
-                         (unsigned)s_imu_pkts, s_imu_angle_deg, s_imu_accel_deg,
-                         s_wifi_rot_deg, s_imu_x, s_imu_y, s_imu_z);
+#if P2_WIFI_LATENCY_TRACE
+                {
+                    const int64_t blit = (s_frames_rendered
+                                          ? s_e2e_time_sum_us / s_frames_rendered : 0)
+                                         - s_wifi_dec_us - s_wifi_rot_us - s_wifi_wait_us;
+                    ESP_LOGI(TAG, "wifi latency us: reasm=%" PRId64 " queue=%" PRId64
+                                  " decode=%" PRId64 " rotate=%" PRId64 " wait=%" PRId64
+                                  " blit=~%" PRId64 " | OURS=%" PRId64 "  gap=%" PRId64,
+                             s_wifi_asm_us, s_wifi_q_us, s_wifi_dec_us, s_wifi_rot_us,
+                             s_wifi_wait_us, blit,
+                             s_wifi_asm_us + s_wifi_q_us + s_wifi_dec_us + s_wifi_rot_us
+                                 + s_wifi_wait_us + blit,
+                             s_wifi_gap_us);
+                }
+#endif
+                ESP_LOGW(TAG, "imu xyz=%6d %6d %6d | XY=%4.0f YZ=%4.0f XZ=%4.0f | ANGLE=%4.0f "
+                              "| applied=%4.0f",
+                         s_imu_x, s_imu_y, s_imu_z, s_rot_xy, s_rot_yz, s_rot_xz,
+                         s_imu_angle_deg, s_wifi_rot_deg);
                 s_frames_rendered = 0;
                 s_e2e_time_sum_us = 0;
                 s_last_report_us = wnow;

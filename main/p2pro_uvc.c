@@ -2254,7 +2254,19 @@ static void wifi_rotate_blit(const uint16_t *src, int sw, int sh,
     const int32_t dydu = (int32_t)(-sn * scale * 65536.0f);
 
 #if P2_WIFI_CIRCLE_MASK
-    const float r = (dw < dh ? dw : dh) * 0.5f;
+    /* The circle tracks the CAMERA'S optical image, not the viewport.
+     *
+     * The lens produces a disc inscribed in the sensor's square, so its diameter is
+     * min(sw, sh) source pixels - 432 here - which is min(sw, sh) * scale output pixels. Using
+     * min(dw, dh) instead would size it to the viewport HEIGHT (320) and leave the left and right
+     * thirds of a 432-wide viewport black, masking off real image.
+     *
+     * At 1:1 this is radius 216 centred in a 432x320 box, so the disc is wider than the box is
+     * tall: the viewport clips its top and bottom (as 1:1 intends) and the mask rounds off the
+     * four corners, which is where the square source's corners sweep through during rotation -
+     * the thing the mask exists for. Expressed via min(sw, sh) rather than dw so it stays
+     * correct for a non-square source, such as the NE3 variant's 640x360. */
+    const float r = (float)(sw < sh ? sw : sh) * 0.5f * ((float)dw / (float)sw);
     const float r2 = r * r;
 #endif
     for (int v = 0; v < dh; v++) {
@@ -4501,11 +4513,27 @@ static void render_task(void *arg)
             if ((int)pi.width != s_wc_sw || (int)pi.height != s_wc_sh) {
                 s_wc_sw = pi.width;
                 s_wc_sh = pi.height;
-                fit_preserving_aspect(s_wc_sw, s_wc_sh, s_disp_w, s_disp_h, &s_wc_w, &s_wc_h);
+                /* 1:1, no scaling. The source is 432x432 and the panel 480x320, so the full
+                 * width fits with a 24 px margin either side while the height clips 56 rows top
+                 * and bottom. Clipping rather than fitting is deliberate: a 1:1 map is the only
+                 * one that shows the sensor's own pixels, and stanelie chose the lost rows over
+                 * the softness of a downscale.
+                 *
+                 * fit_preserving_aspect() is NOT used here. It quantises to PPA's 1/16 scale
+                 * grid, which is irrelevant now that this path rotates on the CPU with 16.16
+                 * fixed point - that grid is what held the image to 297x297 (11/16) when 320 was
+                 * available, and 1:1 needs no grid at all. wifi_rotate_blit derives its scale as
+                 * sw/dw, so an output width equal to the source width gives exactly 1.0, and the
+                 * same factor applies to both axes so nothing is stretched.
+                 *
+                 * A smaller source than the panel is shown at 1:1 too, centred, never upscaled. */
+                s_wc_w = (s_wc_sw < s_disp_w) ? s_wc_sw : s_disp_w;
+                s_wc_h = (s_wc_sh < s_disp_h) ? s_wc_sh : s_disp_h;
                 s_wc_x = (s_disp_w - s_wc_w) / 2;
                 s_wc_y = (s_disp_h - s_wc_h) / 2;
-                ESP_LOGI(TAG, "wifi: %dx%d JPEG -> %dx%d at (%d,%d)",
-                         s_wc_sw, s_wc_sh, s_wc_w, s_wc_h, s_wc_x, s_wc_y);
+                ESP_LOGI(TAG, "wifi: %dx%d JPEG -> %dx%d at (%d,%d)  1:1%s",
+                         s_wc_sw, s_wc_sh, s_wc_w, s_wc_h, s_wc_x, s_wc_y,
+                         (s_wc_sh > s_disp_h) ? ", clipping rows" : "");
                 /* New geometry: wipe the panel so nothing of the previous source survives. */
                 xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
                 memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));

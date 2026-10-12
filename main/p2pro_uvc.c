@@ -128,6 +128,7 @@ typedef enum {
 #define WIFI_CAM_IMU_PORT    52219
 #define WIFI_CAM_JPEG_MAX    (64 * 1024)  /* frames measured at 4.5-14 KB; ample */
 #define WIFI_CAM_STALL_MS    2000    /* no video for this long -> re-send the start packet */
+#define WIFI_CAM_MAX_STALLS  4       /* ...and after this many, abandon the session and rescan */
 /* Bytes to discard from the final chunk. The spec calls this a trailer but tags it [source] -
  * read from the upstream implementation, not verified on this unit - and "purpose unknown
  * (plausibly a checksum)". Stripping 5 made the hardware decoder reject ~70% of frames with
@@ -1777,8 +1778,7 @@ static void draw_crosshair(void)
 /* Runs in ISR context (SPI DMA completion) - keep it to counters only, no logging/printf. */
 /* Strips remaining in the frame currently on the bus; 0 means "single draw". */
 static volatile int s_blit_strips_left;
-static bool s_blit_force_strips;   /* a full-frame transfer has failed: do not keep retrying it */
-static int  s_blit_probe;
+static bool s_blit_force_strips;   /* a full-frame transfer has failed: never retry it */
 
 static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
@@ -1986,17 +1986,18 @@ static esp_err_t blit_strips(int x0, int y0, int x1, int y1, const uint16_t *buf
             xSemaphoreGive(s_trans_done_sem);
             return one;
         }
-        /* Sticky. Retrying the big allocation every frame is worse than just stripping: the
-         * failed 307 KB heap walk cost more than it saved, measured as 16 fps for retry-every-
-         * frame against 20.7 fps for stripping unconditionally. Re-probed occasionally in case
-         * whatever fragmented the heap goes away. */
+        /* Sticky, and PERMANENTLY so. Retrying the big allocation every frame measured worse
+         * than just stripping (16 fps against 20.7). It was briefly re-probed every 600 frames
+         * "in case the heap recovers", which was wishful: the fragmentation comes from
+         * esp-hosted's SDIO init and never goes away for the life of the boot, so the re-probe
+         * could only ever fail - emitting three driver errors each time (spi_master,
+         * lcd_panel.io.spi, st7796_general) roughly twice a minute, which looks like a fault and
+         * is not one. If no USB camera is attached the radio never starts, the heap is never
+         * fragmented, and this flag is never set in the first place. */
         s_blit_force_strips = true;
         ESP_LOGW(TAG, "blit: full-frame transfer needs %d bytes of contiguous internal RAM "
                       "(largest is %u) - switching to strips",
                  w * h * 2, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-    } else if (++s_blit_probe >= 600) {   /* ~every 20 s at 30 fps */
-        s_blit_probe = 0;
-        s_blit_force_strips = false;
     }
 
     const size_t row_bytes = (size_t)w * sizeof(uint16_t);
@@ -3205,6 +3206,7 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
     int probe_i = 0;
     int64_t last_probe_us = 0;
     int64_t last_imu_tx_us = 0;
+    int stalls = 0;
     uint8_t pkt[1600];
 
     while (true) {
@@ -3219,16 +3221,32 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
             sendto(fd, start_video, sizeof(start_video), 0, (struct sockaddr *)&cam, sizeof(cam));
             last_video_us = now;
             s_wifi_active = false;
-            ESP_LOGW(TAG, "wifi: video stalled, re-sent start");
-            if (!s_wifi_frames) {
-                /* Never got a single frame: most likely another client (a phone) holds the
-                 * camera, which accepts exactly one. Give up so the caller can rescan. */
-                static int giveup = 0;
-                if (++giveup >= 5) {
-                    ESP_LOGE(TAG, "wifi: no frames at all - is a phone connected to the camera?");
-                    break;
-                }
+            stalls++;
+            ESP_LOGW(TAG, "wifi: video stalled (%d), re-sent start", stalls);
+            /* Give up after a few, ALWAYS - not only when no frame was ever received.
+             *
+             * This previously tested the lifetime frame counter, which is non-zero forever after
+             * the first frame, so the branch was unreachable and a session whose camera had been
+             * switched off looped here indefinitely, re-sending the start command to nothing and
+             * never returning to rescan. Switching the camera off and on then looked like "it
+             * will not connect", when in fact we had never left the dead session. The counter was
+             * also static, which would have made a LATER session abort almost at once. */
+            if (stalls >= WIFI_CAM_MAX_STALLS) {
+                ESP_LOGE(TAG, "wifi: %d stalls, abandoning the session to rescan "
+                              "(camera off, out of range, or another client took it)", stalls);
+                break;
             }
+        } else if (n > 0) {
+            stalls = 0;   /* any traffic at all means the camera is still there */
+        }
+
+        /* Faster than waiting for stalls: losing the AP raises STA_DISCONNECTED, which is exactly
+         * what happens when the camera is powered off. Leave immediately so the outer loop can
+         * rescan and be ready the moment it comes back. */
+        if (xEventGroupGetBits(s_wifi_evt) & WIFI_BIT_FAILED) {
+            ESP_LOGW(TAG, "wifi: association lost - reason %d (%s), leaving session",
+                     s_wifi_last_reason, wifi_reason_str(s_wifi_last_reason));
+            break;
         }
 #if P2_WIFI_PROBE_SEQ
         /* The untried opcodes from the NE3 sibling, 5 s apart once streaming is established. */
@@ -3707,6 +3725,11 @@ static void render_task(void *arg)
     queued_frame_t qf;
 #if P2_BUILTIN_CAM
     bool bi_shown = false;
+#endif
+#if P2_WIFI_CAM
+    bool wc_shown = false;   /* has the panel been cleared for this WiFi session? */
+#endif
+#if P2_BUILTIN_CAM
     int64_t bi_sem_sum = 0, bi_ppa1_sum = 0, bi_ppa2_sum = 0, bi_wait_sum = 0, bi_dq_sum = 0;
     int bi_n = 0;
 #endif
@@ -3724,6 +3747,20 @@ static void render_task(void *arg)
             if (bi_shown || s_bi_fd >= 0) {
                 bi_shown = false;
                 builtin_cam_stop();
+            }
+            /* Clear the whole panel once on entry. The WiFi image is a 297x297 circle centred in
+             * a 480x320 panel, so without this the margins keep showing whatever the built-in
+             * camera last drew full-screen. Stripped, because WiFi being up means internal RAM
+             * is fragmented and a single full-frame blit would fail. */
+            if (!wc_shown) {
+                wc_shown = true;
+                last_kind = CAM_NONE;
+                disconnect_shown = false;
+                xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
+                memset(s_rgb_tx, 0, (size_t)s_disp_w * s_disp_h * sizeof(uint16_t));
+                s_pending_arrival_us = esp_timer_get_time();
+                blit_strips(0, 0, s_disp_w, s_disp_h, s_rgb_tx);
+                continue;
             }
             int slot = 0;
             RSTAGE("wifi frame wait");
@@ -3825,6 +3862,9 @@ static void render_task(void *arg)
             }
             continue;
         }
+#if P2_WIFI_CAM
+        wc_shown = false;   /* not showing WiFi any more: next entry clears the panel again */
+#endif
         if (s_cam_kind == CAM_NONE) {
             /* Debounced. The built-in camera is a fallback and must never compete with the
              * instrument: starting it eagerly meant it ran all through USB enumeration and after

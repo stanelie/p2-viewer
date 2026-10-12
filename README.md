@@ -582,6 +582,52 @@ One run then read `reasm=0 busy=0 info=0 decode=N`, which cleared the link, the 
 JPEG header simultaneously and pointed at the decoder, whose own log named the cause. A single
 lumped counter cannot distinguish a lossy link from a slow renderer, and those need opposite fixes.
 
+#### A dead session never ended - the real cause of "it will not connect"
+
+Switching the camera off and on again appeared to break connection. It was not a connection
+problem at all. The session's give-up test read:
+
+```c
+if (!s_wifi_frames) {        /* LIFETIME counter - non-zero forever after frame 1 */
+    static int giveup = 0;   /* and static: persists across sessions */
+    if (++giveup >= 5) break;
+}
+```
+
+`s_wifi_frames` counts frames for the life of the process, so once one frame had arrived the
+branch was **unreachable**. With the camera powered off the session sat re-sending `20 36` into
+the void every 2.1 s forever, never returning to the outer loop, so nothing was ever scanning for
+the camera when it came back. From the outside that is indistinguishable from a failure to
+connect. The `static` on `giveup` was a second latent bug - it would have made a *later*, healthy
+session abort almost immediately.
+
+Fixed two ways: a **per-session** stall counter that gives up after `WIFI_CAM_MAX_STALLS` (4)
+regardless of history and resets on any traffic, and **direct detection of lost association** -
+powering the camera off raises `STA_DISCONNECTED` (beacon timeout), so the session now exits
+within ~2 s rather than waiting out stalls.
+
+**Worth recording about the process:** everything in the section below - static IP, join retries,
+channel hints, reason codes - was aimed at the *join*, and the join was never broken. Those are
+real improvements but they were not the fix, because the failure had not been reproduced first.
+One power-cycle reproduced it instantly. Reproduce before fixing.
+
+#### The strip fallback must be permanent
+
+The fallback originally re-probed the 307 KB allocation every 600 frames "in case the heap
+recovers". It cannot: the fragmentation comes from esp-hosted's SDIO init and persists for the
+life of the boot. So the retry could only ever fail, and each failure emitted three driver errors
+(`spi_master`, `lcd_panel.io.spi`, `st7796_general`) about twice a minute - which reads as a fault
+and is not one. Now permanently sticky: one burst at the moment it engages, then silence. With a
+USB camera attached the radio never starts, the heap is never fragmented, and the flag is never
+set at all.
+
+#### Handover clears the panel
+
+The WiFi branch only wiped the panel when the decoded geometry *changed*, so moving from the
+built-in camera's full-screen 480x320 to WiFi's 297x297 circle left the previous image in the
+margins. It now clears the whole panel once on entry, re-armed whenever WiFi stops being the
+active source, and stripped because the heap is fragmented whenever this path runs.
+
 #### Connecting: faster, and failures now say why
 
 Four changes, after "it sometimes just would not connect":

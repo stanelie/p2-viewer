@@ -135,6 +135,28 @@ typedef enum {
  * i.e. the scan data was SHORT, which is exactly what cutting real bytes would cause. */
 #define WIFI_CAM_TRAILER     0
 
+/* ---- auto-rotation ---------------------------------------------------------------------------
+ * The camera reports its orientation on the IMU channel and the vendor app uses it to keep the
+ * picture upright. Which FIELD carries roll is disputed in the spec, so both candidates are
+ * computed and logged and a flag picks the one that is applied:
+ *
+ *   ANGLE  - uint16 big-endian at bytes 18-19, used directly. Tagged [source].
+ *   ACCEL  - atan2 of int16 big-endian axes at bytes 0 and 2. The spec argues for this: the
+ *            at-rest sample gives |(x,y,z)| = 1.037 g at 2^14 counts/g, which is what a
+ *            stationary accelerometer should read, while the uint8 reading has no such
+ *            interpretation. Also tagged as unconfirmed, on one sample.
+ *
+ * Rotation is applied as -angle about the image centre. The frames are square, so rotation never
+ * exposes empty corners inside a square viewport. */
+#define WIFI_ROT_OFF    0
+#define WIFI_ROT_ANGLE  1
+#define WIFI_ROT_ACCEL  2
+#define P2_WIFI_ROTATE  WIFI_ROT_ACCEL
+/* Low-pass on the applied angle: raw roll jitters and a twitching image is worse than a static
+ * one. Also a deadband, so small hand tremor does not keep re-rendering a rotation. */
+#define WIFI_ROT_LPF_NUM   15      /* new sample weight /100 */
+#define WIFI_ROT_DEADBAND  2.0f    /* degrees */
+
 #define P2_BUILTIN_CAM 1
 /* TRIED AND REJECTED - kept so it is not tried again. YUV420 out of the ISP is 1.5 bytes/px
  * instead of RGB565's 2, so 25% fewer bytes per frame. It was accepted by the ISP and PPA and
@@ -1927,6 +1949,50 @@ static esp_err_t blit_strips(int x0, int y0, int x1, int y1, const uint16_t *buf
     return ret;
 }
 
+#if P2_WIFI_CAM
+/* Rotate + scale + byte-swap a decoded RGB565 frame straight into the transmit buffer.
+ *
+ * PPA can only rotate in 90-degree steps, so an arbitrary roll angle has to be done here. Doing
+ * it in one pass also replaces BOTH PPA passes this path used to need, so the extra CPU work is
+ * partly paid for by the two PPA transfers and the intermediate buffer it removes.
+ *
+ * Inverse-mapped (output -> source) with nearest sampling and 16.16 fixed point, stepping
+ * incrementally along each row so the inner loop is two adds, a bounds test and a load. Pixels
+ * that map outside the source are black - with a square source inside a square target that only
+ * happens at the very corners. */
+static void wifi_rotate_blit(const uint16_t *src, int sw, int sh,
+                             uint16_t *dst, int dw, int dh, float deg)
+{
+    const float rad = -deg * 0.01745329252f;   /* applied as -angle, per the spec */
+    const float cs = cosf(rad), sn = sinf(rad);
+    const float scale = (float)sw / (float)dw;  /* source pixels per output pixel */
+
+    const float cu = dw * 0.5f, cv = dh * 0.5f;
+    const float cx = sw * 0.5f, cy = sh * 0.5f;
+
+    const int32_t dxdu = (int32_t)(cs * scale * 65536.0f);
+    const int32_t dydu = (int32_t)(-sn * scale * 65536.0f);
+
+    for (int v = 0; v < dh; v++) {
+        const float dv = (float)v - cv;
+        int32_t x = (int32_t)((cx + (-cu * cs + dv * sn) * scale) * 65536.0f);
+        int32_t y = (int32_t)((cy + ( cu * sn + dv * cs) * scale) * 65536.0f);
+        uint16_t *row = dst + (size_t)v * dw;
+        for (int u = 0; u < dw; u++) {
+            const int sx = x >> 16, sy = y >> 16;
+            if ((unsigned)sx < (unsigned)sw && (unsigned)sy < (unsigned)sh) {
+                const uint16_t px = src[(size_t)sy * sw + sx];
+                row[u] = (uint16_t)((px >> 8) | (px << 8));   /* the ST7796's byte order */
+            } else {
+                row[u] = 0;
+            }
+            x += dxdu;
+            y += dydu;
+        }
+    }
+}
+#endif
+
 static int ppa_quantized_out(int in_dim, int desired_out)
 {
     int sixteenths = (int)(((float)desired_out / in_dim) * 16.0f); /* floor, as the driver casts */
@@ -2707,6 +2773,13 @@ static uint32_t s_wd_reasm;    /* chunk gap / no SOI - the link lost a datagram 
 static uint32_t s_wd_busy;     /* render_task had not taken the previous frame */
 static uint32_t s_wd_info;     /* jpeg_decoder_get_info rejected the bitstream */
 static uint32_t s_wd_decode;   /* the hardware decoder rejected it */
+/* Orientation. s_wifi_rot_deg is what the renderer applies; the two candidates are kept
+ * separately so a log line can show which one actually tracks reality. */
+static volatile float s_wifi_rot_deg;
+static volatile float s_imu_angle_deg, s_imu_accel_deg;
+static volatile int16_t s_imu_x, s_imu_y, s_imu_z;
+static uint32_t s_imu_pkts;
+static int64_t  s_wifi_rot_us;   /* memcpy + JPEG decode + the rotate pass, measured together */
 /* On-panel geometry, recomputed when the decoded frame size changes. The spec warns not to
  * hardcode 432x432: the NE3 variant of this camera family is 640x360, so the dimensions are read
  * from the JPEG header instead. */
@@ -2928,8 +3001,37 @@ static void wifi_cam_session(esp_ip4_addr_t gw)
         if (n < 4) {
             continue;
         }
+        if (ntohs(from.sin_port) == WIFI_CAM_IMU_PORT && n >= 24) {
+            /* Both readings of the same 24 bytes - see the P2_WIFI_ROTATE comment. */
+            const uint16_t raw_angle = ((uint16_t)pkt[18] << 8) | pkt[19];
+            s_imu_angle_deg = (float)raw_angle;
+            s_imu_x = (int16_t)(((uint16_t)pkt[0] << 8) | pkt[1]);
+            s_imu_y = (int16_t)(((uint16_t)pkt[2] << 8) | pkt[3]);
+            s_imu_z = (int16_t)(((uint16_t)pkt[4] << 8) | pkt[5]);
+            s_imu_accel_deg = atan2f((float)s_imu_x, (float)s_imu_y) * 57.2957795f;
+            s_imu_pkts++;
+
+#if P2_WIFI_ROTATE != WIFI_ROT_OFF
+            float want = (P2_WIFI_ROTATE == WIFI_ROT_ANGLE) ? s_imu_angle_deg
+                                                            : s_imu_accel_deg;
+            /* Gimbal guard: with the lens pointing straight up or down, roll about the view
+             * axis is undefined and atan2 swings wildly. Hold the last stable angle. */
+            const int32_t mag_xy = (int32_t)s_imu_x * s_imu_x + (int32_t)s_imu_y * s_imu_y;
+            if (P2_WIFI_ROTATE == WIFI_ROT_ACCEL && mag_xy < (2000 * 2000)) {
+                want = s_wifi_rot_deg;
+            }
+            /* Shortest-way-round low pass, so 359 -> 1 does not spin the long way. */
+            float d = want - s_wifi_rot_deg;
+            while (d > 180.0f)  { d -= 360.0f; }
+            while (d < -180.0f) { d += 360.0f; }
+            if (d > WIFI_ROT_DEADBAND || d < -WIFI_ROT_DEADBAND) {
+                s_wifi_rot_deg += d * (WIFI_ROT_LPF_NUM / 100.0f);
+            }
+#endif
+            continue;
+        }
         if (ntohs(from.sin_port) != WIFI_CAM_VIDEO_PORT) {
-            continue;   /* IMU and discovery replies are not used yet */
+            continue;   /* discovery replies */
         }
 
         const uint8_t fnum = pkt[0], flags = pkt[1], cnum = pkt[2];
@@ -3333,44 +3435,11 @@ static void render_task(void *arg)
                 continue;
             }
             xSemaphoreTake(s_trans_done_sem, portMAX_DELAY);
-            const ppa_srm_oper_config_t wscale = {
-                .in = {
-                    .buffer = s_jpeg_out,
-                    .pic_w = s_wc_sw, .pic_h = s_wc_sh,
-                    .block_w = s_wc_sw, .block_h = s_wc_sh,
-                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                },
-                .out = {
-                    .buffer = s_rgb_buf,
-                    .buffer_size = ppa_out_bytes(s_wc_w, s_wc_h),
-                    .pic_w = s_wc_w, .pic_h = s_wc_h,
-                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                },
-                .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-                .scale_x = (float)s_wc_w / s_wc_sw,
-                .scale_y = (float)s_wc_h / s_wc_sh,
-                .mode = PPA_TRANS_MODE_BLOCKING,
-            };
-            ppa_do_scale_rotate_mirror(s_ppa_client, &wscale);
-            const ppa_srm_oper_config_t wswap = {
-                .in = {
-                    .buffer = s_rgb_buf,
-                    .pic_w = s_wc_w, .pic_h = s_wc_h,
-                    .block_w = s_wc_w, .block_h = s_wc_h,
-                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                },
-                .out = {
-                    .buffer = s_rgb_tx,
-                    .buffer_size = ppa_out_bytes(s_wc_w, s_wc_h),
-                    .pic_w = s_wc_w, .pic_h = s_wc_h,
-                    .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-                },
-                .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-                .scale_x = 1.0f, .scale_y = 1.0f,
-                .byte_swap = true,
-                .mode = PPA_TRANS_MODE_BLOCKING,
-            };
-            ppa_do_scale_rotate_mirror(s_ppa_client, &wswap);
+            /* One CPU pass does rotation, scaling and the byte swap, replacing the two PPA
+             * transfers this path used before - PPA cannot rotate by an arbitrary angle. */
+            wifi_rotate_blit((const uint16_t *)s_jpeg_out, s_wc_sw, s_wc_sh,
+                             s_rgb_tx, s_wc_w, s_wc_h, s_wifi_rot_deg);
+            s_wifi_rot_us = esp_timer_get_time() - t0;
 
             s_pending_arrival_us = t0;
             blit_strips(s_wc_x, s_wc_y,
@@ -3383,6 +3452,11 @@ static void render_task(void *arg)
                          s_frames_rendered ? s_e2e_time_sum_us / s_frames_rendered : 0,
                          (unsigned)s_wifi_frames, (unsigned)s_wd_reasm, (unsigned)s_wd_busy,
                          (unsigned)s_wd_info, (unsigned)s_wd_decode);
+                ESP_LOGI(TAG, "wifi decode+rotate=%" PRId64 "us", s_wifi_rot_us);
+                ESP_LOGI(TAG, "wifi imu: pkts=%u  ANGLE=%.0f  ACCEL=%.0f  applied=%.0f  "
+                              "xyz=%d,%d,%d",
+                         (unsigned)s_imu_pkts, s_imu_angle_deg, s_imu_accel_deg,
+                         s_wifi_rot_deg, s_imu_x, s_imu_y, s_imu_z);
                 s_frames_rendered = 0;
                 s_e2e_time_sum_us = 0;
                 s_last_report_us = wnow;

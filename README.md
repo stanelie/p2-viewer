@@ -582,9 +582,33 @@ One run then read `reasm=0 busy=0 info=0 decode=N`, which cleared the link, the 
 JPEG header simultaneously and pointed at the decoder, whose own log named the cause. A single
 lumped counter cannot distinguish a lossy link from a slow renderer, and those need opposite fixes.
 
-**Not implemented:** IMU-driven auto-rotation. The spec's `angle` field is disputed upstream (it
-disagrees with the accelerometer axes in the one sample available) and PPA rotates only in 90
-degree steps, so arbitrary-angle rotation is not available to us anyway.
+#### Auto-rotation: the accelerometer reading is the correct one
+
+The camera reports orientation on the IMU channel (port 52219, 24 bytes) and the spec flags which
+field carries roll as **disputed**. Both candidates were computed and logged side by side, and
+three independent samples settle it:
+
+| `xyz` (int16 BE, bytes 0/2/4) | magnitude | g at 2^14/g | `ANGLE` (u16 BE, 18-19) |
+|---|---|---|---|
+| -251, -3745, -14644 | 15117 | **0.92** | 75 |
+| -130, -9476, 13566 | 16548 | **1.01** | 307 |
+| -305, 17027, -1771 | 17122 | **1.05** | 175 |
+
+Every sample reads **~1 g** on the int16 big-endian interpretation, which is what a stationary
+3-axis accelerometer must report - confirming the spec's hypothesis on three samples rather than
+the one it had. `ANGLE` meanwhile jumps 75 -> 307 -> 175 with no coherent progression, so it is not
+image roll. `P2_WIFI_ROTATE` defaults to `WIFI_ROT_ACCEL` (`atan2(x, y)`); set it to
+`WIFI_ROT_ANGLE` to use the other field, or `WIFI_ROT_OFF`.
+
+Smoothed with a 15% low-pass and a 2-degree deadband, taking the shortest way round so 359 -> 1
+does not spin the long way, plus a gimbal guard that holds the last angle when the lens points
+near-vertical and roll becomes undefined.
+
+**PPA cannot rotate by an arbitrary angle** (90-degree steps only), so rotation, scaling and the
+ST7796 byte swap are done in one CPU pass, inverse-mapped with nearest sampling and 16.16 fixed
+point stepped incrementally along each row. That pass **replaces both PPA transfers** this path
+used, so it is partly self-funding. Cost: decode+rotate 13.4 ms, end to end 32.7 ms against
+28.7 ms with PPA - still the camera's full 13 fps, with no frames dropped.
 
 The app partition grew 1MB -> 3MB for the WiFi stack, which moves `ffc` and `storage`: a stored
 flat-field table is discarded once on update.

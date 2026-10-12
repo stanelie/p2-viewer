@@ -582,6 +582,38 @@ One run then read `reasm=0 busy=0 info=0 decode=N`, which cleared the link, the 
 JPEG header simultaneously and pointed at the decoder, whose own log named the cause. A single
 lumped counter cannot distinguish a lossy link from a slow renderer, and those need opposite fixes.
 
+#### Connecting: faster, and failures now say why
+
+Four changes, after "it sometimes just would not connect":
+
+**Static IP instead of DHCP.** The camera's AP is always 192.168.1.0/24 with the camera on .1 -
+that is how NE7 is identified in the first place - and its DHCP server is a BK7231U running on a
+250 mAh battery. Measured **3.6 s** to issue a lease, on the critical path, with no recourse if it
+simply does not answer. Assigning ourselves .100 removes the delay and the failure mode together.
+`s_wifi_use_dhcp` flips on permanently if a session ever associates but receives no frames, so a
+wrong assumption self-corrects rather than bricking the feature.
+
+**The disconnect reason is logged.** Previously the code polled for an address and, on timeout,
+blamed DHCP - which made an association failure indistinguishable from a slow lease, and those
+need opposite fixes. It now waits on the `STA_CONNECTED` event and decodes the reason code on
+failure. `ASSOC_TOOMANY` in particular is called out as *"AP full - one client only!"*, which is
+the most likely explanation for a refused join: the camera accepts exactly one client, so a phone
+on the AP locks us out.
+
+**Channel-targeted scan.** The channel is remembered after the first success and scanned alone,
+falling back to a full sweep on a miss. The camera does move - observed on ch2, and once ch1 - so
+the hint cannot be trusted blindly, but it is several times faster when it holds.
+
+**Join retries before rescanning.** Three attempts, 500 ms apart, before going back to scanning. A
+refused association is often transient, and a rescan costs far more than another attempt.
+
+Measured after: camera found and **joined in 2636 ms with no DHCP step**, against a previous path
+that spent 3.6 s on the lease alone.
+
+**Honest limit:** the intermittent failure was never reproduced here, so this is not a confirmed
+fix for it. What it does is remove one known failure mode, add retries, and make the next failure
+diagnosable - the reason code will name it.
+
 #### Latency: 37-43 ms of ours, and two stalls removed
 
 Measured per stage, which is the only way the two serialisations showed up:

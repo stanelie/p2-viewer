@@ -2868,6 +2868,50 @@ static void render_stage_task(void *arg)
 
 #if P2_WIFI_CAM
 static bool s_wifi_inited;
+/* Connection state, driven by events rather than polled. The disconnect REASON is the single
+ * most useful thing here: without it a failure to connect is indistinguishable from a slow DHCP
+ * server, and those need opposite fixes. */
+static EventGroupHandle_t s_wifi_evt;
+#define WIFI_BIT_CONNECTED  BIT0
+#define WIFI_BIT_FAILED     BIT1
+static volatile int s_wifi_last_reason;
+static uint8_t  s_wifi_last_ch;       /* channel the camera was last seen on */
+static bool     s_wifi_use_dhcp;      /* set if the static-IP assumption ever fails */
+static uint32_t s_wifi_attempts, s_wifi_joins;
+
+static const char *wifi_reason_str(int r)
+{
+    switch (r) {
+    case WIFI_REASON_AUTH_EXPIRE:        return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:         return "AUTH_LEAVE";
+    case WIFI_REASON_ASSOC_EXPIRE:       return "ASSOC_EXPIRE";
+    case WIFI_REASON_ASSOC_TOOMANY:      return "ASSOC_TOOMANY (AP full - one client only!)";
+    case WIFI_REASON_NOT_AUTHED:         return "NOT_AUTHED";
+    case WIFI_REASON_NOT_ASSOCED:        return "NOT_ASSOCED";
+    case WIFI_REASON_ASSOC_LEAVE:        return "ASSOC_LEAVE";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:  return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:        return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:          return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:         return "ASSOC_FAIL";
+    case WIFI_REASON_BEACON_TIMEOUT:     return "BEACON_TIMEOUT";
+    case WIFI_REASON_CONNECTION_FAIL:    return "CONNECTION_FAIL";
+    default:                             return "other";
+    }
+}
+
+static void wifi_evt_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != WIFI_EVENT) {
+        return;
+    }
+    if (id == WIFI_EVENT_STA_CONNECTED) {
+        xEventGroupSetBits(s_wifi_evt, WIFI_BIT_CONNECTED);
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
+        s_wifi_last_reason = d ? d->reason : -1;
+        xEventGroupSetBits(s_wifi_evt, WIFI_BIT_FAILED);
+    }
+}
 /* Two slots so the task can assemble the next frame while render_task decodes the current one. */
 static uint8_t *s_wifi_jpeg[2];
 static size_t   s_wifi_jpeg_len[2];
@@ -2945,15 +2989,21 @@ static bool wifi_cam_init(void)
         ESP_LOGE(TAG, "wifi: esp_wifi_start: %s", esp_err_to_name(err));
         return false;
     }
+    s_wifi_evt = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        wifi_evt_handler, NULL, NULL));
     s_wifi_inited = true;
     ESP_LOGI(TAG, "wifi: radio up via the onboard C6");
     return true;
 }
 
 /* Scan and report every AP. Returns true if one matches WIFI_CAM_PREFIX, copying its SSID out. */
-static bool wifi_cam_scan(char *ssid_out, size_t ssid_len)
+static bool wifi_cam_scan(char *ssid_out, size_t ssid_len, uint8_t hint_ch, uint8_t *ch_out)
 {
-    wifi_scan_config_t scan = { .show_hidden = false };
+    /* A hinted single-channel scan is several times faster than sweeping all 13 - and once the
+     * camera has been seen, its channel is known. Falls back to a full scan when the hint misses
+     * (the camera does move channel: observed on 2, and once on 1). */
+    wifi_scan_config_t scan = { .show_hidden = false, .channel = hint_ch };
     esp_err_t err = esp_wifi_scan_start(&scan, true);   /* blocking */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "wifi: scan failed: %s", esp_err_to_name(err));
@@ -2983,6 +3033,9 @@ static bool wifi_cam_scan(char *ssid_out, size_t ssid_len)
             if (ssid_out) {
                 strlcpy(ssid_out, ss, ssid_len);
             }
+            if (ch_out) {
+                *ch_out = recs[i].primary;
+            }
         }
     }
     free(recs);
@@ -2992,36 +3045,94 @@ static bool wifi_cam_scan(char *ssid_out, size_t ssid_len)
 /* Join the camera's open AP and wait for DHCP. Returns the assigned gateway, which for NE7 is
  * the camera itself - the spec says to select the protocol by gateway address, not by the brand
  * string, which misreports NE3. */
-static bool wifi_cam_connect(const char *ssid, esp_ip4_addr_t *gw_out)
+/* Join the camera's open AP.
+ *
+ * Static IP by default, DHCP only as a fallback. The camera's AP is always 192.168.1.0/24 with
+ * the camera itself on .1 - that is how the NE7 protocol is identified in the first place - and
+ * its DHCP server is a BK7231U with 250 mAh of battery: measured 3.6 s to hand out a lease, on
+ * the critical path, with no recourse if it simply does not answer. Assigning ourselves .100
+ * removes both the delay and the failure mode. s_wifi_use_dhcp flips on if the assumption ever
+ * proves wrong, and then stays flipped.
+ *
+ * Waits on the CONNECTED event rather than polling for an address, so a failure reports its
+ * reason instead of timing out anonymously. */
+static bool wifi_cam_connect(const char *ssid, uint8_t channel, esp_ip4_addr_t *gw_out)
 {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!netif) {
+        return false;
+    }
+    s_wifi_attempts++;
+
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
     wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* the camera AP has no password */
-
+    if (channel) {
+        wc.sta.channel = channel;   /* skip the driver's own scan for the AP */
+    }
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+
+    esp_netif_ip_info_t want = { 0 };
+    if (!s_wifi_use_dhcp) {
+        esp_netif_dhcpc_stop(netif);   /* ESP_ERR_..._ALREADY_STOPPED is fine */
+        want.ip.addr = esp_ip4addr_aton("192.168.1.100");
+        want.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+        want.gw.addr = esp_ip4addr_aton("192.168.1.1");
+        esp_netif_set_ip_info(netif, &want);
+    } else {
+        esp_netif_dhcpc_start(netif);
+    }
+
+    xEventGroupClearBits(s_wifi_evt, WIFI_BIT_CONNECTED | WIFI_BIT_FAILED);
+    const int64_t t0 = esp_timer_get_time();
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "wifi: connect to \"%s\" failed: %s", ssid, esp_err_to_name(err));
+        ESP_LOGW(TAG, "wifi: connect(\"%s\") call failed: %s", ssid, esp_err_to_name(err));
         return false;
     }
 
-    /* Poll for an address rather than wiring up an event handler: this runs in its own task and
-     * has nothing else to do until the lease arrives. */
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    esp_netif_ip_info_t ip = { 0 };
-    for (int i = 0; i < 100; i++) {           /* up to ~10 s */
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
-            ESP_LOGI(TAG, "wifi: joined \"%s\"  ip " IPSTR "  gw " IPSTR,
-                     ssid, IP2STR(&ip.ip), IP2STR(&ip.gw));
-            if (gw_out) {
-                *gw_out = ip.gw;
-            }
-            return true;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt, WIFI_BIT_CONNECTED | WIFI_BIT_FAILED,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(8000));
+    const int64_t assoc_ms = (esp_timer_get_time() - t0) / 1000;
+    if (!(bits & WIFI_BIT_CONNECTED)) {
+        if (bits & WIFI_BIT_FAILED) {
+            ESP_LOGW(TAG, "wifi: join failed after %lldms - reason %d (%s)  [attempt %u]",
+                     assoc_ms, s_wifi_last_reason, wifi_reason_str(s_wifi_last_reason),
+                     (unsigned)s_wifi_attempts);
+        } else {
+            ESP_LOGW(TAG, "wifi: join timed out after %lldms, no event  [attempt %u]",
+                     assoc_ms, (unsigned)s_wifi_attempts);
         }
+        return false;
     }
-    ESP_LOGW(TAG, "wifi: no DHCP lease from \"%s\"", ssid);
-    return false;
+
+    esp_netif_ip_info_t ip = { 0 };
+    if (s_wifi_use_dhcp) {
+        /* Only the fallback path has to wait for a lease. */
+        for (int i = 0; i < 60; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+                break;
+            }
+        }
+        if (ip.ip.addr == 0) {
+            ESP_LOGW(TAG, "wifi: associated in %lldms but no DHCP lease", assoc_ms);
+            return false;
+        }
+    } else {
+        ip = want;
+    }
+
+    s_wifi_joins++;
+    ESP_LOGI(TAG, "wifi: joined \"%s\" in %lldms (%s)  ip " IPSTR "  gw " IPSTR
+                  "  [%u/%u ok]",
+             ssid, assoc_ms, s_wifi_use_dhcp ? "dhcp" : "static",
+             IP2STR(&ip.ip), IP2STR(&ip.gw), (unsigned)s_wifi_joins,
+             (unsigned)s_wifi_attempts);
+    if (gw_out) {
+        *gw_out = ip.gw;
+    }
+    return true;
 }
 
 /* The NE7 video/IMU session. Owns one UDP socket; returns when the stream dies so the caller can
@@ -3327,17 +3438,44 @@ static void wifi_cam_task(void *arg)
             continue;
         }
         char ssid[33] = { 0 };
-        if (!wifi_cam_scan(ssid, sizeof(ssid))) {
-            vTaskDelay(pdMS_TO_TICKS(8000));
+        uint8_t ch = 0;
+        /* Try the remembered channel first; only sweep everything if that misses. */
+        bool seen = wifi_cam_scan(ssid, sizeof(ssid), s_wifi_last_ch, &ch);
+        if (!seen && s_wifi_last_ch) {
+            seen = wifi_cam_scan(ssid, sizeof(ssid), 0, &ch);
+        }
+        if (!seen) {
+            s_wifi_last_ch = 0;
+            vTaskDelay(pdMS_TO_TICKS(4000));
             continue;
         }
-        ESP_LOGW(TAG, "wifi: earpick camera present: \"%s\", connecting", ssid);
+        s_wifi_last_ch = ch;
+        ESP_LOGW(TAG, "wifi: camera \"%s\" on ch%d, joining", ssid, ch);
+
+        /* Retry the join a few times before going back to scanning: a refused association is
+         * often transient (the camera takes one client, and a previous session's socket can
+         * linger), and a rescan costs far more than another attempt. */
         esp_ip4_addr_t gw = { 0 };
-        if (wifi_cam_connect(ssid, &gw) && gw.addr != 0) {
+        bool joined = false;
+        for (int attempt = 0; attempt < 3 && !joined; attempt++) {
+            if (attempt) {
+                esp_wifi_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            joined = wifi_cam_connect(ssid, ch, &gw) && gw.addr != 0;
+        }
+        if (joined) {
+            const uint32_t before = s_wifi_frames;
             wifi_cam_session(gw);
+            if (s_wifi_frames == before && !s_wifi_use_dhcp) {
+                /* Associated and addressed, but the camera never sent a frame. The static-IP
+                 * assumption is the thing most likely to be wrong, so fall back permanently. */
+                s_wifi_use_dhcp = true;
+                ESP_LOGW(TAG, "wifi: no frames with a static address - falling back to DHCP");
+            }
         }
         esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(joined ? 2000 : 1000));
     }
 }
 #endif /* P2_WIFI_CAM */

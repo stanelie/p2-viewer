@@ -148,12 +148,24 @@ typedef struct {
      * On the GW192A the stride is 1001: 1000 pixels, one 0x8002 marker, repeat. A 96x96 plane
      * therefore spans 9225 words, not 9216. */
     uint16_t marker_stride;
+    /* UVC Extension Unit carrying this camera's vendor channel; 0 = none, and then the two
+     * fields below are meaningless. Read off the GW192A's own descriptors on hardware
+     * (probe_dump_xu(), behind P2_USB_PROBE) rather than assumed:
+     *     XU unit_id=10 on interface 0, GUID {A29E7641-DE04-47E3-8B2B-F4341AFF003B},
+     *     bmControls=ff 03 -> control selectors 1..10 implemented.
+     * Kept here instead of re-walking the descriptors at runtime because the UVC component owns
+     * the device and does not expose them, and a second USB host client purely to re-read a
+     * constant is not worth the resources. The numbers are not trusted blindly either: every
+     * exchange is checked against the device's own status register and the returned dwSize, so a
+     * wrong unit shows up as a failed read and not as silently wrong data. */
+    uint8_t  xu_unit;
+    uint8_t  xu_interface;
     bool     vendor_cmds;          /* the InfiRay control channel is available */
 } thermal_model_info_t;
 
 static const thermal_model_info_t s_thermal_models[] = {
     [THERMAL_P2PRO]       = { "P2 Pro",     256, 384, 256, 192, 256u * 192u * 2u,
-                              64.0f, 0.0f, 0,     0,    true  },
+                              64.0f, 0.0f, 0,     0,    0,  0, true  },
     /* Table order is preference order. 96x176 wins because it is the one that FRAMES cleanly:
      * its marker words land at a fixed stride every frame and its min/max are steady, which is
      * what a stable picture needs.
@@ -180,9 +192,9 @@ static const thermal_model_info_t s_thermal_models[] = {
      * worse further out, and the true slope may well be a round 51.2 or 64. A third reference far
      * from these two - ice water or just-boiled water - would tighten it; docs has the procedure. */
     [THERMAL_GW192A]      = { "GW192A",      96, 176,  96,  96, 0u,
-                              51.714f, -10262.0f, 32768, 1001, false },
+                              51.714f, -10262.0f, 32768, 1001, 10, 0, false },
     [THERMAL_GW192A_FULL] = { "GW192A/194",  96, 194,  96,  96, 24u * 192u,
-                              51.714f, -10262.0f, 32768, 1001, false },
+                              51.714f, -10262.0f, 32768, 1001, 10, 0, false },
 };
 #define THERMAL_MODEL_COUNT (sizeof(s_thermal_models) / sizeof(s_thermal_models[0]))
 
@@ -4011,6 +4023,251 @@ static void usb_lib_task(void *arg)
 
 /* ---------------- Render task: raw -> palette -> SPI blit ---------------- */
 
+/* ---- HIKMICRO extension-unit channel --------------------------------------------------------
+ * The GW192A is a rebadged HIKMICRO MiniE/P09-class module (established by decompiling the
+ * vendor app) and carries Hikvision's HCUSBSDK vendor channel on a UVC Extension Unit. The
+ * exchange below was recovered by disassembling libHCUSBSDK.so; docs/GW192A_frame_layout.md has
+ * the derivation and the full 415-command map.
+ *
+ * Addressing is ordinary UVC XU:
+ *     wValue = control_selector << 8
+ *     wIndex = (unit_id << 8) | interface          (0x0A00 on this camera)
+ *     GET: bmRequestType 0xA1, bRequest 0x81 (GET_CUR)
+ *     SET: bmRequestType 0x21, bRequest 0x01 (SET_CUR)
+ *
+ * Two selectors are infrastructure rather than data, and no command in the SDK targets either:
+ *     CS 5  command switch - a 2-byte mailbox, { target_selector, sub_function }
+ *     CS 6  status / last error - 1 byte: 1 busy, 0 success, anything else an error
+ *
+ * So every exchange is: switch on CS 5, transfer on the target selector, then poll CS 6 until it
+ * stops reading busy. The switch is what makes the channel stateful - the SDK even caches it and
+ * skips the write when the pair has not changed - and skipping it is why a naive read of these
+ * selectors returns whatever command happened to be selected last.
+ *
+ * This implementation does the three steps every time and never retries a failed exchange. The
+ * repo's generic-camera notes record what a vendor-request retry loop does to a stream: a
+ * control-transfer storm that drowns it. One pass, then give up and say so. */
+#define XU_CS_SWITCH   5
+#define XU_CS_STATUS   6
+/* Each selector on this camera declares a 512-byte length, so a full-length GET is the
+ * spec-compliant request and comfortably covers the structures read here. It also needs the EP0
+ * buffer patch in tools/patch_managed_components.sh: stock usb_host_uvc caps wLength at 56. */
+#define XU_PAYLOAD_MAX 512
+
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static esp_err_t xu_ctrl(uint8_t bmreq, uint8_t breq, uint8_t cs, uint16_t len, uint8_t *data)
+{
+    if (!s_stream || !s_therm->xu_unit) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return uvc_host_usb_ctrl(s_stream, bmreq, breq,
+                             (uint16_t)cs << 8,
+                             ((uint16_t)s_therm->xu_unit << 8) | s_therm->xu_interface,
+                             len, data);
+}
+
+/* Latch which command the next transfer on `cs` refers to. */
+static esp_err_t xu_select(uint8_t cs, uint8_t subfunc)
+{
+    uint8_t sel[2] = { cs, subfunc };
+    return xu_ctrl(0x21, 0x01, XU_CS_SWITCH, sizeof(sel), sel);
+}
+
+/* Poll CS 6 the way CheckDeviceStatus() does: 10 ms between reads, bounded. */
+static esp_err_t xu_wait_ready(int timeout_ms)
+{
+    for (int waited = 0;; waited += 10) {
+        uint8_t st = 0xFF;
+        esp_err_t e = xu_ctrl(0xA1, 0x81, XU_CS_STATUS, 1, &st);
+        if (e != ESP_OK) {
+            return e;
+        }
+        if (st == 0) {
+            return ESP_OK;
+        }
+        if (st != 1) {
+            ESP_LOGW(TAG, "XU: device reports error status 0x%02x", st);
+            return ESP_FAIL;
+        }
+        if (waited >= timeout_ms) {
+            ESP_LOGW(TAG, "XU: still busy after %d ms", timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* How many bytes the command just latched will return.
+ *
+ * This is NOT optional, and guessing is what made the first attempt fail: asking for the
+ * selector's advertised 512 bytes made the camera STALL every GET_CUR. CUsbDeviceVideoBase::
+ * GetDataLen() shows why - the SDK never picks the read length itself, it asks the device, and
+ * ReadDataStrategy assigns the answer straight into the transfer (trans.length = GetDataLen()).
+ *
+ * The SDK reads FOUR bytes here where UVC defines GET_LEN as two, and asking for four fails on
+ * this stack: usb_host_uvc requires actual_num_bytes == num_bytes, so a device that answers the
+ * standard two bytes is reported as ESP_ERR_INVALID_RESPONSE rather than as a short read. libusb
+ * hands the real count back instead, which is why the SDK never had to care. Two bytes it is -
+ * the value has never been anywhere near 65535. */
+static esp_err_t xu_data_len(uint8_t cs, uint32_t *out)
+{
+    uint8_t len2[2] = {0, 0};
+    esp_err_t e = xu_ctrl(0xA1, 0x85, cs, sizeof(len2), len2);   /* GET_LEN */
+    if (e != ESP_OK) {
+        return e;
+    }
+    *out = (uint32_t)len2[0] | ((uint32_t)len2[1] << 8);
+    return ESP_OK;
+}
+
+/* Switch, ask the length, read it, wait for the status register to go idle. */
+static esp_err_t xu_read(uint8_t cs, uint8_t subfunc, uint8_t *buf, uint16_t cap, uint16_t *got)
+{
+    memset(buf, 0, cap);
+    *got = 0;
+    esp_err_t e = xu_select(cs, subfunc);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "XU: select CS %u sub 0x%02x failed: %s", cs, subfunc, esp_err_to_name(e));
+        return e;
+    }
+    uint32_t want = 0;
+    e = xu_data_len(cs, &want);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "XU: GET_LEN CS %u failed: %s", cs, esp_err_to_name(e));
+        return e;
+    }
+    if (want == 0 || want > cap) {
+        ESP_LOGW(TAG, "XU: CS %u sub 0x%02x wants %u bytes, buffer is %u - not reading",
+                 cs, subfunc, (unsigned)want, cap);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    e = xu_ctrl(0xA1, 0x81, cs, (uint16_t)want, buf);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "XU: GET_CUR CS %u (%u bytes) failed: %s",
+                 cs, (unsigned)want, esp_err_to_name(e));
+        return e;
+    }
+    *got = (uint16_t)want;
+    ESP_LOGW(TAG, "XU: CS %u sub 0x%02x returned %u bytes", cs, subfunc, (unsigned)want);
+    return xu_wait_ready(500);
+}
+
+/* Copies a fixed-width, possibly unterminated vendor string out for logging. */
+static void xu_str(char *dst, size_t dstsz, const uint8_t *src, size_t n)
+{
+    size_t i = 0;
+    for (; i < n && i + 1 < dstsz && src[i] >= 0x20 && src[i] < 0x7F; i++) {
+        dst[i] = (char)src[i];
+    }
+    dst[i] = '\0';
+}
+
+/* One pure read of each of the two structures worth having, logged and then done with.
+ *
+ * Both are GETs: the only write is the 2-byte selector latch, which is what the channel is for.
+ * Field offsets come from the JNA bindings' getFieldOrder(), which is authoritative for the C
+ * layout in a way the plain Java class is not - jadx lists those fields alphabetically, and
+ * trusting that order would have put every value in the wrong place. */
+static void xu_read_device_params(void)
+{
+    static uint8_t buf[XU_PAYLOAD_MAX] __attribute__((aligned(4)));
+
+    /* USB_GET_SYSTEM_DEVICE_INFO - command 2011, CS 1 sub 0x01.
+     * The full structure is 516 bytes and so spans two chunked transfers, but everything
+     * identifying lives in the first 512: byDeviceType is at +196. */
+    uint16_t got = 0;
+    if (xu_read(1, 0x01, buf, sizeof(buf), &got) == ESP_OK && got >= 260) {
+        const uint32_t dwsize = le32(buf);
+        char model[65], fw[65], serial[65];
+        xu_str(model,  sizeof(model),  buf + 196, 64);
+        xu_str(fw,     sizeof(fw),     buf + 4,   64);
+        xu_str(serial, sizeof(serial), buf + 264, 64);
+        ESP_LOGW(TAG, "XU: device info dwSize=%u type='%s' fw='%s' sn='%s'",
+                 (unsigned)dwsize, model, fw, serial);
+    }
+
+    /* USB_GET_THERMOMETRY_BASIC_PARAM - command 2030, CS 3 sub 0x01. The interesting one: it
+     * carries byShiftLength and byFloatTransMode, HIKMICRO's convention for sending floats as
+     * scaled integers, which would let the camera state its own value scaling instead of us
+     * fitting counts_per_kelvin from two reference temperatures. */
+    if (xu_read(3, 0x01, buf, sizeof(buf), &got) == ESP_OK && got >= 84) {
+        const uint32_t dwsize = le32(buf);
+        ESP_LOGW(TAG, "XU: thermometry dwSize=%u enabled=%u unit=%u range=%u",
+                 (unsigned)dwsize, buf[5], buf[9], buf[10]);
+        ESP_LOGW(TAG, "XU: thermometry emissivity=%u distance=%u reflective=%u(en %u) "
+                      "envirotemp=%u(en %u) humidity=%u",
+                 (unsigned)le32(buf + 20), (unsigned)le32(buf + 28),
+                 (unsigned)le32(buf + 36), buf[32],
+                 (unsigned)le32(buf + 80), buf[78], (unsigned)le32(buf + 72));
+        ESP_LOGW(TAG, "XU: thermometry floatTransMode=%u shiftLength=%u thermalRawData=%u "
+                      "sse=%u autoDrift=%u calibCoef=%u(en %u)",
+                 buf[76], buf[77], buf[35], buf[34], buf[33],
+                 (unsigned)le32(buf + 12), buf[11]);
+        ESP_LOGW(TAG, "XU: thermometry range limits %d..%d, excursion %d..%d",
+                 (int)le32(buf + 60), (int)le32(buf + 56),
+                 (int)le32(buf + 68), (int)le32(buf + 64));
+        /* The whole point of the read: if the camera reports a shift length, its values are
+         * scaled by a power of ten and our two-point fit can be checked against it. */
+        if (buf[77]) {
+            float scale = 1.0f;
+            for (int i = 0; i < buf[77] && i < 9; i++) {
+                scale *= 10.0f;
+            }
+            ESP_LOGW(TAG, "XU: shiftLength %u => vendor floats are scaled by %.0f "
+                          "(emissivity %.3f, distance %.3f)",
+                     buf[77], scale, le32(buf + 20) / scale, le32(buf + 28) / scale);
+        }
+    }
+
+    /* Several commands in one pass, to separate "our framing is wrong" from "this module does
+     * not implement that command". If every one answers with nothing but a dwSize then the
+     * framing is incomplete; if one comes back populated, the framing is right and the GW192A
+     * simply does not implement the industrial thermometry API its SDK describes. */
+    static const struct { uint8_t cs, sub; const char *name; } probe[] = {
+        { 1, 0x01, "SYSTEM_DEVICE_INFO" },
+        { 8, 0x11, "DEVICE_INFO_CAPABILITIES" },
+        { 3, 0x01, "THERMOMETRY_BASIC" },
+        { 3, 0x02, "THERMOMETRY_MODE" },
+        { 3, 0x14, "THERMAL_STREAM_CTRL" },
+        { 3, 0x1f, "THERMAL_STREAM_YUV_RES" },
+        { 8, 0x3c, "YUV_RES_CAPABILITIES" },
+        { 10, 0x01, "VIDEO_CODE" },
+        { 2, 0x05, "IMAGE_ENHANCEMENT" },
+    };
+    for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+        uint16_t n = 0;
+        if (xu_read(probe[i].cs, probe[i].sub, buf, sizeof(buf), &n) != ESP_OK) {
+            continue;
+        }
+        unsigned nonzero = 0, last = 0;
+        for (uint16_t k = 0; k < n; k++) {
+            if (buf[k]) {
+                nonzero++;
+                last = k;
+            }
+        }
+        char hex[3 * 16 + 1];
+        int c = 0;
+        for (int k = 0; k < 16 && k < n; k++) {
+            c += snprintf(hex + c, sizeof(hex) - c, "%02x ", buf[k]);
+        }
+        ESP_LOGW(TAG, "XU: CS %2u sub 0x%02x %-26s %u nonzero (last +%u): %s",
+                 probe[i].cs, probe[i].sub, probe[i].name, nonzero, last, hex);
+    }
+
+    /* Raw head of the last response, so a layout that does not match can still be diagnosed
+     * from the console rather than needing another build. */
+    char hex[3 * 24 + 1];
+    int c = 0;
+    for (int i = 0; i < 24; i++) {
+        c += snprintf(hex + c, sizeof(hex) - c, "%02x ", buf[i]);
+    }
+    ESP_LOGW(TAG, "XU: last response +00 %s", hex);
+}
+
 /* ---- GW192A extension-unit enumeration ------------------------------------------------------
  * Read-only reconnaissance of the vendor channel the probe found. For each control selector the
  * device claims in bmControls, ask:
@@ -4026,6 +4283,17 @@ static void usb_lib_task(void *arg)
  * selectors the descriptor advertises, makes one pass, and never retries.
  *
  * UVC addressing: wValue = CS << 8, wIndex = (unit_id << 8) | interface. */
+/* Read the vendor channel once per boot and log what it says. GETs only, plus the 2-byte selector
+ * latch each, no retries, no writes to any setting.
+ *
+ * DEFAULT 0, because as it stands the pass learns nothing: the transport works - selector latch,
+ * GET_LEN, GET_CUR and the status register all succeed, and the status reads 0 for success - but
+ * the camera answers every command with the same two bytes, 00 02, and no structure behind them.
+ * Measured across nine different commands on five selectors. The request framing is therefore
+ * still incomplete (see docs/GW192A_frame_layout.md), and until it is there is no reason to poke
+ * the extension unit on every boot. Set to 1 to re-run the pass while working on it. */
+#define P2_GW_XU_READ 0
+
 #define P2_GW_XU_PROBE 0
 #if P2_GW_XU_PROBE
 static void gw_xu_enumerate(void)
@@ -5574,10 +5842,21 @@ static void streaming_task(void *arg)
         }
 #if P2_GW_XU_PROBE
         if (s_cam_kind == CAM_THERMAL && !s_therm->vendor_cmds) {
-            static bool xu_done = false;
-            if (!xu_done) {
-                xu_done = true;   /* one pass per boot, not per stream */
+            static bool xu_enum_done = false;
+            if (!xu_enum_done) {
+                xu_enum_done = true;   /* one pass per boot, not per stream */
                 gw_xu_enumerate();
+            }
+        }
+#endif
+#if P2_GW_XU_READ
+        /* One pass per boot. Deliberately not per stream: a camera that answers once has
+         * nothing more to say, and a camera that does not should not be asked repeatedly. */
+        if (s_cam_kind == CAM_THERMAL && s_therm->xu_unit) {
+            static bool xu_read_done = false;
+            if (!xu_read_done) {
+                xu_read_done = true;
+                xu_read_device_params();
             }
         }
 #endif

@@ -258,10 +258,10 @@ them, so an unswitched read answers for whatever command was selected last.
 ### The protocol, recovered from libHCUSBSDK.so
 
 Disassembling the SDK's AArch64 build (`tools/hcusbsdk/disas.py`, capstone + pyelftools) recovered
-the whole exchange. **Everything in this subsection is read off the SDK's code, not yet exercised
-against the camera** — the firmware still writes nothing to the channel. What *is* confirmed on
-hardware is the addressing (unit 10, interface 0, selectors 1..10 implemented) and that CS 6
-answers as a 1-byte control, which is what the SDK says the status register is.
+the whole exchange, and it has since been **implemented and run against the camera**. The
+addressing, the selector latch, the length query and the status register all behave as described
+below. The request framing does not yet produce data — see "Implemented, and exactly where it
+stops" at the end of this section before building on any of it.
 
 #### Addressing
 
@@ -369,23 +369,66 @@ as cameras, so plenty of entries are irrelevant here; and a handful of extracted
 out above 10 (11, 23, 24, 25 and one absurd 415), which are either other device families or
 mis-parses of the heuristic, and should not be trusted without checking the function by hand.
 
-#### What to try first
+#### Implemented, and exactly where it stops
 
-`USB_GET_THERMOMETRY_BASIC_PARAM` (CS 3, sub 0x01) is the one to attempt first, and the order is:
+The transport is in `main/p2pro_uvc.c` (`xu_ctrl`, `xu_select`, `xu_data_len`, `xu_wait_ready`,
+`xu_read`) behind `P2_GW_XU_READ`, which **defaults to 0**. It works, and it is not enough.
 
-```
-SET_CUR  CS 5, wIndex 0x0A00, data { 0x03, 0x01 }, 2 bytes
-GET_CUR  CS 3, wIndex 0x0A00, read sizeof(USB_THERMOMETRY_BASIC_PARAM)
-GET_CUR  CS 6, wIndex 0x0A00, 1 byte -> expect 0
-```
+**What works, measured on the camera:**
 
-It is a pure read, so a wrong guess costs nothing but an error, and its payload carries
-`byShiftLength` and `byFloatTransMode` — the scaling the camera applies to its own values, which
-would turn the 51.714 counts/K two-point fit above into a cross-check. `USB_GET_SYSTEM_DEVICE_INFO`
-(CS 1, sub 0x01) is an equally safe first read and would confirm the model string.
+- the selector latch — `SET_CUR` on CS 5 with `{ target_CS, sub_function }` — is accepted;
+- `GET_LEN` on the target selector answers 512;
+- `GET_CUR` on the target selector completes;
+- the status register on CS 6 reads **0, success**, after every exchange.
 
-Note that the firmware's EP0 buffer patch is a hard prerequisite: `USB_THERMOMETRY_BASIC_PARAM`
-alone is well over the stock 56-byte ceiling.
+**What does not work:** the camera answers *every* command with the same two bytes, `00 02`, and
+nothing behind them. That was checked across nine commands on five different selectors —
+`SYSTEM_DEVICE_INFO`, `DEVICE_INFO_CAPABILITIES`, `THERMOMETRY_BASIC`, `THERMOMETRY_MODE`,
+`THERMAL_STREAM_CTRL`, `THERMAL_STREAM_YUV_RES`, `YUV_RES_CAPABILITIES`, `VIDEO_CODE`,
+`IMAGE_ENHANCEMENT` — and all nine returned byte-for-byte the same thing. A response that does
+not vary with the command is not a response.
+
+Note `0x0200` is 512, the same number `GET_LEN` reports, so the likeliest reading is that the
+device is handing back a length rather than a payload: the command is latched and acknowledged,
+but the body was never produced. The missing step is almost certainly a `SET_CUR` of a request
+block on the target selector *before* the read — `CUsbDeviceVideoBase::CommonDeviceConfig` sets
+up two 512-byte buffers and branches on whether the command has an input structure, and that
+branch is where the request layout lives. It was not chased further.
+
+#### Two wrong turns worth recording
+
+Both cost a build each and both looked like the camera's fault when they were ours:
+
+1. **Guessing the read length.** Asking for the advertised 512 bytes failed, and the natural
+   reading was "the device stalled". It had not. `GetDataLen()` shows the SDK never picks a read
+   length — it asks the device with `GET_LEN` and assigns the answer straight into the transfer.
+   Worth knowing even though, on this camera, the answer is always 512.
+
+2. **A short IN read is not an error.** `usb_host_uvc` enforces
+   `actual_num_bytes == num_bytes` and reports anything less as `ESP_ERR_INVALID_RESPONSE`,
+   which is indistinguishable from a real fault at the call site. A short control IN is legal
+   USB; libusb returns the real count, which is why the vendor SDK never had to care, and why
+   its 4-byte `GET_LEN` read works there and fails here against a device that answers the
+   standard 2 bytes. `tools/patch_managed_components.sh` now relaxes that check for IN transfers
+   only — a short *write* is still a fault — and zeroes the payload area first so a caller never
+   sees stale bytes past what arrived.
+
+   This one matters beyond the GW192A: it applies to any vendor control request on any camera.
+
+#### Finishing it
+
+The cheapest remaining route is unchanged and now better motivated: **capture the Android app
+talking to the camera** (USBPcap on Windows, or `usbmon` on a rooted phone). One known-good
+exchange would show the request block the device is waiting for, and the transport to replay it
+is already written and tested. The alternative is to keep reading
+`CommonDeviceConfig` and the `tagUSB_DEVICE_CONFIG_CONTEXT` it takes.
+
+Worth saying plainly: it is also possible the GW192A implements none of this. It is a consumer
+camera carrying an SDK written for industrial modules, the thermometry API it exposes is a
+superset of anything a £40 phone accessory needs, and "acknowledges the command, returns no
+data" is consistent with a module that answers the plumbing and implements nothing behind it.
+The capture would settle that too — if the vendor app gets no more out of it than we do, there
+is nothing there to get.
 
 ### Reproducing the decompile
 

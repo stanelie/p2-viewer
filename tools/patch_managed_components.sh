@@ -47,3 +47,28 @@ if [ -f "$G" ]; then
 else
     echo "skipped, not fetched yet: $G"
 fi
+
+# usb_host_uvc requires a control transfer to move EXACTLY wLength bytes:
+#     ESP_GOTO_ON_FALSE(actual_num_bytes == num_bytes, ESP_ERR_INVALID_RESPONSE, ...)
+# A short control IN is perfectly legal USB, and the HIKMICRO extension unit on the GW192A relies
+# on it: every one of its selectors advertises a 512-byte length (GET_LEN says 512 whatever
+# command is latched) while the actual response is the size of the structure being read - 84-odd
+# bytes for the thermometry parameters. libusb hands the real count back, so the vendor SDK never
+# had to care; here the read failed with ESP_ERR_INVALID_RESPONSE and looked like a stall.
+#
+# So: accept a short IN, and zero the payload area beforehand so a caller never sees stale bytes
+# past what actually arrived. OUT transfers keep the strict check - a short write IS a fault.
+if [ -f "$G" ]; then
+    if grep -q 'actual_num_bytes == p_uvc_host_driver->ctrl_transfer->num_bytes, ESP_ERR_INVALID_RESPONSE' "$G"; then
+        sed -i 's|actual_num_bytes == p_uvc_host_driver->ctrl_transfer->num_bytes, ESP_ERR_INVALID_RESPONSE|actual_num_bytes == p_uvc_host_driver->ctrl_transfer->num_bytes \|\| (in_transfer \&\& p_uvc_host_driver->ctrl_transfer->actual_num_bytes <= p_uvc_host_driver->ctrl_transfer->num_bytes), ESP_ERR_INVALID_RESPONSE|' "$G"
+        echo "patched: uvc_host accepts a short control IN ($G)"
+    else
+        echo "already patched (or upstream changed) short-IN check: $G"
+    fi
+    if ! grep -q 'p2-viewer: a short IN must not expose stale bytes' "$G"; then
+        perl -0pi -e 's|(\n    if \(!in_transfer\) \{\n        memcpy\(start_of_data, data, wLength\);\n    \})|$1 else \{\n        memset(start_of_data, 0, wLength);   /* p2-viewer: a short IN must not expose stale bytes */\n    \}|' "$G"
+        echo "patched: uvc_host zeroes the IN payload area ($G)"
+    else
+        echo "already patched: IN payload zeroing ($G)"
+    fi
+fi

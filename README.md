@@ -1,8 +1,8 @@
 # p2-viewer
 
-Handheld thermal imager firmware: an **InfiRay P2 Pro** USB-C thermal camera driven over UVC by a
-**Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5**, with a touch OSD, palette mapping and live temperature
-readouts. No LVGL — the display is driven straight through `esp_lcd`.
+Handheld thermal imager firmware: an **InfiRay P2 Pro** or **GOYOJO GW192A** USB-C thermal camera
+driven over UVC by a **Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5**, with a touch OSD, palette mapping
+and live temperature readouts. No LVGL — the display is driven straight through `esp_lcd`.
 
 Priorities, in order: **boot time, framerate, latency.**
 
@@ -11,6 +11,48 @@ Priorities, in order: **boot time, framerate, latency.**
 Streams 256x384 YUY2 at a stable **25 fps** (the sensor's ceiling), **~36.9 ms** arrival-to-on-screen,
 **~1.71 s** from power-on to first image and **~6.4 s** to a fully calibrated one (down from ~11.8 s).
 Time-to-calibrated is reported on the console every stream open.
+
+### Two thermal cameras, one path
+
+The GW192A is supported through the *same* code as the P2 Pro, not a parallel implementation.
+Both deliver a 16-bit radiometric plane inside an ordinary UVC frame, so everything downstream
+of the parse — flat-field, min/max scaling, palettes, crosshair, readouts, touch OSD, manual
+scale — is shared, and only the four numbers that actually differ live in a table
+(`s_thermal_models` in `main/p2pro_uvc.c`):
+
+| | InfiRay P2 Pro | GOYOJO GW192A |
+|---|---|---|
+| stream format | YUY2 256x384 | YUY2 96x176 |
+| radiometric plane | 256x192 at byte 98304 (bottom half) | 96x96 at byte 0 |
+| counts | Kelvin x 64 | 51.714 counts/K, intercept -10262 (measured) |
+| panel image | 416x312 (1.625x) | 288x288 (3x) |
+| vendor control channel | yes | none known |
+
+Detection stays capability-based, never VID:PID: a camera is thermal because it advertises one
+of those stacked formats. Anything else still gets the generic preview.
+
+Two consequences for the GW192A, both inherent to the device rather than this firmware:
+
+- **No shutter control, no forced flat-field, no device temperatures.** No vendor channel is
+  known for it, so the InfiRay opcodes are not fired at it. That is a safety measure as much as
+  a limitation — aiming them at a camera that does not implement them makes it STALL EP0 on
+  every request, and the retry loop becomes a control-transfer storm that drowns the stream.
+  The firmware's own frame-derived flat-field still works, re-keyed per sensor geometry.
+- **Absolute temperatures are calibrated from two measured points, over a short baseline.**
+  A matte wall at 23.0 °C reads 5053 counts and a palm at 33.5 °C reads 5596, giving 51.714
+  counts/K with the intercept at -10262; the wall then reads back as 23.7 °C on the panel. The
+  10.5 K baseline is the weak part — half a degree of error on either reference moves the slope
+  ~7%, so expect roughly ±1.5 °C at body temperature and worse at the extremes. A third
+  reference far from these (ice or boiling water) would tighten it;
+  `docs/GW192A_frame_layout.md` has the procedure and the arithmetic.
+
+A square sensor costs panel width: 288 is the only multiple of 32 a 96-pixel source can reach
+at or below the 320-row panel, so the GW192A gets a 192px control bar against the P2 Pro's
+64px. The layout is searched now rather than hardcoded, and reproduces the P2 Pro's hand-tuned
+416x312 exactly.
+
+Full measured protocol, including the frame map, the marker words and the modes that will not
+negotiate: **[docs/GW192A_frame_layout.md](docs/GW192A_frame_layout.md)**.
 
 ## Flashing a prebuilt binary
 

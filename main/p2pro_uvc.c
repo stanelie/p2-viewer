@@ -78,9 +78,116 @@ esp_err_t uvc_host_usb_ctrl(uvc_host_stream_hdl_t stream_hdl, uint8_t bmRequestT
  * that has somehow been left in image-only mode falls back to a picture rather than garbage. */
 typedef enum {
     CAM_NONE = 0,
-    CAM_THERMAL,     /* 256x384: full thermal interface */
+    CAM_THERMAL,     /* a stacked radiometric format: full thermal interface */
     CAM_GENERIC,     /* any other USB camera: just show the image */
 } cam_kind_t;
+
+/* ---- thermal camera models -------------------------------------------------------------------
+ * Two cameras present the same SHAPE of data - a 16-bit radiometric plane carried inside an
+ * ordinary UVC frame - and everything downstream of the parse is identical for both: flat-field,
+ * min/max scaling, palette mapping, crosshair, readouts, touch OSD, the manual scale. Only four
+ * numbers differ, so they live in a table and the rest of the firmware reads them through
+ * s_therm instead of the old RAW_H_RES/RAW_V_RES constants.
+ *
+ *   InfiRay P2 Pro   YUY2 256x384: preview in the top half, raw radiometric in the bottom.
+ *                    Counts are Kelvin x 64. Has the InfiRay vendor control channel (shutter
+ *                    schedule, forced FFC, device temperatures).
+ *
+ *   GOYOJO GW192A    YUY2 96x176, measured on this hardware (docs/GW192A_frame_layout.md):
+ *                      rows   0..95   the 96x96 radiometric plane, uint16 LE, at offset 0
+ *                      rows  96..99   a telemetry block, contents not yet decoded
+ *                      rows 100..171  an NV12 96x96 visible copy - unused, because palette
+ *                                     mapping the radiometric plane is both sharper and the
+ *                                     same thing the P2 path already does
+ *                      rows 172..175  zero padding
+ *                    Counts are Kelvin x 16. No vendor channel is known for it, so there is no
+ *                    shutter control and no device-temperature readout - the camera runs its own
+ *                    schedule and we take what it gives.
+ *
+ * Detection is by advertised format, never VID:PID, for the reason given above. */
+typedef enum {
+    THERMAL_P2PRO = 0,
+    THERMAL_GW192A,
+    THERMAL_GW192A_FULL,
+} thermal_model_t;
+
+typedef struct {
+    const char *name;
+    uint16_t stream_w, stream_h;   /* the UVC format to request */
+    uint16_t raw_w, raw_h;         /* geometry of the radiometric plane */
+    size_t   raw_offset;           /* its byte offset within the frame */
+    float    counts_per_kelvin;
+    /* Counts reported at 0 K, i.e. the intercept of the camera's linear count/temperature law.
+     * The P2 Pro is a pure scale (0), so its arithmetic is untouched. Kept separate from the
+     * scale because the two are measured differently: the scale comes from the DIFFERENCE
+     * between two reference temperatures and the bias from where that line crosses zero. */
+    float    counts_bias;
+    /* Pixels at or above this read as markers, not temperatures, and are excluded from the
+     * scene. 0 disables the test. The GW192A sprinkles ~0x8002 words through its radiometric
+     * plane - roughly one per row, at a position that moves - and left in they pin the auto
+     * scale's maximum at 32770 forever, which squashes the whole real scene into the bottom
+     * fifth of the palette and renders it nearly black. Measured on hardware.
+     *
+     * The threshold is physics, not a magic number: 32768 counts is 2048 K at 16 counts/K, so
+     * nothing this camera can legitimately see reaches it. The P2 Pro keeps 0 deliberately -
+     * its 0x8000 is a whole-frame "not calibrated yet" sentinel that the STARTING overlay
+     * already handles, and masking it per pixel would leave that frame with no pixels at all. */
+    uint16_t invalid_at;
+    /* Non-zero: the radiometric plane is WORD-STUFFED. Every marker_stride-th word (those with
+     * i % marker_stride == marker_stride - 1) is a marker rather than a pixel, and it is
+     * INSERTED into the stream, not written over a pixel - so it has to be removed and the rest
+     * closed up, not masked in place.
+     *
+     * Masking in place was the first implementation and it looked almost right, which is the
+     * trap: every marker pushed the pixels after it one place along, so the picture came out in
+     * horizontal bands each shifted one pixel right of the band above - a vertical edge rendered
+     * as a staircase with a step every ~10.7 sensor rows. Reported from the panel, which is the
+     * only place a one-pixel-per-1000 shift is visible at all.
+     *
+     * On the GW192A the stride is 1001: 1000 pixels, one 0x8002 marker, repeat. A 96x96 plane
+     * therefore spans 9225 words, not 9216. */
+    uint16_t marker_stride;
+    bool     vendor_cmds;          /* the InfiRay control channel is available */
+} thermal_model_info_t;
+
+static const thermal_model_info_t s_thermal_models[] = {
+    [THERMAL_P2PRO]       = { "P2 Pro",     256, 384, 256, 192, 256u * 192u * 2u,
+                              64.0f, 0.0f, 0,     0,    true  },
+    /* Table order is preference order. 96x176 wins because it is the one that FRAMES cleanly:
+     * its marker words land at a fixed stride every frame and its min/max are steady, which is
+     * what a stable picture needs.
+     *
+     * 96x194 is kept last and is effectively a fallback. It was tried as the preferred mode
+     * because its plane reads ~420 counts lower - a plausible 19-20 C against 96x176's
+     * implausible 50 C - but on hardware the frame does not assemble at a fixed offset: the
+     * marker words move between frames, zeros appear inside the plane, and the scene maximum
+     * swings from 5219 to 32141 frame to frame. A believable number from an unstable frame is
+     * not worth a flickering image, and the offset below (bias) is the honest way to fix the
+     * reading on the mode that actually works. */
+    /* Scale and intercept MEASURED on hardware against a reference thermal camera, not guessed:
+     *     matte wall  23.0 C  ->  5053 counts   (centre 3x3, steady to +-2)
+     *     human palm  33.5 C  ->  5596 counts   (steady to +-4)
+     * 543 counts over 10.5 K gives 51.71 counts/K, and the wall point puts the intercept at
+     * -10262 counts, i.e. 0 C sits at 3864 counts.
+     *
+     * Earlier builds carried 16.0 counts/K, which was inferred from magnitude alone (5170/16 is
+     * about room temperature in Kelvin) and was wrong by more than 3x - it reported a 23 C wall
+     * as 50 C. Order of magnitude is not a calibration.
+     *
+     * Accuracy caveat: a 10.5 K baseline is short. Half a degree of error on either reference
+     * moves the slope by about 7% (47 to 57 counts/K), which is +-1.5 C at body temperature and
+     * worse further out, and the true slope may well be a round 51.2 or 64. A third reference far
+     * from these two - ice water or just-boiled water - would tighten it; docs has the procedure. */
+    [THERMAL_GW192A]      = { "GW192A",      96, 176,  96,  96, 0u,
+                              51.714f, -10262.0f, 32768, 1001, false },
+    [THERMAL_GW192A_FULL] = { "GW192A/194",  96, 194,  96,  96, 24u * 192u,
+                              51.714f, -10262.0f, 32768, 1001, false },
+};
+#define THERMAL_MODEL_COUNT (sizeof(s_thermal_models) / sizeof(s_thermal_models[0]))
+
+/* Written by the connect callback, read by render_task and the OSD - hence volatile. It always
+ * points into the table above, so a stale read is a wrong camera, never a wild pointer. */
+static const thermal_model_info_t *volatile s_therm = &s_thermal_models[THERMAL_P2PRO];
 
 /* ---- built-in OV5647 ------------------------------------------------------------------------
  * The board carries an OV5647 on its MIPI-CSI connector, and it answers at SCCB address 0x36 on
@@ -585,8 +692,25 @@ static bool ffc_store_load(size_t npix)
     return true;
 }
 
-/* One press = 2 C. Raw counts are Kelvin*64, so a 2 K step is 2*64. */
-#define ADJ_STEP_RAW (2 * 64)
+/* The stored flat-field table belongs to one sensor geometry, so swapping cameras has to re-key
+ * it: a 256x192 table applied to a 96x96 plane stays in bounds and is silently wrong, which is
+ * the worst of both worlds. ffc_store_load() already rejects a mismatched pixel count from its
+ * header, so loading unconditionally here is the whole check. */
+static void ffc_reset_for_camera(void)
+{
+    s_ffc_active = false;
+    s_ffc_remaining = 0;
+    if (ffc_store_load((size_t)s_therm->raw_w * s_therm->raw_h)) {
+        s_ffc_active = true;   /* the side-bar button shows CLR, so this is visible and undoable */
+    }
+}
+
+/* One press = 2 C, expressed in whatever counts the attached camera reports (Kelvin x 64 on the
+ * P2 Pro, x 16 on the GW192A), so the button means the same thing on both. */
+static int adj_step_raw(void)
+{
+    return (int)(2.0f * s_therm->counts_per_kelvin);
+}
 /* Touch posts steps; render_task applies them, so all scale state stays owned by one task. */
 static volatile int s_adj_min_steps = 0;
 static volatile int s_adj_max_steps = 0;
@@ -713,7 +837,7 @@ static void p2_frame_diag(const uint16_t *raw16, size_t npix, size_t data_len, i
         sum += v;
         /* plausible band: roughly -40C..150C in Kelvin*64 */
         if (v < 14900u || v > 27100u) outside++;
-        if ((i % RAW_H_RES) != 0) {
+        if ((i % s_therm->raw_w) != 0) {
             const int d = (int)v - (int)raw16[i - 1];
             adiff += (uint64_t)(d < 0 ? -d : d);
         }
@@ -1402,6 +1526,8 @@ static volatile bool s_scale_latch_req = false;
 static uint16_t s_manual_min = 0, s_manual_max = 1, s_manual_range = 1;
 
 static uint16_t *s_small_rgb; /* RAW_H_RES * RAW_V_RES, native-res converted image (PPA input) */
+/* Destination for destuff_plane(). Sized for the largest sensor so a camera swap never reallocs. */
+static uint16_t *s_raw_destuff;
 static uint16_t *s_rgb_buf;   /* PPA scale target + overlays, plain RGB565 */
 static uint16_t *s_rgb_tx;    /* byte-swapped copy, DMA-capable - this is what gets blitted */
 static ppa_client_handle_t s_ppa_client;
@@ -1564,10 +1690,12 @@ static void draw_text(int x0, int y0, int scale, const char *text)
 }
 
 /* Raw P2 Pro counts are Kelvin*64 (reverse-engineered, confirmed by P2Pro-Viewer/thermal-cat/
- * p2pro-rs and verified sane against indoor-scene readings on this hardware). */
+ * p2pro-rs and verified sane against indoor-scene readings on this hardware). The GW192A uses
+ * the same linear-in-Kelvin form at a different scale, which is why this is one function and
+ * not two: see s_thermal_models. */
 static float raw_to_celsius(uint16_t raw)
 {
-    return raw / 64.0f - 273.15f;
+    return (raw - s_therm->counts_bias) / s_therm->counts_per_kelvin - 273.15f;
 }
 
 static int slot_h(void)      { return s_bar_h / BAR_SLOTS; }
@@ -1705,16 +1833,69 @@ static inline uint16_t ffc_px(const uint16_t *raw, size_t i)
     return (uint16_t)v;
 }
 
+/* Words the camera actually sends to deliver npix pixels, stuffing included. */
+static size_t raw_plane_words(size_t npix)
+{
+    const size_t stride = s_therm->marker_stride;
+    if (!stride || npix == 0) {
+        return npix;
+    }
+    return npix + (npix - 1) / (stride - 1);
+}
+
+/* Copies the plane out, dropping the stuffed marker words so that pixel n lands at index n.
+ *
+ * Done as a handful of memcpy runs rather than a per-pixel test: there are only nine markers in
+ * a 96x96 plane, so this is ~9 straight copies of 2000 bytes and costs microseconds, where a
+ * modulo per pixel would run 9216 times. Everything downstream - flat-field, min/max, palette,
+ * centre patch - then indexes a plain dense image and needs no knowledge of the stuffing. */
+static const uint16_t *destuff_plane(const uint16_t *src, size_t npix)
+{
+    const size_t stride = s_therm->marker_stride;
+    size_t out = 0, in = 0;
+    while (out < npix) {
+        /* How many pixels remain before the next marker, from wherever we are in the pattern. */
+        size_t run = stride - 1 - (in % stride);
+        size_t n = npix - out;
+        if (n > run) {
+            n = run;
+        }
+        memcpy(&s_raw_destuff[out], &src[in], n * sizeof(uint16_t));
+        out += n;
+        in  += n;
+        if ((in % stride) == stride - 1) {
+            in++;                      /* step over the marker */
+        }
+    }
+    return s_raw_destuff;
+}
+
+/* True for a word that is a marker rather than a measurement - see invalid_at. */
+static inline bool raw_invalid(uint16_t v)
+{
+    const uint16_t lim = s_therm->invalid_at;
+    return lim && v >= lim;
+}
+
 static uint16_t centre_raw(const uint16_t *raw16)
 {
     uint32_t sum = 0;
-    const int cx = RAW_H_RES / 2, cy = RAW_V_RES / 2;
+    int n = 0;
+    const int w = s_therm->raw_w;
+    const int cx = w / 2, cy = s_therm->raw_h / 2;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
-            sum += ffc_px(raw16, (size_t)(cy + dy) * RAW_H_RES + (cx + dx));
+            const uint16_t v = ffc_px(raw16, (size_t)(cy + dy) * w + (cx + dx));
+            if (!raw_invalid(v)) {
+                sum += v;
+                n++;
+            }
         }
     }
-    return (uint16_t)(sum / 9);
+    /* A marker landing in the 3x3 centre patch must not drag the reading down towards zero;
+     * averaging only the real pixels keeps the crosshair honest. All nine invalid is possible
+     * in principle, so fall back to the raw centre rather than dividing by zero. */
+    return n ? (uint16_t)(sum / n) : ffc_px(raw16, (size_t)cy * w + cx);
 }
 
 /* Readouts overlaid along the bottom of the image. Drawn into s_rgb_buf before the byte swap
@@ -2107,14 +2288,52 @@ static int ppa_quantized_out(int in_dim, int desired_out)
     return (sixteenths / 16) * in_dim + ((sixteenths % 16) * in_dim) / 16;
 }
 
-static esp_err_t display_init(void)
+/* Panel layout for the attached thermal camera: the image flush top-left at the largest size
+ * that keeps the sensor's own aspect ratio, with the leftover width as the control bar.
+ *
+ * This used to be two hand-tuned expressions that happened to land on 416x312 for a 256x192
+ * sensor - exactly 1.625x on both axes. A 96x96 sensor does not land on the same numbers, and
+ * reusing them stretched it 1.2:1, so the rule is now searched rather than assumed.
+ *
+ * Two hard constraints:
+ *  - Width must be a multiple of 32, so each row is exactly 64 bytes (one cache line) of RGB565.
+ *    PPA validates its output buffer size against the cache line, and a whole number of lines
+ *    per row makes any height legal without further rounding.
+ *  - PPA can only produce outputs of in_dim * k/16, so a 96-wide source reaches multiples of 6
+ *    and a 256-wide one reaches multiples of 16. Any width that is not exactly reachable is
+ *    rejected rather than silently scaled to something else.
+ *
+ * Largest first, so the first candidate that satisfies both wins:
+ *   256x192 -> 416x312 at 1.625x, 64px bar (unchanged, bit for bit)
+ *    96x96  -> 288x288 at 3x,    192px bar. 288 is the only multiple of 32 that a 96-pixel
+ *              source can reach at or below the 320-row panel, so a square sensor costs a wide
+ *              bar. Geometry correct beats filling the glass. */
+static void thermal_layout(void)
 {
-    display_compute_logical_size(&s_orientation, &s_disp_w, &s_disp_h);
-    /* Round width down to a multiple of 32 so each row is exactly 64 bytes (one cache line)
-     * of RGB565 - PPA's output buffer size must be cache-line aligned, and since each row is
-     * then already a whole number of cache lines, any height works without further rounding. */
-    s_img_w = ppa_quantized_out(RAW_H_RES, ((s_disp_w - SIDE_PANEL_W) / 32) * 32);
-    s_img_h = ppa_quantized_out(RAW_V_RES, s_disp_h); /* largest PPA-exact height that fits */
+    const int max_w = ((s_disp_w - SIDE_PANEL_W) / 32) * 32;
+    int img_w = 0, img_h = 0;
+    for (int w = max_w; w >= 32; w -= 32) {
+        if (ppa_quantized_out(s_therm->raw_w, w) != w) {
+            continue;                      /* PPA cannot land on this width exactly */
+        }
+        const int want_h = (int)((float)w * s_therm->raw_h / s_therm->raw_w + 0.5f);
+        const int h = ppa_quantized_out(s_therm->raw_h, want_h);
+        if (h > 0 && h <= s_disp_h) {
+            img_w = w;
+            img_h = h;
+            break;
+        }
+    }
+    if (!img_w) {
+        /* No aspect-correct layout exists for this sensor on this panel. Fall back to the old
+         * independent-axis rule, which always produces something displayable. */
+        img_w = ppa_quantized_out(s_therm->raw_w, max_w);
+        img_h = ppa_quantized_out(s_therm->raw_h, s_disp_h);
+        ESP_LOGW(TAG, "layout: no square-scale fit for %ux%u, falling back to %dx%d",
+                 s_therm->raw_w, s_therm->raw_h, img_w, img_h);
+    }
+    s_img_w = img_w;
+    s_img_h = img_h;
     /* REVERTED to the image height: covering all 320 rows cost ~0.7ms of transfer plus a
      * bigger byte-swap pass, which tipped the frame over 40ms and sent latency climbing
      * (39 -> 52 -> 73ms as frames backed up). Readouts sit as low as the image allows. */
@@ -2126,7 +2345,16 @@ static esp_err_t display_init(void)
     /* Flush left, so the leftover width consolidates into one usable panel on the right
      * instead of being split into two useless slivers. */
     s_img_off_x = 0;
-    s_img_off_y = 0; /* flush top, status bar occupies the bottom s_bar_h rows */
+    s_img_off_y = 0;
+    ESP_LOGI(TAG, "layout: %s %ux%u -> image %dx%d (%.2fx), bar %dx%d at (%d,%d)",
+             s_therm->name, s_therm->raw_w, s_therm->raw_h, s_img_w, s_img_h,
+             (float)s_img_w / s_therm->raw_w, s_bar_w, s_bar_h, s_bar_x, s_bar_y);
+}
+
+static esp_err_t display_init(void)
+{
+    display_compute_logical_size(&s_orientation, &s_disp_w, &s_disp_h);
+    thermal_layout();
 
     gpio_config_t bk_cfg = {
         .pin_bit_mask = 1ULL << LCD_BACKLIGHT,
@@ -3712,6 +3940,77 @@ static void usb_lib_task(void *arg)
 
 /* ---------------- Render task: raw -> palette -> SPI blit ---------------- */
 
+/* ---- GW192A calibration instrumentation ------------------------------------------------------
+ * Temporary, and separate from P2_GW_PROBE: that one owns the camera and dumps whole modes, this
+ * one rides along on the live render path so the picture stays on screen while it reports. It
+ * answers two questions that the first probe left open:
+ *   1. where the marker pixels actually are, which decides whether masking them is enough or the
+ *      plane needs reinterpreting;
+ *   2. what the centre of the image reads in raw counts, so pointing the camera at two surfaces
+ *      of known temperature pins down counts_per_kelvin instead of assuming it.
+ * Set to 0 once the scale is settled. */
+#define P2_GW_CALIB 1
+#if P2_GW_CALIB
+static void gw_calib_report(const uint16_t *raw16, size_t npix, uint16_t centre_v,
+                            uint16_t min_v, uint16_t max_v)
+{
+    static bool mapped = false;
+    if (!mapped) {
+        mapped = true;
+        const int w = s_therm->raw_w;
+        char line[160];
+        int p = 0, shown = 0;
+        size_t n = 0;
+        for (size_t i = 0; i < npix; i++) {
+            if (raw16[i] < 32768u) {
+                continue;
+            }
+            n++;
+            if (shown < 24) {
+                shown++;
+                p += snprintf(line + p, sizeof(line) - p, " r%u,c%u=%04x",
+                              (unsigned)(i / w), (unsigned)(i % w), raw16[i]);
+            }
+        }
+        ESP_LOGW(TAG, "GWCAL markers: %u of %u pixels >=0x8000;%s",
+                 (unsigned)n, (unsigned)npix, shown ? line : " none");
+    }
+
+    static int64_t last_us = 0;
+    const int64_t now = esp_timer_get_time();
+    if (now - last_us < 2000000) {
+        return;
+    }
+    last_us = now;
+    /* Scanned here rather than reusing the render pass's min_v/max_v. Those come from a cache
+     * refreshed every MINMAX_PERIOD frames, which is right for driving a palette and wrong for
+     * calibration: against a 23 C wall it reported a range of 5068..5491 while the centre read
+     * 5053, i.e. a centre BELOW the frame minimum, which is impossible within one frame and made
+     * the numbers impossible to trust. A calibration readout has to describe one frame. */
+    uint16_t lo = 0xFFFF, hi = 0;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < npix; i++) {
+        const uint16_t v = raw16[i];
+        if (raw_invalid(v)) {
+            continue;
+        }
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        sum += v;
+    }
+    const unsigned mean = npix ? (unsigned)(sum / npix) : 0;
+    /* Printed as raw counts AND as the temperature the current scale implies, so a wrong scale
+     * shows up as an implausible number instead of hiding behind a plausible-looking one. */
+    ESP_LOGW(TAG, "GWCAL centre=%u (%.1f C)  frame %u..%u mean %u (%.1f..%.1f C)  "
+                  "@%.3f counts/K bias %.0f  [cached %u..%u]",
+             (unsigned)centre_v, raw_to_celsius(centre_v),
+             (unsigned)lo, (unsigned)hi, mean,
+             raw_to_celsius(lo), raw_to_celsius(hi),
+             s_therm->counts_per_kelvin, s_therm->counts_bias,
+             (unsigned)min_v, (unsigned)max_v);
+}
+#endif
+
 static void render_task(void *arg)
 {
     static int frames_converted = 0;
@@ -3722,6 +4021,11 @@ static void render_task(void *arg)
     uint16_t last_min_v = 0, last_max_v = 0;
 
     cam_kind_t last_kind = CAM_NONE;
+    /* NULL, not s_therm: the per-camera setup below (layout, flat-field re-key) has to run for
+     * the FIRST thermal camera too, including a P2 Pro that matches the boot-time default. The
+     * stored flat-field table used to be loaded in app_main(); seeding this with s_therm would
+     * have meant it was then never loaded at all. */
+    const thermal_model_info_t *last_therm = NULL;
     queued_frame_t qf;
 #if P2_BUILTIN_CAM
     bool bi_shown = false;
@@ -4127,9 +4431,20 @@ static void render_task(void *arg)
          * Done as ONE full-screen draw: the completion callback gives a binary semaphore and
          * counts a frame, so a burst of strip draws would unbalance it and skew the e2e stats.
          * Skipping this frame lets the next iteration re-take the semaphore normally. */
-        if (s_cam_kind != last_kind) {
-            ESP_LOGI(TAG, "camera kind %d -> %d, clearing panel", (int)last_kind, (int)s_cam_kind);
+        if (s_cam_kind != last_kind || s_therm != last_therm) {
+            ESP_LOGI(TAG, "camera kind %d -> %d (%s), clearing panel",
+                     (int)last_kind, (int)s_cam_kind, s_therm->name);
             last_kind = s_cam_kind;
+            /* A different thermal sensor means a different image size, a different bar width and
+             * a flat-field table that no longer applies. Safe to do here and nowhere else: this
+             * runs on the task that owns the layout, and the SPI transfer semaphore above has
+             * already confirmed the panel is idle. */
+            if (s_therm != last_therm) {
+                last_therm = s_therm;
+                thermal_layout();
+                ffc_reset_for_camera();
+                s_scale_manual = false;   /* endpoints latched in the old camera's counts */
+            }
             /* Hand back the JPEG decoder's buffers when the new camera does not need them -
              * 640x480 costs ~1.2 MB of PSRAM across input and output. Done here rather than in
              * the connect callback because this runs on the task that does the decoding, so it
@@ -4349,12 +4664,13 @@ static void render_task(void *arg)
             continue;
         }
 
-        /* The 256x384 format is preview on top + radiometric below. If the camera has been put
-         * into image-only mode (256x192, 98304 bytes) the second half simply isn't there, and
-         * reading it walks off the end of the frame buffer into whatever PSRAM follows - which
-         * renders as garbage rather than failing loudly. Seen for real after the camera was
-         * reconfigured by the vendor phone app. */
-        const size_t needed = (size_t)RAW_H_RES * RAW_V_RES * 4;
+        /* Where the radiometric plane sits depends on the model: the bottom half of the frame on
+         * the P2 Pro, the very start of it on the GW192A. Either way, a frame too short to
+         * contain it must not be parsed - reading past the end walks into whatever PSRAM
+         * follows and renders as garbage rather than failing loudly. Seen for real on a P2 that
+         * the vendor phone app had left in image-only mode (256x192, 98304 bytes). */
+        const size_t needed = s_therm->raw_offset +
+                              raw_plane_words((size_t)s_therm->raw_w * s_therm->raw_h) * 2;
         if (qf.frame->data_len < needed) {
             static bool warned = false;
             if (!warned) {
@@ -4379,11 +4695,20 @@ static void render_task(void *arg)
         }
         no_temp_shown = false;
 
-        const uint8_t *raw_half = qf.frame->data + (RAW_H_RES * RAW_V_RES * 2); /* skip preview half */
+        const uint8_t *raw_half = qf.frame->data + s_therm->raw_offset;
         const uint16_t *raw16 = (const uint16_t *)raw_half;
-        size_t npix = RAW_H_RES * RAW_V_RES;
-        p2_frame_diag(raw16, npix, qf.frame->data_len, s_stream_open_us);
-        p2_log_first_clean(raw16, npix, s_stream_open_us);
+        size_t npix = (size_t)s_therm->raw_w * s_therm->raw_h;
+        if (s_therm->marker_stride) {
+            raw16 = destuff_plane(raw16, npix);
+        }
+        /* Both of these read P2-specific signatures - the 0x8000 "not calibrated yet" sentinel
+         * and the spatial roughness that marks a pre-flat-field frame - and they drive the
+         * STARTING / CALIBRATING overlays. The GW192A shows neither, so running them on it would
+         * only invent phases it does not have. */
+        if (s_therm->vendor_cmds) {
+            p2_frame_diag(raw16, npix, qf.frame->data_len, s_stream_open_us);
+            p2_log_first_clean(raw16, npix, s_stream_open_us);
+        }
 
         /* The camera re-runs its flat-field every MAX_INTERVAL (60s), closing the shutter and
          * freezing the image each time. PROP_SWITCH turns that off. Only ever applied AFTER the
@@ -4464,8 +4789,8 @@ static void render_task(void *arg)
             int dmin = s_adj_min_steps, dmax = s_adj_max_steps;
             s_adj_min_steps = 0;
             s_adj_max_steps = 0;
-            int32_t nmin = (int32_t)s_manual_min + dmin * ADJ_STEP_RAW;
-            int32_t nmax = (int32_t)s_manual_max + dmax * ADJ_STEP_RAW;
+            int32_t nmin = (int32_t)s_manual_min + dmin * adj_step_raw();
+            int32_t nmax = (int32_t)s_manual_max + dmax * adj_step_raw();
             if (nmin < 0) nmin = 0;
             if (nmax > 65535) nmax = 65535;
             /* keep the endpoints ordered - ignore a nudge that would cross them over */
@@ -4482,8 +4807,15 @@ static void render_task(void *arg)
             uint16_t min_v = 0xFFFF, max_v = 0;
             for (size_t i = 0; i < npix; i++) {
                 uint16_t v = ffc_px(raw16, i);
+                if (raw_invalid(v)) {
+                    continue;
+                }
                 if (v < min_v) min_v = v;
                 if (v > max_v) max_v = v;
+            }
+            if (min_v > max_v) {     /* every pixel was a marker - keep the previous range */
+                min_v = cached_min_v;
+                max_v = cached_max_v;
             }
             cached_min_v = min_v;
             cached_max_v = max_v;
@@ -4503,6 +4835,15 @@ static void render_task(void *arg)
 
         for (size_t i = 0; i < npix; i++) {
             uint16_t v = ffc_px(raw16, i);
+            if (raw_invalid(v)) {
+                /* Paint a marker as the coldest colour instead of letting it saturate white:
+                 * it is a handful of scattered pixels, and a dark speck reads as noise while a
+                 * white one reads as a hotspot that is not there. It must NOT set
+                 * out_of_range_this_frame either, or the min/max scan would re-run every frame
+                 * forever chasing a pixel that is never in range. */
+                s_small_rgb[i] = lut[0];
+                continue;
+            }
             /* min_v/max_v can be stale (see MINMAX_PERIOD above), so a pixel can legitimately
              * fall outside [min_v, max_v] between recalculations. Clamp instead of letting the
              * uint8_t cast wrap: a hot pixel above the stale max must saturate to 255 (white),
@@ -4525,15 +4866,15 @@ static void render_task(void *arg)
             need_recompute = true; /* scene range actually changed - don't wait out the period */
         }
 
-        /* Upscale from the native RAW_H_RES x RAW_V_RES image to s_img_w x s_img_h (a slight
+        /* Upscale from the sensor's native size to s_img_w x s_img_h (a slight
          * inset from the full panel, see IMG_COVERAGE) using the PPA hardware scaler, instead
          * of a CPU gather loop - a software nearest-neighbor version of this (indexed PSRAM
          * reads) cost ~16ms of CPU time and dragged the whole pipeline behind real time. */
         const ppa_srm_oper_config_t srm_config = {
             .in = {
                 .buffer = s_small_rgb,
-                .pic_w = RAW_H_RES, .pic_h = RAW_V_RES,
-                .block_w = RAW_H_RES, .block_h = RAW_V_RES,
+                .pic_w = s_therm->raw_w, .pic_h = s_therm->raw_h,
+                .block_w = s_therm->raw_w, .block_h = s_therm->raw_h,
                 .block_offset_x = 0, .block_offset_y = 0,
                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
             },
@@ -4545,8 +4886,8 @@ static void render_task(void *arg)
                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
             },
             .rotation_angle = PPA_SRM_ROTATION_ANGLE_0, /* rotation is handled by the panel's own swap_xy/mirror */
-            .scale_x = (float)s_img_w / RAW_H_RES,
-            .scale_y = (float)s_img_h / RAW_V_RES,
+            .scale_x = (float)s_img_w / s_therm->raw_w,
+            .scale_y = (float)s_img_h / s_therm->raw_h,
             .mirror_x = false,
             .mirror_y = false,
             .mode = PPA_TRANS_MODE_BLOCKING,
@@ -4631,6 +4972,11 @@ static void render_task(void *arg)
             ESP_LOGE(TAG, "PPA byte-swap pass failed: %s", esp_err_to_name(swap_err));
         }
 
+#if P2_GW_CALIB
+        if (!s_therm->vendor_cmds) {
+            gw_calib_report(raw16, npix, centre_v, min_v, max_v);
+        }
+#endif
         last_min_v = min_v;
         last_max_v = max_v;
         s_dbg_min_v = min_v;
@@ -4755,6 +5101,174 @@ static void gen_bench_task(void *arg)
 
 /* ---------------- UVC stream open ---------------- */
 
+/* ---- GW192A frame-layout probe ----------------------------------------------------------------
+ * One-shot reverse engineering aid, not part of normal operation. The GOYOJO GW192A advertises
+ * six modes whose geometry makes no sense as pictures (96x100, 96x176, 96x194, 96x216, 96x322
+ * YUY2 plus 96x96 NV12), so the only way to learn which one carries radiometric data is to
+ * stream each in turn and look at the bytes.
+ *
+ * What the dump reports per mode, for one settled frame:
+ *  - data_len against w*h*2, so a mode that delivers short frames is visible immediately.
+ *  - per-row mean of the bytes: an 8-bit picture row sits near the scene grey level, a row of
+ *    16-bit counts does not, and padding or telemetry rows stand out as constant.
+ *  - per-row mean of the uint16 LE words. This is the discriminator that matters: the P2 Pro
+ *    radiometric half is Kelvin x 64, so a room-temperature row reads ~19200. Eight-bit image
+ *    data read as uint16 lands near 33000 instead, and either is far from the other.
+ *  - a hexdump of the first row and the last two rows, where a header or telemetry block would be.
+ *
+ * Set P2_GW_PROBE to 0 to get the normal firmware back. */
+#define P2_GW_PROBE 0
+#if P2_GW_PROBE
+
+static uint8_t *s_gw_copy;          /* PSRAM snapshot of one frame, dumped after the stream stops */
+static size_t   s_gw_copy_len;
+static volatile bool s_gw_have_copy;
+static volatile int  s_gw_frames;
+
+#define GW_COPY_CAP (128 * 1024)
+
+static bool gw_probe_frame_cb(const uvc_host_frame_t *frame, void *user_ctx)
+{
+    /* Frame 8 rather than frame 0: the first few frames of any UVC stream can be partial, and on
+     * a thermal core they also predate the first flat-field correction. */
+    if (++s_gw_frames == 8 && !s_gw_have_copy && s_gw_copy) {
+        size_t n = frame->data_len < GW_COPY_CAP ? frame->data_len : GW_COPY_CAP;
+        memcpy(s_gw_copy, frame->data, n);
+        s_gw_copy_len = n;
+        s_gw_have_copy = true;   /* written last: the dumping task reads it as the ready flag */
+    }
+    return true;   /* nothing is queued, so the driver can have the buffer straight back */
+}
+
+static void gw_hexrow(const char *what, const uint8_t *p, int n)
+{
+    char line[3 * 32 + 1];
+    for (int off = 0; off < n; off += 32) {
+        int k = (n - off < 32) ? (n - off) : 32;
+        int c = 0;
+        for (int i = 0; i < k; i++) {
+            c += snprintf(line + c, sizeof(line) - c, "%02x ", p[off + i]);
+        }
+        ESP_LOGW(TAG, "GW   %s +%3d: %s", what, off, line);
+    }
+}
+
+static void gw_dump(int idx, const uvc_host_frame_info_t *fi)
+{
+    const uint8_t *d = s_gw_copy;
+    const size_t len = s_gw_copy_len;
+    /* How the HOST laid the frame out, which is what we have to index with. YUY2 is 2 bytes per
+     * pixel; the NV12 luma plane is 1, with the chroma plane following at half height. */
+    const int stride = (fi->format == UVC_VS_FORMAT_NV12) ? (int)fi->h_res : (int)fi->h_res * 2;
+    const size_t rows = len / stride;
+
+    ESP_LOGW(TAG, "GW[%d] fmt=%d %ux%u: data_len=%u (expected %u), stride=%d -> %u rows",
+             idx, (int)fi->format, fi->h_res, fi->v_res, (unsigned)len,
+             (unsigned)((size_t)stride * fi->v_res), stride, (unsigned)rows);
+
+    char l8[80], l16[112];
+    int p8 = 0, p16 = 0;
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t *row = d + r * stride;
+        uint32_t s8 = 0, s16 = 0;
+        for (int c = 0; c < stride; c++) {
+            s8 += row[c];
+        }
+        for (int c = 0; c + 1 < stride; c += 2) {
+            s16 += (uint32_t)row[c] | ((uint32_t)row[c + 1] << 8);
+        }
+        p8  += snprintf(l8  + p8,  sizeof(l8)  - p8,  "%4u", (unsigned)(s8 / stride));
+        p16 += snprintf(l16 + p16, sizeof(l16) - p16, "%6u", (unsigned)(s16 / (stride / 2)));
+        if ((r % 16) == 15 || r == rows - 1) {
+            ESP_LOGW(TAG, "GW[%d] row %3u u8 :%s", idx, (unsigned)(r - r % 16), l8);
+            ESP_LOGW(TAG, "GW[%d] row %3u u16:%s", idx, (unsigned)(r - r % 16), l16);
+            p8 = p16 = 0;
+        }
+    }
+
+    gw_hexrow("row0  ", d, stride < 64 ? stride : 64);
+    if (rows >= 2) {
+        gw_hexrow("row-2 ", d + (rows - 2) * stride, stride < 64 ? stride : 64);
+        gw_hexrow("row-1 ", d + (rows - 1) * stride, stride < 64 ? stride : 64);
+    }
+}
+
+static void gw_probe_task(void *arg)
+{
+    s_gw_copy = heap_caps_malloc(GW_COPY_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_gw_copy) {
+        ESP_LOGE(TAG, "GW probe: no PSRAM for the frame snapshot");
+        vTaskDelete(NULL);
+    }
+    while (s_adv_n == 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW(TAG, "GW probe: %u advertised modes", (unsigned)s_adv_n);
+    for (size_t i = 0; i < s_adv_n; i++) {
+        /* Intervals first: 25 fps is hardcoded everywhere else in this firmware, and a mode that
+         * does not offer it is exactly how the normal path fails on this camera. */
+        ESP_LOGW(TAG, "GW[%d] fmt=%d %ux%u default_interval=%u type=%u",
+                 (int)i, (int)s_adv[i].format, s_adv[i].h_res, s_adv[i].v_res,
+                 (unsigned)s_adv[i].default_interval, (unsigned)s_adv[i].interval_type);
+        if (s_adv[i].interval_type == 0) {
+            ESP_LOGW(TAG, "GW[%d]   continuous %u..%u step %u", (int)i,
+                     (unsigned)s_adv[i].interval_min, (unsigned)s_adv[i].interval_max,
+                     (unsigned)s_adv[i].interval_step);
+        } else {
+            for (int k = 0; k < s_adv[i].interval_type && k < CONFIG_UVC_INTERVAL_ARRAY_SIZE; k++) {
+                ESP_LOGW(TAG, "GW[%d]   interval[%d]=%u (%.1f fps)", (int)i, k,
+                         (unsigned)s_adv[i].interval[k],
+                         s_adv[i].interval[k] ? 1e7f / s_adv[i].interval[k] : 0.0f);
+            }
+        }
+
+        s_gw_have_copy = false;
+        s_gw_frames = 0;
+
+        uvc_host_stream_config_t cfg = {
+            .event_cb = NULL,
+            .frame_cb = gw_probe_frame_cb,
+            .user_ctx = NULL,
+            .usb = { .vid = UVC_HOST_ANY_VID, .pid = UVC_HOST_ANY_PID, .uvc_stream_index = 0 },
+            /* fps 0 asks for the device default interval. Naming a rate is what makes
+             * negotiation fail on the modes this camera only offers at one speed. */
+            .vs_format = { .h_res = s_adv[i].h_res, .v_res = s_adv[i].v_res,
+                           .fps = 0, .format = s_adv[i].format },
+            .advanced = { .number_of_frame_buffers = 3, .frame_size = 0,
+                          .frame_heap_caps = MALLOC_CAP_SPIRAM,
+                          .number_of_urbs = 4, .urb_size = 0 },
+        };
+        uvc_host_stream_hdl_t st = NULL;
+        esp_err_t e = uvc_host_stream_open(&cfg, pdMS_TO_TICKS(3000), &st);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "GW[%d] open failed: %s", (int)i, esp_err_to_name(e));
+            continue;
+        }
+        e = uvc_host_stream_start(st);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "GW[%d] start failed: %s", (int)i, esp_err_to_name(e));
+            uvc_host_stream_close(st);
+            continue;
+        }
+        for (int t = 0; t < 50 && !s_gw_have_copy; t++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        uvc_host_stream_stop(st);
+        uvc_host_stream_close(st);
+        if (s_gw_have_copy) {
+            gw_dump((int)i, &s_adv[i]);
+        } else {
+            ESP_LOGE(TAG, "GW[%d] no frames arrived in 5 s (%d callbacks)", (int)i, s_gw_frames);
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    ESP_LOGW(TAG, "GW probe: done");
+    free(s_gw_copy);
+    s_gw_copy = NULL;
+    vTaskDelete(NULL);
+}
+#endif /* P2_GW_PROBE */
+
 static void streaming_task(void *arg)
 {
     /* app_main allocates the frame buffers concurrently with enumeration - don't touch them until
@@ -4833,7 +5347,7 @@ static void streaming_task(void *arg)
         BOOT_MARK("uvc: calling stream_open");
         ESP_LOGI(TAG, "Opening %ux%u %s @%.1ffps (%s)...", s_cam_w, s_cam_h,
                  (s_cam_fmt == UVC_VS_FORMAT_MJPEG) ? "MJPEG" : "YUY2", STREAM_FPS,
-                 (s_cam_kind == CAM_THERMAL) ? "thermal" : "generic");
+                 (s_cam_kind == CAM_THERMAL) ? s_therm->name : "generic");
         esp_err_t err = uvc_host_stream_open(&stream_config, pdMS_TO_TICKS(5000), &s_stream);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "uvc_host_stream_open failed: %s - retrying", esp_err_to_name(err));
@@ -4905,7 +5419,7 @@ static void streaming_task(void *arg)
          * makes it STALL EP0 on every one, and the channel-availability probe retries for 15s at
          * 25ms intervals - a control-transfer storm that drowns the stream it is supposed to
          * precede. Seen for real against an iMac webcam. */
-        if (s_cam_kind == CAM_THERMAL) {
+        if (s_cam_kind == CAM_THERMAL && s_therm->vendor_cmds) {
             p2_camera_init();
         }
         s_stream_restart_req = false;
@@ -4962,21 +5476,31 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
             s_adv_n = (actual < P2_MAX_ADVERTISED) ? actual : P2_MAX_ADVERTISED;
             memcpy(s_adv, list, s_adv_n * sizeof(uvc_host_frame_info_t));
 
-            /* Thermal if the 256x384 stacked format is on offer, otherwise a plain preview. */
-            bool thermal = false;
-            for (size_t i = 0; i < actual; i++) {
-                if (list[i].format == UVC_VS_FORMAT_YUY2 &&
-                    list[i].h_res == RAW_H_RES && list[i].v_res == RAW_V_RES * 2) {
-                    thermal = true;
-                    break;
+            /* Thermal if one of the known stacked radiometric formats is on offer, otherwise a
+             * plain preview. Table order is the priority order, so a device advertising two of
+             * them (none does today) resolves deterministically. */
+            const thermal_model_info_t *therm = NULL;
+            for (size_t m = 0; m < THERMAL_MODEL_COUNT && !therm; m++) {
+                for (size_t i = 0; i < actual; i++) {
+                    if (list[i].format == UVC_VS_FORMAT_YUY2 &&
+                        list[i].h_res == s_thermal_models[m].stream_w &&
+                        list[i].v_res == s_thermal_models[m].stream_h) {
+                        therm = &s_thermal_models[m];
+                        break;
+                    }
                 }
             }
-            if (thermal) {
+            if (therm) {
+                s_therm = therm;
                 s_cam_kind = CAM_THERMAL;
-                s_cam_w = RAW_H_RES;
-                s_cam_h = RAW_V_RES * 2;
-                s_cam_fmt = UVC_VS_FORMAT_YUY2;   /* the raw half must not be compressed */
-                ESP_LOGI(TAG, "camera: P2 Pro thermal (%ux%u)", s_cam_w, s_cam_h);
+                s_cam_w = therm->stream_w;
+                s_cam_h = therm->stream_h;
+                s_cam_fmt = UVC_VS_FORMAT_YUY2;   /* the raw plane must not be compressed */
+                ESP_LOGI(TAG, "camera: %s thermal (stream %ux%u, %ux%u radiometric at +%u, "
+                              "%.0f counts/K, vendor channel %s)",
+                         therm->name, s_cam_w, s_cam_h, therm->raw_w, therm->raw_h,
+                         (unsigned)therm->raw_offset, therm->counts_per_kelvin,
+                         therm->vendor_cmds ? "yes" : "no");
             } else {
                 /* Pick the largest mode up to P2_GEN_OVERSAMPLE x the panel in each axis.
                  *
@@ -5100,7 +5624,13 @@ static void uvc_event_cb(const uvc_host_driver_event_data_t *event, void *user_c
                                                  * reconnects itself - only ever spawn one */
     if (!streaming_task_started) {
         streaming_task_started = true;
+#if P2_GW_PROBE
+        /* The probe owns the camera for the whole session: it opens and closes every advertised
+         * mode in turn, so a second client negotiating alongside it would corrupt the results. */
+        xTaskCreatePinnedToCore(gw_probe_task, "gwprobe", 6144, NULL, USB_HOST_PRIORITY - 2, NULL, tskNO_AFFINITY);
+#else
         xTaskCreatePinnedToCore(streaming_task, "streaming", 6144, NULL, USB_HOST_PRIORITY - 2, NULL, tskNO_AFFINITY);
+#endif
     }
 }
 
@@ -5246,6 +5776,12 @@ void app_main(void)
     s_small_rgb = heap_caps_aligned_alloc(P2_CACHE_LINE, RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     assert(s_small_rgb);
 
+    /* CPU-only (every pass that reads it is a plain loop), so this needs no DMA capability -
+     * but it is sized for the biggest sensor in the table rather than the attached one, so that
+     * swapping cameras re-points the parse without reallocating on the render task. */
+    s_raw_destuff = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    assert(s_raw_destuff);
+
     /* Sized for the LARGER of the thermal image and a full-screen generic preview: a webcam's
      * picture is letterboxed to the panel, which can exceed the thermal image's 416x312. Only
      * the used region is ever transferred, so the extra PSRAM costs nothing per frame. */
@@ -5273,9 +5809,10 @@ void app_main(void)
     s_ffc_offset    = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(int8_t),   MALLOC_CAP_SPIRAM);
     s_ffc_accum     = heap_caps_malloc(RAW_H_RES * RAW_V_RES * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
     assert(s_ffc_offset && s_ffc_accum);
-    if (ffc_store_load((size_t)RAW_H_RES * RAW_V_RES)) {
-        s_ffc_active = true;   /* the side-bar button shows CLR, so this is visible and undoable */
-    }
+    /* Not loaded here any more: which table is valid depends on the sensor that turns up, and
+     * at this point nothing has enumerated. render_task calls ffc_reset_for_camera() as soon as
+     * it knows, which costs one 48KB partition read against a camera that takes ~1.1 s to
+     * appear - invisible in the boot budget. */
 
     const ppa_client_config_t ppa_client_config = {
         .oper_type = PPA_OPERATION_SRM,
@@ -5284,10 +5821,13 @@ void app_main(void)
     ESP_ERROR_CHECK(ppa_register_client(&ppa_client_config, &s_ppa_client));
     BOOT_MARK("buffers + PPA client ready");
 
-    s_status_buf = heap_caps_malloc((size_t)s_bar_w * s_bar_h * sizeof(uint16_t),
-                                     MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    /* Sized for the full panel, not the current bar: the bar is 64px wide for a 256x192 sensor
+     * and 192px for a 96x96 one, and a camera swap re-lays-out the panel without reallocating.
+     * 300KB of PSRAM against a 32MB part is the cheap way to make that resize unable to overrun. */
+    const size_t bar_bytes = (size_t)s_disp_w * s_disp_h * sizeof(uint16_t);
+    s_status_buf = heap_caps_malloc(bar_bytes, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
     if (!s_status_buf) {
-        s_status_buf = heap_caps_malloc((size_t)s_bar_w * s_bar_h * sizeof(uint16_t), MALLOC_CAP_DMA);
+        s_status_buf = heap_caps_malloc(bar_bytes, MALLOC_CAP_DMA);
     }
     assert(s_status_buf);
 

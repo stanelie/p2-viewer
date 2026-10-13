@@ -26,18 +26,26 @@ scale — is shared, and only the four numbers that actually differ live in a ta
 | radiometric plane | 256x192 at byte 98304 (bottom half) | 96x96 at byte 0 |
 | counts | Kelvin x 64 | 51.714 counts/K, intercept -10262 (measured) |
 | panel image | 416x312 (1.625x) | 288x288 (3x) |
-| vendor control channel | yes | none known |
+| vendor control channel | yes (InfiRay, driven) | HIKMICRO extension unit, found but not yet driven |
 
 Detection stays capability-based, never VID:PID: a camera is thermal because it advertises one
 of those stacked formats. Anything else still gets the generic preview.
 
 Two consequences for the GW192A, both inherent to the device rather than this firmware:
 
-- **No shutter control, no forced flat-field, no device temperatures.** No vendor channel is
-  known for it, so the InfiRay opcodes are not fired at it. That is a safety measure as much as
-  a limitation — aiming them at a camera that does not implement them makes it STALL EP0 on
-  every request, and the retry loop becomes a control-transfer storm that drowns the stream.
-  The firmware's own frame-derived flat-field still works, re-keyed per sensor geometry.
+- **No shutter control, no forced flat-field, no device temperatures — yet.** The InfiRay
+  opcodes are not fired at it, which is a safety measure as much as a limitation: aiming them at
+  a camera that does not implement them makes it STALL EP0 on every request, and the retry loop
+  becomes a control-transfer storm that drowns the stream. The firmware's own frame-derived
+  flat-field still works, re-keyed per sensor geometry.
+
+  Decompiling the vendor app showed the GW192A is a **rebadged HIKMICRO MiniE/P09-class module**
+  (`37b4:0102`), and the camera does expose a HIKMICRO UVC **extension unit** — unit 10, GUID
+  `{A29E7641-DE04-47E3-8B2B-F4341AFF003B}`, ten control selectors — which would give a forced
+  flat-field, emissivity and distance correction, the device's own temperature scaling and its
+  model string. It is not driven yet: the command-header layout is still missing, and the
+  selectors answer unreliably until a command is actually written. Details and the two routes to
+  finishing it are in `docs/GW192A_frame_layout.md`.
 - **Absolute temperatures are calibrated from two measured points, over a short baseline.**
   A matte wall at 23.0 °C reads 5053 counts and a palm at 33.5 °C reads 5596, giving 51.714
   counts/K with the intercept at -10262; the wall then reads back as 23.7 °C on the panel. The

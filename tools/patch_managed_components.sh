@@ -26,3 +26,24 @@ if [ -f "$F" ]; then
 else
     echo "skipped, not fetched yet: $F"
 fi
+
+G=managed_components/espressif__usb_host_uvc/uvc_host.c
+
+# usb_host_uvc 2.6.0 allocates the endpoint-0 transfer at 64 bytes ("Worst case HS MPS") and then
+# validates every uvc_host_usb_ctrl() against it as
+#     data_buffer_size >= wLength + sizeof(usb_setup_packet_t)
+# so the largest vendor control payload it can carry is 64 - 8 = 56 bytes. That is fine for the
+# InfiRay P2 Pro, whose commands are tiny, and too small for the HIKMICRO extension unit on the
+# GOYOJO GW192A: every one of its ten control selectors reports a length of 512, and a GET_CUR at
+# that size fails in the component before a packet is ever sent. 576 covers 512 plus the setup
+# packet with room to spare, and costs one allocation of internal DMA memory per stream.
+if [ -f "$G" ]; then
+    if grep -q 'usb_host_transfer_alloc(64, 0, &ctrl_xfer)' "$G"; then
+        sed -i 's/usb_host_transfer_alloc(64, 0, &ctrl_xfer)/usb_host_transfer_alloc(576, 0, \&ctrl_xfer)/' "$G"
+        echo "patched: uvc_host EP0 transfer 64 -> 576 bytes ($G)"
+    else
+        echo "already patched (or upstream changed): $G"
+    fi
+else
+    echo "skipped, not fetched yet: $G"
+fi

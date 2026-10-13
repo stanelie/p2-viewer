@@ -173,15 +173,131 @@ which is right for driving a palette and wrong for calibration — against the 2
 reported a range of 5068..5491 while the centre read 5053, a centre *below* the frame
 minimum, which cannot happen within one frame and made the numbers untrustworthy.
 
+## What the camera really is, and the vendor channel it has
+
+Decompiling the GOYOJO vendor app (`com.guardExpert.thgStartGoogle`, "THG Start") settled what
+this device is. Its device table groups the GW192A with HIKMICRO hardware:
+
+```
+F0:   "MiniE", "P09", "HM-TJ10-1ARF", "HM-TJ10G-1ARF",
+      "HM-TJ33-10G-1ARF", "Finder S1", "Finder S1 Pro", "GW192A"
+F2V2: ... "Finder S2", "Finder S2 Pro", "GW340"
+```
+
+So the **GW192A is a rebadged HIKMICRO MiniE/P09-class module** (HIKMICRO is Hikvision's thermal
+brand), and the app drives it with the Hikvision `HCUSBSDK`. The MiniE is a 96x96 core, which
+matches the plane measured above and settles the 192x192 marketing claim: it is interpolated.
+
+The device identifies as **`37b4:0102`**, USB 2.0 high speed, class 239 (misc/IAD).
+
+### It does have a vendor control channel
+
+The earlier conclusion in this document — that no vendor channel exists — was **wrong**. The
+camera exposes a UVC **Extension Unit**, read straight off its own descriptors by
+`probe_dump_xu()` (build with `P2_USB_PROBE 1`):
+
+```
+XU unit_id=10 on interface 0  bNumControls=15  bNrInPins=1
+GUID  {A29E7641-DE04-47E3-8B2B-F4341AFF003B}
+bControlSize=4  bmControls=ff 03 00 00     -> control selectors 1..10 implemented
+```
+
+That is the same mechanism the SDK uses: `libHCUSBSDK.so` exports
+`AccessDeviceDriver::ParseExtensionUnit(... _USB_GUID ...)`, which finds the unit by GUID and
+returns its ID, and `CUsbDeviceVideoBase::ControlTransfer` / `SwitchCommand`, which take a
+`tagXU_COMMAND_HEADER`. The SDK's own log format string names the fields:
+
+```
+byRequestType[0x%02x], byRequest[0x%02x], wValue[0x%04x],
+Sub-function[0x%02x], wIndex[0x%04x], dwDataLen[%d], iLen[%d]
+```
+
+So: ordinary UVC XU addressing (`wValue = CS << 8`, `wIndex = (unit << 8) | interface`, which is
+`0x0a00` here) wrapping a command header that carries a command ID and a sub-function byte. The
+command IDs are plain integers in the Java bindings, and the ones that matter to a viewer are:
+
+| ID | command | what it would buy us |
+|---|---|---|
+| 2025 | `USB_SET_IMAGE_MANUAL_CORRECT` | **forced flat-field** — the P2 Pro's shutter equivalent |
+| 2030 / 2031 | `USB_GET/SET_THERMOMETRY_BASIC_PARAM` | emissivity, distance, reflective temperature, range, **and `byFloatTransMode`/`byShiftLength`: the device's own value scaling** |
+| 2110 / 2111 | `USB_GET/SET_THERMAL_STREAM_CTRL` | enable/disable the radiometric stream |
+| 2038 / 2039 | `USB_GET/SET_THERMAL_STREAM_PARAM` | stream coding type |
+| 2131 / 2132 / 2133 | `USB_GET/SET_THERMAL_STREAM_YUV_RESOLUTION(_CAPABILITIES)` | possibly the modes that will not negotiate (96x216, 96x322, NV12 96x96) |
+| 2047 | `USB_GET_ROI_MAX_TEMPERATURE_SEARCH` | device-side hotspot search |
+| 2011 | `USB_GET_SYSTEM_DEVICE_INFO` | model string — real identification instead of inferring it from advertised formats |
+| 2026 / 2027 | `USB_GET/SET_IMAGE_ENHANCEMENT` | device-side contrast and denoise |
+| 2115 | `USB_SET_IMAGE_PALETTE_DATA` | upload a palette |
+
+`USB_THERMOMETRY_BASIC_PARAM` is the interesting one for this document, because it carries
+`byShiftLength` and `byFloatTransMode` — the HIKMICRO convention for sending floats as scaled
+integers. If that can be read, the camera states its own scaling, and the measured
+51.714 counts/K above stops being a two-point fit and becomes a cross-check.
+
+### What stopped us, and what is fixed
+
+Our own stack was the first wall. `usb_host_uvc` 2.6.0 allocates the endpoint-0 transfer at
+64 bytes and then validates every `uvc_host_usb_ctrl()` call as
+`data_buffer_size >= wLength + sizeof(usb_setup_packet_t)`, so the largest vendor payload it
+could carry was **56 bytes**. Every selector on this camera reports a length of 512, so a
+`GET_CUR` failed inside the component before a packet was ever sent. `GET_INFO` (1 byte) and
+`GET_LEN` (2 bytes) worked, which is what made the limit visible rather than mysterious.
+
+`tools/patch_managed_components.sh` now raises that allocation to 576 bytes. It is harmless for
+the P2 Pro, whose commands are a few bytes, and it is a prerequisite for anything in this
+section. **Run the patch script after any component re-download**, or XU work fails confusingly.
+
+That is as far as this has been taken. With the bigger buffer the read-only enumeration returns
+**unstable** answers — on one pass CS 5 reported `info=0x03, len=512` and on the next
+`info=0x32, len=2`, while selectors 7..10 moved from `0x00` to `0x07` — which is the expected
+behaviour of a stateful mailbox: reading a command buffer that has had no command written into it
+is not a defined operation. The numbers from that enumeration are therefore **not** a usable map
+of the channel, and should not be quoted as one.
+
+### Finishing it
+
+The missing piece is the layout of `tagXU_COMMAND_HEADER` — the byte order and widths of command
+ID, sub-function and length — after which the sequence is a `SET_CUR` of the header followed by a
+`GET_CUR` of the response on the same selector. That layout lives in `libHCUSBSDK.so`
+(`CUsbCommandBuilder::CreateCommand`, `CUsbDeviceVideoBase::SwitchCommand`), so getting it means
+more AArch64 disassembly; the `disas.py` used in this investigation did the small libs with
+capstone and pyelftools and the same approach scales to the 4.5 MB one.
+
+The cheaper route is almost certainly a **USB capture of the Android app talking to the camera**,
+which hands over the exact bytes of a known-good exchange with no disassembly at all.
+
+Until one of those is done, nothing is written to the channel. Writing a malformed command header
+to a thermal core is not an experiment to leave running unattended, so `P2_USB_PROBE` and
+`P2_GW_XU_PROBE` are both back to 0 and the shipped firmware does not touch the extension unit.
+
+### Reproducing the decompile
+
+The app is not on F-Droid and the APK has to be supplied. With a JDK and
+[jadx](https://github.com/skylot/jadx) on the path:
+
+```bash
+unzip -o app.apk 'classes*.dex' 'lib/arm64-v8a/lib*.so' -d apk_x
+jadx --no-res --no-debug-info -d out apk_x/classes2.dex   # HCUSBSDK + f1/f2 module bindings
+jadx --no-res --no-debug-info -d out3 apk_x/classes3.dex  # the device model tables
+```
+
+`classes2.dex` holds `com.hcusbsdk.*` (command IDs, structures) and `com.hik.f2module.*` (the
+F0/F2 wrapper the GW192A goes through); `classes3.dex` holds the model-to-module-type table
+quoted above. The native side worth reading is `libHCUSBSDK.so` for the transport and
+`libusbCam_host.so`, a much smaller HAL carrying `hal_usbcam_host_shutter_ctrl`,
+`hal_usbcam_host_get_cavity_temperature` and `hal_usbcam_host_pass_through_read/write`.
+
 ## What this camera does not have
 
-No vendor control channel is known. The InfiRay opcodes are not fired at it — the model
+No *InfiRay* control channel. The InfiRay opcodes are not fired at it — the model
 table's `vendor_cmds` flag is false, and `p2_camera_init()` is skipped — which matters for
 more than tidiness: aiming those requests at a camera that does not implement them makes it
 STALL EP0 on every one, and the retry loop turns into a control-transfer storm that drowns
 the stream (observed for real against an iMac webcam, see the generic-camera notes).
 
-So on the GW192A there is **no** shutter scheduling, no forced flat-field, and no device
+The camera does have a vendor channel of its own — a HIKMICRO extension unit — which this
+firmware does not yet drive. See the section above.
+
+So **as the firmware stands today** there is no shutter scheduling, no forced flat-field, and no device
 temperature readout. The camera runs its own shutter on its own schedule and we take what it
 gives. Everything that does not need the vendor channel works: palette, manual and automatic
 scale, crosshair, min/max/centre readouts, the touch OSD, and the firmware's own

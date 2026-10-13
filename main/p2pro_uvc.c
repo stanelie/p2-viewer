@@ -48,6 +48,7 @@
 #include "esp_lcd_st7796.h"
 
 #include "usb/usb_host.h"
+#include "usb/usb_helpers.h"   /* usb_parse_next_descriptor(), for the XU walk */
 #include "soc/usb_dwc_struct.h"   /* USB_DWC_HS */
 #include "soc/usb_utmi_struct.h"  /* USB_UTMI: analogue PHY trims (termination, squelch, swing) */
 #include "usb/uvc_host.h"
@@ -3841,6 +3842,75 @@ static const char *speed_str(usb_speed_t sp)
     }
 }
 
+/* ---- UVC Extension Unit discovery -----------------------------------------------------------
+ * Decompiling the GOYOJO vendor app (THG Start) showed the GW192A is a rebadged HIKMICRO
+ * MiniE/P09-class module, and that HIKMICRO drives these over a UVC EXTENSION UNIT: the SDK
+ * locates the unit by GUID (ParseExtensionUnit) and then issues control transfers carrying a
+ * command header. That channel, if this camera exposes it, is the route to a forced flat-field,
+ * emissivity and distance correction, the device's own temperature scaling, and its model string.
+ *
+ * None of that is worth writing until the hardware says the unit is there, so this prints it:
+ * the unit ID to put in wIndex, the GUID the SDK matches on, and the control bitmap that says
+ * which selectors the device will answer. Class-specific VC descriptors are bDescriptorType 0x24
+ * (CS_INTERFACE) with bDescriptorSubType 0x06 for VC_EXTENSION_UNIT. */
+/* Discovered XU coordinates, consumed by gw_xu_enumerate(). 0 unit = nothing found. */
+static volatile uint8_t s_xu_unit_id;
+static volatile uint8_t s_xu_interface;
+
+static void probe_dump_xu(usb_device_handle_t dev, uint8_t addr)
+{
+    const usb_config_desc_t *cfg = NULL;
+    if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK || !cfg) {
+        ESP_LOGW(TAG, "probe: addr %d has no readable config descriptor", addr);
+        return;
+    }
+    int offset = 0;
+    const usb_standard_desc_t *d = (const usb_standard_desc_t *)cfg;
+    int n_xu = 0;
+    uint8_t cur_if = 0;   /* wIndex needs the VideoControl interface the XU belongs to */
+    while ((d = usb_parse_next_descriptor(d, cfg->wTotalLength, &offset)) != NULL) {
+        if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+            cur_if = ((const usb_intf_desc_t *)d)->bInterfaceNumber;
+            continue;
+        }
+        if (d->bDescriptorType != 0x24 || d->bLength < 22) {
+            continue;                       /* not a class-specific VC descriptor */
+        }
+        /* Indexed as raw bytes: the usb component's usb_standard_desc_t is only the two-byte
+         * header, with no trailing value array to walk. p[0] is bDescriptorSubType. */
+        const uint8_t *p = ((const uint8_t *)d) + 2;
+        if (p[0] != 0x06) {
+            continue;
+        }
+        n_xu++;
+        const uint8_t unit_id   = p[1];
+        const uint8_t *guid     = &p[2];
+        const uint8_t n_ctrl    = p[18];
+        const uint8_t n_in_pins = p[19];
+        ESP_LOGW(TAG, "probe: XU unit_id=%u on interface %u bNumControls=%u bNrInPins=%u",
+                 unit_id, cur_if, n_ctrl, n_in_pins);
+        s_xu_unit_id = unit_id;
+        s_xu_interface = cur_if;
+        ESP_LOGW(TAG, "probe: XU GUID %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+                      "%02x%02x%02x%02x%02x%02x",
+                 guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6], guid[7],
+                 guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
+        /* bControlSize and bmControls sit after the variable-length baSourceID array. */
+        const int ctrl_size_off = 20 + n_in_pins;
+        if (ctrl_size_off < d->bLength - 2) {
+            const uint8_t ctrl_size = p[ctrl_size_off];
+            char bits[64];
+            int c = 0;
+            for (int i = 0; i < ctrl_size && ctrl_size_off + 1 + i < d->bLength - 2; i++) {
+                c += snprintf(bits + c, sizeof(bits) - c, "%02x ", p[ctrl_size_off + 1 + i]);
+            }
+            ESP_LOGW(TAG, "probe: XU bControlSize=%u bmControls=%s", ctrl_size, bits);
+        }
+    }
+    ESP_LOGW(TAG, "probe: addr %d has %d extension unit(s)%s", addr, n_xu,
+             n_xu ? "" : " - no vendor control channel on this device");
+}
+
 static void usb_probe_cb(const usb_host_client_event_msg_t *msg, void *arg)
 {
     (void)arg;
@@ -3863,6 +3933,7 @@ static void usb_probe_cb(const usb_host_client_event_msg_t *msg, void *arg)
                      msg->new_dev.address, desc->idVendor, desc->idProduct,
                      desc->bcdUSB, desc->bDeviceClass);
         }
+        probe_dump_xu(dev, msg->new_dev.address);
         usb_host_device_close(s_probe_client, dev);
     } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
         ESP_LOGW(TAG, "probe: device gone");
@@ -3939,6 +4010,85 @@ static void usb_lib_task(void *arg)
 }
 
 /* ---------------- Render task: raw -> palette -> SPI blit ---------------- */
+
+/* ---- GW192A extension-unit enumeration ------------------------------------------------------
+ * Read-only reconnaissance of the vendor channel the probe found. For each control selector the
+ * device claims in bmControls, ask:
+ *   GET_INFO (0x86) - 1 byte of capability bits: bit0 GET supported, bit1 SET supported
+ *   GET_LEN  (0x85) - 2 bytes, the control's payload length
+ *   GET_CUR  (0x81) - the payload itself
+ * and print them. That is the map needed before writing anything: a selector that reports no SET
+ * support, or a length that does not match a structure we know, is one to leave alone.
+ *
+ * Deliberately GET-only, and deliberately once. The generic-camera notes in this repo record what
+ * happens when vendor requests are fired at a device that does not implement them - EP0 stalls on
+ * every request and a control-transfer storm that drowns the stream - so this touches only
+ * selectors the descriptor advertises, makes one pass, and never retries.
+ *
+ * UVC addressing: wValue = CS << 8, wIndex = (unit_id << 8) | interface. */
+#define P2_GW_XU_PROBE 0
+#if P2_GW_XU_PROBE
+static void gw_xu_enumerate(void)
+{
+    const uint8_t unit = s_xu_unit_id;
+    if (!unit || !s_stream) {
+        ESP_LOGW(TAG, "XU: no extension unit discovered (is P2_USB_PROBE enabled?)");
+        return;
+    }
+    const uint16_t windex = ((uint16_t)unit << 8) | s_xu_interface;
+    ESP_LOGW(TAG, "XU: enumerating unit %u on interface %u (wIndex=0x%04x)",
+             unit, s_xu_interface, windex);
+
+    for (uint8_t cs = 1; cs <= 10; cs++) {
+        const uint16_t wvalue = (uint16_t)cs << 8;
+        uint8_t info = 0;
+        esp_err_t e_info = uvc_host_usb_ctrl(s_stream, 0xA1, 0x86, wvalue, windex, 1, &info);
+
+        uint8_t lenbuf[2] = {0, 0};
+        esp_err_t e_len = uvc_host_usb_ctrl(s_stream, 0xA1, 0x85, wvalue, windex,
+                                            sizeof(lenbuf), lenbuf);
+        const uint16_t len = (uint16_t)lenbuf[0] | ((uint16_t)lenbuf[1] << 8);
+
+        if (e_info != ESP_OK && e_len != ESP_OK) {
+            ESP_LOGW(TAG, "XU: CS %2u - no answer (info %s, len %s)", cs,
+                     esp_err_to_name(e_info), esp_err_to_name(e_len));
+            continue;
+        }
+        ESP_LOGW(TAG, "XU: CS %2u info=0x%02x (%s%s) len=%u", cs, info,
+                 (info & 1) ? "GET " : "", (info & 2) ? "SET" : "", len);
+
+        /* Every selector on this device reports 512 bytes, which is the SDK's command-mailbox
+         * shape rather than a per-control structure: the header goes in, the response comes back
+         * in the same buffer. Read the whole thing but print only the head, where a header
+         * would live - 512 bytes of mostly padding down a 115200 baud console is not worth it. */
+        if (e_len != ESP_OK || len == 0 || len > 512) {
+            continue;
+        }
+        static uint8_t cur[512];
+        memset(cur, 0, sizeof(cur));
+        if (uvc_host_usb_ctrl(s_stream, 0xA1, 0x81, wvalue, windex, len, cur) != ESP_OK) {
+            ESP_LOGW(TAG, "XU: CS %2u GET_CUR failed", cs);
+            continue;
+        }
+        size_t last = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (cur[i]) {
+                last = i;
+            }
+        }
+        char hex[3 * 32 + 1];
+        for (size_t off = 0; off < 64 && off < len; off += 32) {
+            int c = 0;
+            for (size_t i = off; i < off + 32 && i < len; i++) {
+                c += snprintf(hex + c, sizeof(hex) - c, "%02x ", cur[i]);
+            }
+            ESP_LOGW(TAG, "XU: CS %2u +%02u %s", cs, (unsigned)off, hex);
+        }
+        ESP_LOGW(TAG, "XU: CS %2u last non-zero byte at %u of %u", cs, (unsigned)last, len);
+    }
+    ESP_LOGW(TAG, "XU: enumeration done");
+}
+#endif
 
 /* ---- GW192A calibration instrumentation ------------------------------------------------------
  * Temporary, and separate from P2_GW_PROBE: that one owns the camera and dumps whole modes, this
@@ -5422,6 +5572,15 @@ static void streaming_task(void *arg)
         if (s_cam_kind == CAM_THERMAL && s_therm->vendor_cmds) {
             p2_camera_init();
         }
+#if P2_GW_XU_PROBE
+        if (s_cam_kind == CAM_THERMAL && !s_therm->vendor_cmds) {
+            static bool xu_done = false;
+            if (!xu_done) {
+                xu_done = true;   /* one pass per boot, not per stream */
+                gw_xu_enumerate();
+            }
+        }
+#endif
         s_stream_restart_req = false;
         s_stream_epoch++;
         s_camera_connected = true;

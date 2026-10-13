@@ -19,3 +19,7 @@ build/
 
 # Vendor reference repos cloned for comparison; not part of this project.
 ws35/
+
+# serial captures
+/awb*.txt
+/clean*.txt

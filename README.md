@@ -1,71 +1,81 @@
 # p2-viewer
 
-A handheld thermal camera, built out of a USB thermal module and a cheap ESP32 board with a
-touchscreen. Plug the camera into the board, and you get a live thermal image with a colour
-palette, a crosshair temperature readout and a few touch buttons, with no phone and no app in
-the middle.
+A pocket thermal camera made from a USB thermal module and a cheap ESP32 board with a
+touchscreen. Plug the camera in and you get a live thermal image, a colour palette, a crosshair
+that tells you how hot the thing you're pointing at is, and a few buttons down the side. No
+phone, no app, no cloud account that stops working in two years.
 
-It started as a viewer for the InfiRay P2 Pro, which is where the name comes from. It has since
-grown into a general-purpose camera viewer: if it recognises a thermal camera you get the full
-thermal interface, and if you plug in something else - a webcam, a borescope, an otoscope - you
-get a plain picture instead. There is also a WiFi otoscope that it finds and connects to on its
-own, and the little camera on the board itself as a last resort, so the screen is never blank.
+It started as a viewer for the InfiRay P2 Pro, which is where the name comes from. Then I
+plugged in a borescope to see what would happen, and it turned into a viewer for whatever camera
+I own. It now knows about five of them.
 
-The whole thing is one C file against ESP-IDF. No LVGL, no RTOS abstractions over the top; the
-display is driven straight through `esp_lcd`, because the three things I cared about were boot
-time, framerate and latency, in that order. It boots to a picture in about 1.7 seconds and runs
-the P2 Pro at its full 25 fps.
+## It takes almost any camera you plug into it
 
-## Hardware
+Thermal cameras get the full instrument: palette, auto-ranging temperature scale, flat-field
+correction, crosshair readout.
 
-- **Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5** - 480x320 SPI touchscreen, USB OTG host, battery
-  charger. The P4 is the part that matters: it can be a USB host, which is what makes any of
-  this possible.
-- A camera (see below). The USB one goes in the OTG port.
-- Optionally the OV5647 module that ships on the board's MIPI-CSI connector.
+- **InfiRay P2 Pro** over USB-C, at its full 25 fps
+- **GOYOJO GW192A** over USB, which turned out to be a rebadged HIKMICRO module
 
-One warning before you build one: **the camera cannot run off the internal battery without a
-hardware modification.** Both Type-C VBUS pins share a net that feeds the PMIC's charger input,
-and that PMIC has no boost converter, so there is no 5 V to give the camera. On battery you need
-an added 3.7 -> 5 V boost module.
+Anything else gets a plain full-screen picture, which is enough to be useful:
 
-## Cameras it supports
+- **any USB webcam or borescope**, using MJPEG and the P4's hardware JPEG decoder where it can
+- **an NK3 "earpick" otoscope over WiFi**, which has no USB connector at all - it serves video
+  from its own access point, so the viewer finds the network, joins it and starts streaming
+  without being asked. It also reports its own orientation, so the image is rotated upright as
+  you twist it.
+- **the little OV5647 camera** on the board's ribbon connector, as a fallback, so the screen is
+  never just blank
 
-| camera | connection | what you get |
-|---|---|---|
-| **InfiRay P2 Pro** | USB-C | full thermal UI, 25 fps, absolute temperatures, shutter control |
-| **GOYOJO GW192A** | USB | same thermal UI, 96x96 sensor, temperatures good to about ±1.5 °C |
-| **Any UVC webcam or borescope** | USB | plain full-screen preview, MJPEG where the camera offers it |
-| **NK3 / HNDEC "earpick" otoscope** | WiFi | auto-joins its access point, rotates the image upright |
-| **OV5647 on the board** | MIPI-CSI | fallback preview when nothing else is attached |
+They're tried in that order: USB first, then WiFi, then the onboard camera. Swap USB cameras
+while it's running and it follows along without a reset.
 
-They are tried in that order of priority: a USB camera wins, then the WiFi otoscope, then the
-board's own camera. You can swap between USB cameras without resetting the device.
+Nothing is matched on USB IDs - a camera is thermal because of what it advertises about itself.
+So a thermal camera I've never seen stands a decent chance of just working, and if it doesn't,
+you get a normal picture instead of garbage.
 
-Thermal cameras are recognised by what they advertise, not by their USB IDs, so a thermal camera
-I have never seen may well just work - and if it does not, it degrades to a normal picture
-rather than to garbage.
+It boots to a live image in about 1.7 seconds, which took some doing and is written up in the
+notes.
 
-## Installing it
+## Getting it on the device
 
 Grab the `.bin` from the [latest release](https://github.com/stanelie/p2-viewer/releases/latest)
-and write it at offset 0:
+and write it at offset 0, using the **UART** Type-C port so the other one stays free for a
+camera:
 
 ```bash
 esptool.py --chip esp32p4 -b 460800 write_flash 0x0 p2-viewer-v1.3.1-esp32p4.bin
 ```
 
-Use the **UART** Type-C port, not the OTG one, so the camera port stays free. That single file
-contains the bootloader, partition table and app. For a clean device, run
+That one file is the bootloader, partition table and app together. For a clean device, run
 `esptool.py --chip esp32p4 erase_flash` first.
 
-Coming from a release older than v1.3.0, your stored flat-field table will be discarded once,
-because the app partition grew and everything after it moved. Just capture it again.
+You'll want a **Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5**: 480x320 touchscreen, USB host, battery
+charger, and an ESP32-P4, which is the part that makes this possible at all - it can act as a USB
+host, which most hobbyist microcontrollers can't.
+
+## Using it
+
+Eight buttons down the side:
+
+| button | does |
+|---|---|
+| `FFC` | point at something uniform, like a wall, and press. Takes about a second |
+| `CLR` | the same button, once a correction is loaded - throws it away |
+| `AS1` / `AS0` | let the camera do its own periodic shutter calibration, or stop it |
+| `IRON` / `GRAY` | palette |
+| `AUTO` / `LOCK` | follow the scene's temperature range, or hold it still |
+| `MAX±` `MIN±` | nudge the ends of the scale while it's locked |
+
+Hold the power button for a second to shut down.
+
+Your flat-field correction is saved and comes back after a power cycle, which is worth doing:
+the camera's own shutter sits *behind* the lens, so it can't see dust on the window or the lens's
+own vignetting. Pointing at a wall can.
 
 ## Building it yourself
 
-You need **ESP-IDF v5.5 or newer**. Not optional: this board's P4 is silicon revision v3.2 and
-v5.3.x refuses to flash it outright.
+ESP-IDF v5.5 or newer - not optional, v5.3.x refuses to flash this board's chip revision.
 
 ```bash
 idf.py set-target esp32p4
@@ -74,58 +84,36 @@ idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-Don't skip the patch script. It fixes four real bugs in Espressif's managed components - an
-uninitialised struct that breaks auto white balance on our chip revision, and three limits in
-the UVC host that block vendor control transfers. `managed_components/` is gitignored and gets
-recreated on every fresh clone, so the script is the honest way to carry those fixes rather than
-hand-editing files that will silently come back. It is idempotent and it explains each patch as
-it applies it.
+Don't skip the patch script; it fixes four genuine bugs in Espressif's components that this
+firmware needs fixed, and it explains each one as it goes. It's all one C file against ESP-IDF,
+no LVGL, with the display driven straight through `esp_lcd`, because what I cared about was boot
+time, framerate and latency in that order.
 
-## Using it
+## Before you build one
 
-Eight buttons down the side of the thermal view:
+Three things I'd want to know in your position:
 
-| button | does |
-|---|---|
-| `MAX+` `MAX-` `MIN+` `MIN-` | nudge the temperature scale when it is locked |
-| `FFC` | flat-field correction: aim at something uniform, press, wait about a second |
-| `CLR` | the same button once a correction is active - clears it |
-| `AS1` / `AS0` | let the camera run its own periodic shutter calibration, or suppress it |
-| `IRON` / `GRAY` | colour palette |
-| `AUTO` / `LOCK` | auto-range the scale to the scene, or hold it where it is |
+- **The camera can't run off the internal battery** without adding a 3.7 -> 5 V boost module.
+  Both USB-C VBUS pins feed the PMIC's charger input, and that PMIC has no boost, so there's
+  simply no 5 V to hand out.
+- **The screen tears, and it can't be fixed on this board.** There's no sync signal to wait for,
+  and the tear forms inside the panel's own memory, so buffering on our side does nothing.
+- The thermal image is about 8% vertically stretched, because the scaler works in sixteenths.
 
-Holding the power button for one second shuts the device down.
+## The notes
 
-The FFC table is saved to its own flash partition and restored at boot, so a correction survives
-a power cycle. This is worth doing because the camera's own shutter sits behind the lens and
-therefore cannot see dust on the window or lens vignetting, which a wall-based correction can.
+Most of what's interesting is in **[docs/](docs/)**. A fair amount of this hardware was
+reverse-engineered, so those files are mostly measurements, and they include the things that
+didn't work - the point of writing a dead end down is that nobody walks into it twice. There's a
+nine-second cold start cut to five, a camera that turned out to be a different brand underneath,
+a USB fault I chased through the SoC's analogue PHY registers before finding it in a connector,
+and a sensor mode that's both more pixels and 2.7x faster than the one that looked right.
 
-## Notes and findings
-
-The detail lives in [`docs/`](docs/). Most of it is measurement rather than documentation - a
-good deal of this was reverse-engineered, and the notes exist so neither I nor anyone else
-repeats a dead end.
-
-| | |
-|---|---|
-| [The thermal path](docs/thermal_cameras.md) | how two different thermal cameras share one pipeline, flat-field correction, the shutter toggle |
-| [P2 Pro protocol](docs/p2pro_protocol.md) | stream format, the three cold-start phases, cutting the startup from 9 s to 5 s, the vendor command channel |
-| [GW192A frame layout](docs/GW192A_frame_layout.md) | the rebadged HIKMICRO module, its frame map, its temperature calibration, the extension unit I recovered but cannot yet get data out of |
-| [Generic USB cameras](docs/generic_uvc_cameras.md) | mode selection, hardware JPEG decode, hot-swap |
-| [The WiFi otoscope](docs/wifi_camera.md) | joining its AP, reassembling its UDP frames, auto-rotation from its accelerometer, latency |
-| [NK3 camera protocol](docs/NK3_camera_protocol.md) | the device protocol itself, as a standalone spec |
-| [The built-in camera](docs/builtin_camera.md) | OV5647 through the P4's ISP, why the sensor mode matters more than anything host-side |
-| [Board and platform](docs/platform.md) | boot time, flash layout, the power button, the display bug that bit every path |
-| [The borescope USB saga](docs/usb_link_investigation.md) | a long hunt that ended at a connector, with the PHY measurements it produced on the way |
-
-Two known limits worth knowing before you build one. **The screen tears and it cannot be fixed
-on this board** - there is no TE signal to sync to, and the tear forms in the panel's own memory,
-so no amount of buffering on our side helps. And the thermal image is about 8% vertically
-stretched, because the PPA's scale factors land on sixteenths.
+[docs/README.md](docs/README.md) is the index.
 
 ## Credit
 
-The P2 Pro's vendor command transport was worked out by
-[LeoDJ/P2Pro-Viewer](https://github.com/LeoDJ/P2Pro-Viewer); a copy of the reference
-implementation is kept in [`docs/P2Pro_cmd_reference.py`](docs/P2Pro_cmd_reference.py). The NK3
-protocol work builds on haxko/NE3-Scope, with corrections from this hardware noted in the spec.
+The P2 Pro's command transport was worked out by
+[LeoDJ/P2Pro-Viewer](https://github.com/LeoDJ/P2Pro-Viewer), and a copy of the reference
+implementation lives in [`docs/P2Pro_cmd_reference.py`](docs/P2Pro_cmd_reference.py). The NK3
+work builds on haxko/NE3-Scope, with corrections from this particular unit noted in the spec.

@@ -251,23 +251,141 @@ That is as far as this has been taken. With the bigger buffer the read-only enum
 `info=0x32, len=2`, while selectors 7..10 moved from `0x00` to `0x07` — which is the expected
 behaviour of a stateful mailbox: reading a command buffer that has had no command written into it
 is not a defined operation. The numbers from that enumeration are therefore **not** a usable map
-of the channel, and should not be quoted as one.
+of the channel, and should not be quoted as one. The disassembly below explains exactly why —
+selector and sub-function are latched by a separate "switch" control and the SDK even caches
+them, so an unswitched read answers for whatever command was selected last.
 
-### Finishing it
+### The protocol, recovered from libHCUSBSDK.so
 
-The missing piece is the layout of `tagXU_COMMAND_HEADER` — the byte order and widths of command
-ID, sub-function and length — after which the sequence is a `SET_CUR` of the header followed by a
-`GET_CUR` of the response on the same selector. That layout lives in `libHCUSBSDK.so`
-(`CUsbCommandBuilder::CreateCommand`, `CUsbDeviceVideoBase::SwitchCommand`), so getting it means
-more AArch64 disassembly; the `disas.py` used in this investigation did the small libs with
-capstone and pyelftools and the same approach scales to the 4.5 MB one.
+Disassembling the SDK's AArch64 build (`tools/hcusbsdk/disas.py`, capstone + pyelftools) recovered
+the whole exchange. **Everything in this subsection is read off the SDK's code, not yet exercised
+against the camera** — the firmware still writes nothing to the channel. What *is* confirmed on
+hardware is the addressing (unit 10, interface 0, selectors 1..10 implemented) and that CS 6
+answers as a 1-byte control, which is what the SDK says the status register is.
 
-The cheaper route is almost certainly a **USB capture of the Android app talking to the camera**,
-which hands over the exact bytes of a known-good exchange with no disassembly at all.
+#### Addressing
 
-Until one of those is done, nothing is written to the channel. Writing a malformed command header
-to a thermal core is not an experiment to leave running unattended, so `P2_USB_PROBE` and
-`P2_GW_XU_PROBE` are both back to 0 and the shipped firmware does not touch the extension unit.
+Plain UVC extension-unit control transfers:
+
+```
+wValue = control_selector << 8
+wIndex = (unit_id << 8) | interface      /* 0x0A00 on this camera */
+GET:  bmRequestType 0xA1, bRequest 0x81 (GET_CUR)
+SET:  bmRequestType 0x21, bRequest 0x01 (SET_CUR)
+```
+
+`CUsbDeviceVideoBase::ControlTransfer` fills `wIndex` itself from the unit it cached at
+`ParseExtensionUnit` time; only `wValue` and the direction come from the command.
+
+#### Two selectors are reserved
+
+| CS | role |
+|---|---|
+| 5 | **command switch** — a 2-byte mailbox, `{ target_CS, sub_function }` |
+| 6 | **status / last error** — 1 byte: `1` = busy, `0` = success, anything else = error |
+
+Across all 415 command objects in the SDK, **no command ever targets CS 5 or CS 6**, which
+corroborates that they are infrastructure rather than data. Our probe measured CS 6 as a 1-byte
+control, matching `GetUVCLastError`.
+
+#### The sequence
+
+`ProtocolStrategyUvc20::ReadDataStrategy` / `WriteDataStrategy` do this:
+
+1. **Switch** (`CUsbDeviceVideoBase::SwitchCommand`) — `SET_CUR` on **CS 5**, 2 bytes
+   `{ target_CS, sub_function }`.
+
+   This is **cached**: `HoldCommand(wValue, sub_function)` compares against the last pair it
+   selected and returns 0 — skipping the transfer entirely — when nothing changed. That is
+   exactly why our own read-only enumeration gave different answers on consecutive passes: with
+   no switch written, every selector was still answering for whatever command had been selected
+   before, so the numbers drifted with history rather than describing the selectors.
+
+2. **Transfer** — `GET_CUR` or `SET_CUR` on the **target CS**, same `wIndex`, carrying the
+   payload.
+
+3. **Poll** (`ProtocolStrategyUvc20::CheckDeviceStatus`) — `GET_CUR` on **CS 6**, 1 byte. While
+   it reads `1`, sleep 10 ms and retry, up to the 5 s timeout the SDK passes.
+
+Reads longer than one control transfer are chunked, and each chunk comes back with a **5-byte
+header**: the SDK requests `chunk + 5`, checks that exactly that arrived, and copies from offset
+5 onward. So usable payload per transfer is `wLength - 5`.
+
+#### The 11-byte command prefix
+
+Internally the SDK passes commands around as a buffer whose first 11 bytes are the prefix and
+whose remainder is the payload (`ReadDataStrategy` writes `pCmd + 11` with length
+`cmdLen - 11`, and rejects any `cmdLen <= 10`):
+
+```
++0  u8   bmRequestType      0xA1 get / 0x21 set
++1  u8   bRequest           0x81 GET_CUR / 0x01 SET_CUR
++2  u16  (reserved, zero)
++4  u16  wValue             control_selector << 8
++6  u16  wIndex             filled in by the device layer
++8  u8   3                  constant in every command inspected
++9  u8   flag               0 on the get path, 0x88 on the set path
++10 u8   sub_function       what gets written to CS 5
++11 ...  payload
+```
+
+That 8-byte head is `tagXU_COMMAND_HEADER`, and it is memcpy'd straight into the driver's
+transfer descriptor at offset 0x18, where the fields line up one-for-one with
+`libusb_control_transfer(handle, bmRequestType, bRequest, wValue, wIndex, data, wLength, timeout)`.
+
+#### Command map
+
+The SDK implements each command as a template instantiation
+`CUsbCommandConfig<ID, InputStruct, OutputStruct>::Excute()`, and each one stores its own
+constants into that prefix. `tools/hcusbsdk/cmdmap.py` walks every instantiation and reads the
+selector and sub-function back out — 415 commands in total. GET and SET of the same item share a
+`(CS, sub)` pair and differ only in direction, which is the design the prefix implies.
+
+The ones a thermal viewer wants:
+
+| ID | command | CS | sub |
+|---|---|---|---|
+| 2011 | `GET_SYSTEM_DEVICE_INFO` | 1 | 0x01 |
+| 2025 | `SET_IMAGE_MANUAL_CORRECT` (forced FFC) | 2 | 0x04 |
+| 2026 / 2027 | `GET/SET_IMAGE_ENHANCEMENT` | 2 | 0x05 |
+| 2080 | `GET_IMAGE_ENHANCEMENT_EX` | 2 | 0x05 |
+| 2105 / 2115 | `GET/SET_IMAGE_PALETTE_DATA` | 2 | 0x15 |
+| 2119 | `SET_IMAGE_MULTI_PALETTE_DATA` | 2 | 0x1a |
+| 2030 / 2031 | `GET/SET_THERMOMETRY_BASIC_PARAM` | 3 | 0x01 |
+| 2032 / 2033 | `GET/SET_THERMOMETRY_MODE` | 3 | 0x02 |
+| 2038 / 2039 | `GET/SET_THERMAL_STREAM_PARAM` | 3 | 0x05 |
+| 2047 | `GET_ROI_MAX_TEMPERATURE_SEARCH` | 3 | 0x0a |
+| 2048 | `GET_P2P_PARAM` | 3 | 0x0b |
+| 2063 / 2064 | `GET/SET_ENVIROTEMPERATURE_CORRECT` | 3 | 0x13 |
+| 2110 / 2111 | `GET/SET_THERMAL_STREAM_CTRL` | 3 | 0x14 |
+| 2131 / 2132 | `GET/SET_THERMAL_STREAM_YUV_RESOLUTION` | 3 | 0x1f |
+| 2087 | `GET_SYSTEM_DEVICE_INFO_CAPABILITIES` | 8 | 0x11 |
+| 2133 | `GET_THERMAL_STREAM_YUV_RESOLUTION_CAPABILITIES` | 8 | 0x3c |
+| 2068 / 2069 | `GET/SET_VIDEO_CODE` (max frame rate) | 10 | 0x01 |
+
+All of those selectors are inside the 1..10 this camera advertises. `tools/hcusbsdk/command_map.txt` has
+the full 415. Two cautions about that file: the SDK serves card readers and CDC devices as well
+as cameras, so plenty of entries are irrelevant here; and a handful of extracted selectors come
+out above 10 (11, 23, 24, 25 and one absurd 415), which are either other device families or
+mis-parses of the heuristic, and should not be trusted without checking the function by hand.
+
+#### What to try first
+
+`USB_GET_THERMOMETRY_BASIC_PARAM` (CS 3, sub 0x01) is the one to attempt first, and the order is:
+
+```
+SET_CUR  CS 5, wIndex 0x0A00, data { 0x03, 0x01 }, 2 bytes
+GET_CUR  CS 3, wIndex 0x0A00, read sizeof(USB_THERMOMETRY_BASIC_PARAM)
+GET_CUR  CS 6, wIndex 0x0A00, 1 byte -> expect 0
+```
+
+It is a pure read, so a wrong guess costs nothing but an error, and its payload carries
+`byShiftLength` and `byFloatTransMode` — the scaling the camera applies to its own values, which
+would turn the 51.714 counts/K two-point fit above into a cross-check. `USB_GET_SYSTEM_DEVICE_INFO`
+(CS 1, sub 0x01) is an equally safe first read and would confirm the model string.
+
+Note that the firmware's EP0 buffer patch is a hard prerequisite: `USB_THERMOMETRY_BASIC_PARAM`
+alone is well over the stock 56-byte ceiling.
 
 ### Reproducing the decompile
 

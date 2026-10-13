@@ -43,9 +43,12 @@ Two consequences for the GW192A, both inherent to the device rather than this fi
   (`37b4:0102`), and the camera does expose a HIKMICRO UVC **extension unit** — unit 10, GUID
   `{A29E7641-DE04-47E3-8B2B-F4341AFF003B}`, ten control selectors — which would give a forced
   flat-field, emissivity and distance correction, the device's own temperature scaling and its
-  model string. It is not driven yet: the command-header layout is still missing, and the
-  selectors answer unreliably until a command is actually written. Details and the two routes to
-  finishing it are in `docs/GW192A_frame_layout.md`.
+  model string. **The protocol is now recovered** by disassembling `libHCUSBSDK.so`: control
+  selector 5 is a `{selector, sub-function}` switch, CS 6 is a 1-byte status register, and all
+  415 of the SDK's commands have been mapped to their selector and sub-function pair — forced
+  flat-field is CS 2 sub 0x04, thermometry params are CS 3 sub 0x01. It is not driven yet: the
+  sequence is read off the SDK and has not been exercised against the camera. Full write-up,
+  command map and the first safe read to try are in `docs/GW192A_frame_layout.md`.
 - **Absolute temperatures are calibrated from two measured points, over a short baseline.**
   A matte wall at 23.0 °C reads 5053 counts and a palm at 33.5 °C reads 5596, giving 51.714
   counts/K with the intercept at -10262; the wall then reads back as 23.7 °C on the panel. The
